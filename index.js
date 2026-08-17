@@ -5,7 +5,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'grafana'
-export const inject = ['tools', 'systemPrompt', 'credentials']
+export const inject = ['tools', 'systemPrompt', 'credentials', 'webServer']
 
 const TOKEN_REF = 'GRAFANA_TOKEN'
 const BASE_URL_REF = 'GRAFANA_BASE_URL'
@@ -47,10 +47,14 @@ export function apply(ctx, config) {
   }
 
   async function resolveBaseUrl() {
-    const base = await ctx.credentials.resolve(BASE_URL_REF)
-    const url = base?.value || config.baseUrl
+    const url = await resolveBaseUrlSafe()
     if (!url) throw new Error('未配置 Grafana 地址：请在「设置 → 插件」的 Grafana 卡片里填写，或写入凭证 GRAFANA_BASE_URL')
     return url
+  }
+
+  async function resolveBaseUrlSafe() {
+    const base = await ctx.credentials.resolve(BASE_URL_REF)
+    return base?.value || config.baseUrl || ''
   }
 
   async function api(path, init = {}) {
@@ -126,4 +130,33 @@ export function apply(ctx, config) {
       return `health=${h.status ?? 'ok'}; 凭证有效，可搜索到大盘 ${Array.isArray(rows) ? rows.length : '?'} 个; baseUrl=${baseUrl}`
     },
   }))
+
+  // 供设置卡片读取/写回当前配置（只返回地址与配置状态，不回传 token 值）
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-grafana/config',
+    handler: async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.method === 'GET') {
+        const baseUrl = await resolveBaseUrlSafe()
+        const tok = await ctx.credentials.resolve(config.tokenRef)
+        res.end(JSON.stringify({ baseUrl, tokenConfigured: !!tok }))
+        return
+      }
+      if (req.method === 'POST') {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        let body
+        try { body = JSON.parse(raw || '{}') } catch { body = {} }
+        if (typeof body.baseUrl === 'string' && body.baseUrl.trim()) {
+          await ctx.credentials.set(BASE_URL_REF, body.baseUrl.trim())
+        }
+        const baseUrl = await resolveBaseUrlSafe()
+        res.end(JSON.stringify({ baseUrl }))
+        return
+      }
+      res.statusCode = 405
+      res.end(JSON.stringify({ error: 'method not allowed' }))
+    },
+  }), 'grafana: config route')
 }

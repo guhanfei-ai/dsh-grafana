@@ -13,6 +13,8 @@ window.__ModuleLoader__.load({
 
 		const TOKEN_REF = "GRAFANA_TOKEN";
 		const BASE_URL_REF = "GRAFANA_BASE_URL";
+		// 已配置时的占位星号串（虚假值，仅视觉提示，绝不写入凭证库）
+		const MASK = "*".repeat(28);
 
 		const inject = ["slots", "connection"];
 
@@ -41,14 +43,19 @@ window.__ModuleLoader__.load({
 			const [saving, setSaving] = react.useState(false);
 			const [saved, setSaved] = react.useState(false);
 			const [error, setError] = react.useState("");
+			const [tokenFocus, setTokenFocus] = react.useState(false);
+
+			// 已配置且未聚焦且无新输入时，用虚假星号占位；否则显示真实草稿（草稿在聚焦后才可能产生）
+			const tokenValue = status.token && !tokenFocus && tokenDraft === "" ? MASK : tokenDraft;
 
 			react.useEffect(() => {
 				let alive = true;
 				face.describe().then((r) => {
 					if (alive) setStatus({ loaded: true, token: r.tokenConfigured });
-				}).catch((e) => {
-					if (alive) { setStatus({ loaded: true, token: false }); setError(String(e?.message ?? e)); }
-				});
+				}).catch(() => {});
+				face.loadConfig().then((c) => {
+					if (alive) setBaseDraft(c.baseUrl || '');
+				}).catch(() => {});
 				return () => { alive = false; };
 			}, [face]);
 
@@ -58,10 +65,10 @@ window.__ModuleLoader__.load({
 					const t = tokenDraft.trim();
 					const b = baseDraft.trim();
 					if (t !== "") await face.setToken(t);
-					if (b !== "") await face.setBaseUrl(b);
+					if (b !== "") await face.saveBaseUrl(b);
 					const r = await face.describe();
 					setStatus({ loaded: true, token: r.tokenConfigured });
-					setTokenDraft(""); setBaseDraft("");
+					setTokenDraft(""); setBaseDraft(""); setTokenFocus(false);
 					setSaved(true);
 				} catch (e) {
 					setError(String(e?.message ?? e));
@@ -78,12 +85,25 @@ window.__ModuleLoader__.load({
 						(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Service Account Token" }),
 						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.token ? S.badgeOk : {}) }, children: status.token ? "已配置" : "未配置" }) : null
 					] }),
-					(0, react_jsx_runtime.jsx)("input", { type: "password", style: S.input, placeholder: "留空保持现有凭证；粘贴 glsa_… 后点保存", value: tokenDraft, onChange: (e) => setTokenDraft(e.target.value) }),
-					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: "写入本机凭证库（~/.dsh/.credentials.yaml，600 权限）；界面永不回显。" })
+					(0, react_jsx_runtime.jsx)("input", {
+						type: "password",
+						style: S.input,
+						placeholder: "留空保持现有凭证；粘贴 glsa_… 后点保存",
+						value: tokenValue,
+						onFocus: () => setTokenFocus(true),
+						onBlur: () => { if (tokenDraft === "") setTokenFocus(false); },
+						onChange: (e) => {
+							let v = e.target.value;
+							// 防御：若值仍带占位星号前缀（聚焦后立即输入的理论边界），剥离后再存草稿
+							if (v.startsWith(MASK)) v = v.slice(MASK.length);
+							setTokenDraft(v);
+						}
+					}),
+					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: status.token ? "已配置（星号为占位，不回显真实 token）。聚焦输入新值即可覆盖。" : "写入本机凭证库（~/.dsh/.credentials.yaml，600 权限）；界面永不回显。" })
 				] }),
 				(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
 					(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Grafana 地址" }),
-					(0, react_jsx_runtime.jsx)("input", { type: "text", style: S.input, placeholder: "留空保持当前值；如 https://grafana.example.com", value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
+					(0, react_jsx_runtime.jsx)("input", { type: "text", style: S.input, placeholder: "如 https://grafana.example.com", value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
 					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: "同样写入本机凭证库（GRAFANA_BASE_URL），保存后即生效。" })
 				] }),
 				(0, react_jsx_runtime.jsxs)("div", { style: S.footer, children: [
@@ -106,7 +126,20 @@ window.__ModuleLoader__.load({
 					};
 				},
 				setToken: (value) => api.credentials.set({ ref: TOKEN_REF, value }),
-				setBaseUrl: (value) => api.credentials.set({ ref: BASE_URL_REF, value })
+				loadConfig: async () => {
+					const r = await fetch('/dsh-grafana/config')
+					if (!r.ok) throw new Error(`读取配置失败：HTTP ${r.status}`)
+					return r.json()
+				},
+				saveBaseUrl: async (value) => {
+					const r = await fetch('/dsh-grafana/config', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ baseUrl: value })
+					})
+					if (!r.ok) throw new Error(`保存失败：HTTP ${r.status}`)
+					return r.json()
+				}
 			};
 			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
 				name: "settings.plugin.item",
