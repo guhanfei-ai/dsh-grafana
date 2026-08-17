@@ -1,15 +1,19 @@
 // dsh-grafana — Grafana 大盘编辑插件
 // 流程：用户贴大盘 URL → AI 用 grafana_get 拉 JSON → 对话微调 → grafana_push 写回 → 用户刷新
+// 配置：Web 设置 → 插件 → 卡片（token/地址走 GUI，落本机凭证库）；baseUrl 亦可由 cordis.patch.yml 覆盖
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'grafana'
 export const inject = ['tools', 'systemPrompt', 'credentials']
 
+const TOKEN_REF = 'GRAFANA_TOKEN'
+const BASE_URL_REF = 'GRAFANA_BASE_URL'
+
 const GUIDANCE = `## Grafana 大盘编辑（dsh-grafana 插件）
 
 用户在 Grafana 里贴大盘地址即可微调大盘，无需截图。工作流：
- 1. 用户粘贴大盘 URL（如 http://grafana.example.com/d/<uid>/<slug>?orgId=1）或直接给 UID。
+1. 用户粘贴大盘 URL（如 http://grafana.example.com/d/<uid>/<slug>?orgId=1）或直接给 UID。
 2. 调用 grafana_get 拉取 dashboard JSON（唯一真相源，含 meta 与 dashboard）。
 3. 按用户要求修改 panels/targets/阈值/布局/变量等 JSON 字段，用 grafana_push 写回（overwrite 覆盖原盘；folderUid 用 meta 里提供的值可保持文件夹位置）。
 4. 提醒用户刷新大盘页面查看效果，不满意继续对话微调。
@@ -17,8 +21,8 @@ const GUIDANCE = `## Grafana 大盘编辑（dsh-grafana 插件）
 安全原则：写回前把改动摘要（改了哪些面板/查询）讲给用户听；对生产大盘的大改动先征得用户同意。不要在聊天里输出 token。`
 
 export const Config = Schema.object({
-  baseUrl: Schema.string().default('http://grafana.example.com').description('Grafana 根地址'),
-  tokenRef: Schema.string().default('GRAFANA_TOKEN').description('凭证引用名：对应 ~/.dsh/.credentials.yaml 中的键，值为 Service Account token'),
+  baseUrl: Schema.string().default('').description('Grafana 根地址；留空时用凭证 GRAFANA_BASE_URL（设置卡片里填）'),
+  tokenRef: Schema.string().default(TOKEN_REF).description('凭证引用名：对应 ~/.dsh/.credentials.yaml 中的键，值为 Service Account token'),
 })
 
 function parseUid(input) {
@@ -38,12 +42,20 @@ export function apply(ctx, config) {
 
   async function authHeaders() {
     const r = await ctx.credentials.resolve(config.tokenRef)
-    if (!r) throw new Error(`未配置凭证 ${config.tokenRef}：请在 ~/.dsh/.credentials.yaml 写入（键名 ${config.tokenRef}，值为 Service Account token）`)
+    if (!r) throw new Error(`未配置凭证 ${config.tokenRef}：请在 Web 设置 → 插件 → Grafana 卡片里填写 token，或写入 ~/.dsh/.credentials.yaml`)
     return { Authorization: `Bearer ${r.value}` }
   }
 
+  async function resolveBaseUrl() {
+    const base = await ctx.credentials.resolve(BASE_URL_REF)
+    const url = base?.value || config.baseUrl
+    if (!url) throw new Error('未配置 Grafana 地址：请在「设置 → 插件」的 Grafana 卡片里填写，或写入凭证 GRAFANA_BASE_URL')
+    return url
+  }
+
   async function api(path, init = {}) {
-    const res = await fetch(`${config.baseUrl}${path}`, init)
+    const baseUrl = await resolveBaseUrl()
+    const res = await fetch(`${baseUrl}${path}`, init)
     const text = await res.text()
     if (!res.ok) throw new Error(`Grafana API ${res.status} ${path}: ${text.slice(0, 600)}`)
     try { return JSON.parse(text) } catch { return text }
@@ -104,13 +116,14 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'grafana_health',
-    description: '检查 Grafana 连通性与凭证是否可用（/api/health + 带凭证的 /api/search）。',
+    description: '检查 Grafana 连通性与凭证是否可用（/api/health + 带凭证的 /api/search），并报告生效中的 baseUrl。',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_a, v) => textOut(v) },
     async execute() {
+      const baseUrl = await resolveBaseUrl()
       const h = await api('/api/health')
       const rows = await api('/api/search?type=dash-db&limit=3', { headers: await authHeaders() })
-      return `health=${h.status ?? 'ok'}; 凭证有效，可搜索到大盘 ${Array.isArray(rows) ? rows.length : '?'} 个`
+      return `health=${h.status ?? 'ok'}; 凭证有效，可搜索到大盘 ${Array.isArray(rows) ? rows.length : '?'} 个; baseUrl=${baseUrl}`
     },
   }))
 }

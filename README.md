@@ -22,26 +22,25 @@ dsh plugin --profile <profile> add link:/path/to/dsh-grafana
 
 > 注意：link 安装后需要在本插件目录执行一次 `npm install`，确保依赖在插件目录内可解析。
 
-## 配置
+## 配置（全部在 Web 界面完成）
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `baseUrl` | `http://grafana.example.com` | Grafana 根地址 |
-| `tokenRef` | `GRAFANA_TOKEN` | 凭证引用名，对应 `~/.dsh/.credentials.yaml` 中的键 |
+安装并重启后，打开 DSH Web 的 **设置 → 插件** 页，找到 **Grafana 大盘编辑** 卡片：
 
-可在 DSH Web 设置界面（插件页）或 profile 的 `cordis.patch.yml` 中覆盖。
+| 字段 | 说明 |
+| --- | --- |
+| Service Account Token | 粘贴 `glsa_...` 后点保存；写入本机凭证库（`~/.dsh/.credentials.yaml`，600 权限），界面只显示 已配置/未配置，永不回显明文 |
+| Grafana 地址 | 留空使用默认 `http://grafana.example.com`；填写后同样写入本机凭证库（`GRAFANA_BASE_URL`），保存即生效 |
 
-## 凭证配置
+前提：在 Grafana 中创建 **Service Account**（Editor 权限）并生成 token。
 
-1. 在 Grafana 中创建 **Service Account**（Editor 权限）并生成 token（`glsa_...`）
-2. 把 token 写入本机凭证文件（权限 600，仅本机用户可读）：
+### 高级：CLI / 文件方式（等价）
 
 ```bash
 echo 'GRAFANA_TOKEN: glsa_xxxxxxxx' >> ~/.dsh/.credentials.yaml
 chmod 600 ~/.dsh/.credentials.yaml
 ```
 
-3. 聊天记录、插件配置、日志中永远只出现引用名 `GRAFANA_TOKEN`，不出现 token 明文
+也可以覆盖插件配置（`baseUrl` / `tokenRef`）。token 永远不进聊天、不进 git。
 
 ## 工具
 

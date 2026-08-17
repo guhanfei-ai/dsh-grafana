@@ -1,16 +1,26 @@
 {
   "name": "dsh-grafana",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Grafana dashboard editor for DeepSeek Harness: paste a dashboard URL, edit JSON via conversation, push back via HTTP API",
   "type": "module",
   "main": "index.js",
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web",
+      "immediately": true
     }
   },
   "dependencies": {
@@ -30,5 +40,10 @@
     "type": "git",
     "url": "git+https://github.com/guhanfei-ai/dsh-grafana.git"
   },
-  "homepage": "https://github.com/guhanfei-ai/dsh-grafana"
+  "homepage": "https://github.com/guhanfei-ai/dsh-grafana",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  }
 }
