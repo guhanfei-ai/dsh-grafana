@@ -1,0 +1,3 @@
+- insert:
+    - id: grafana
+      name: dsh-grafana
