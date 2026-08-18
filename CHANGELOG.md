@@ -18,7 +18,8 @@ All notable changes to this project are documented here. Release-specific notes 
 
 - Automated tests and a Node 20/22/24 CI matrix.
 - English default documentation and a Simplified Chinese translation.
-- Explicit `publish.sh` release workflow.
+- Explicit three-step `deploy.sh` release workflow (`release` → `build` → `publish`).
+- npm publication in `./deploy.sh publish`: the packed tarball is uploaded to npm before the GitHub Release is created, and versions already on npm are skipped so failed runs can be retried safely.
 - Security, contributing, conduct, and dependency-update policies.
 
 ### Changed

@@ -26,5 +26,5 @@ dsh plugin --profile <profile> add link:/absolute/path/to/dsh-grafana
 - Update both `README.md` and `README.zh-CN.md` when user-facing behavior changes.
 - Run `npm run verify` and `npm pack --dry-run --ignore-scripts` before opening a pull request.
 
-Use clear commit messages. Releases are created only through `publish.sh`; ordinary pushes must not create tags or Releases.
+Use clear commit messages. Releases are created only through `deploy.sh`; ordinary pushes must not create tags or Releases.
 

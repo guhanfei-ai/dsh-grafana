@@ -49,7 +49,7 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-grafana
 
 安装后重启对应 DSH profile。
 
-Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台；`publish.sh` 需要 Git Bash、WSL、macOS 或 Linux。
+Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台；`deploy.sh` 需要 Git Bash、WSL、macOS 或 Linux。
 
 ## 配置
 
@@ -127,30 +127,29 @@ npm pack --dry-run --ignore-scripts
 
 ## 发布
 
-普通手工 `git push` 不会触发版本号、tag 或 Release。只有主动运行发布脚本才会进入发布流程：
+普通手工 `git push` 不会触发版本号、tag 或 Release。发布是一个显式的三步流程，要求 `main` 工作区干净且变更已提交：
 
 ```bash
-bash ./publish.sh patch
-# 也可以使用 minor 或 major
+./deploy.sh release   # 锁版本：递增版本、提交、打 tag、推送（patch/minor/major 或 x.y.z）
+./deploy.sh build     # 验证并打包，产物输出到 dist/
+./deploy.sh publish   # 先将安装包发布到 npm，再创建 GitHub Release 并上传同一产物
 ```
 
-首次发布前需要运行一次 `gh auth login`。脚本要求 `main` 工作区干净且变更已经提交。它会验证代码、递增版本、创建 release commit 与 tag、原子推送并生成 GitHub Release notes；修改 Git 历史和远端前会再次要求明确确认。
+直接运行 `./deploy.sh`（不带参数）可查看内置帮助。首次发布前需要运行一次 `gh auth login` 和 `npm login`。每一步都有自我守卫：`release` 要求 `main` 干净且与远端同步，`build` 要求 tag 已锁定在 `HEAD` 上，`publish` 要求打包产物存在且 GitHub 与 npm 凭证就绪；所有会改动远端的操作都会先要求明确确认。
 
-在 npm 所有者账号和包名配置完成前，脚本不会执行 npm 发布。
+`publish` 会先把 `dist/` 里的安装包发布到 npm，再把同一个文件上传到 GitHub Release，两个渠道分发的产物字节完全一致。npm 版本号不可变：如果 `dsh-grafana@<version>` 已在 npm 上存在，则跳过 npm 步骤、只创建 GitHub Release；脚本也绝不会覆盖已存在的 GitHub Release。
 
-### 稍后占用 npm 包名
+### npm 前置条件
 
-npm 没有独立的“占位”操作，第一次成功发布就会占用包名。准备好后：
+首次 npm 发布前的一次性准备：
 
-1. 在 npmjs.com 注册账号、验证邮箱，并为写操作开启双因素认证。
+1. 使用已验证邮箱、并为写操作开启双因素认证的 npmjs.com 账号。
 2. 执行 `npm login`，再用 `npm whoami` 确认身份。
-3. 用 `npm view dsh-grafana` 再次检查；返回 `404` 表示名字仍未被占用。
-4. 在当前无作用域名称 `dsh-grafana` 与 `@guhanfei-ai/dsh-grafana` 这类 npm 组织作用域名称之间做选择；作用域名称需要先修改 `package.json`。
-5. 在不可变的 release commit 上执行 `npm publish --access public`。
+3. 无作用域名称 `dsh-grafana` 已由包所有者账号占用。如需改用 `@guhanfei-ai/dsh-grafana` 这类组织作用域名称，请先修改 `package.json`；`deploy.sh` 会从其中读取包名。
 
-如果需要供应链来源证明，应先通过独立 CI 工作流配置 npm Trusted Publishing，再在该工作流中加入 `--provenance`。本地用户名/密码或 2FA 登录不具备可信来源证明所需的 CI OIDC 身份。在这套配置完成前，`publish.sh` 仍明确不包含 npm 发布动作。
+开启写操作 2FA 后，`npm publish` 会交互式提示输入一次性验证码；非交互场景可通过 `NPM_OTP` 环境变量传入。
 
-不建议发布空壳占位包，应直接发布已经验证过的插件版本，让包名从第一天起就有可审计的有效内容。
+如需供应链来源证明，建议改用独立 CI 工作流配置 npm Trusted Publishing 并加 `--provenance`；本地登录不具备可信来源证明所需的 CI OIDC 身份。
 
 ## 许可证
 

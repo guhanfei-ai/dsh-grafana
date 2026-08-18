@@ -49,7 +49,7 @@ dsh plugin --profile <profile> add link:/absolute/path/to/dsh-grafana
 
 Restart the selected DSH profile after installation.
 
-On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform; `publish.sh` requires Git Bash, WSL, macOS, or Linux.
+On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform; `deploy.sh` requires Git Bash, WSL, macOS, or Linux.
 
 ## Configuration
 
@@ -127,30 +127,29 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CHANGELOG.md](./CHANGELOG.md).
 
 ## Publishing
 
-Ordinary manual pushes do not trigger versioning or releases. To create an explicit release from a clean, already committed `main` branch:
+Ordinary manual pushes do not trigger versioning or releases. Publishing is an explicit three-step flow from a clean, already committed `main` branch:
 
 ```bash
-bash ./publish.sh patch
-# or: minor / major
+./deploy.sh release   # lock the version: bump, commit, tag, push (patch/minor/major or x.y.z)
+./deploy.sh build     # verify and pack the tarball into dist/
+./deploy.sh publish   # publish the tarball to npm, then create the GitHub Release with it
 ```
 
-Run `gh auth login` once before the first release. The script verifies the repository, increments the version, creates a release commit and tag, atomically pushes them, and creates GitHub Release notes. It asks for confirmation before mutating Git history or the remote.
+Run `./deploy.sh` with no arguments for the built-in help. Run `gh auth login` and `npm login` once before the first release. Each step guards itself: `release` requires a clean synced `main`, `build` requires the tag to sit on `HEAD`, and `publish` requires the packed tarball plus GitHub and npm credentials. Every remote-mutating step asks for confirmation first.
 
-npm publication is intentionally disabled until the package owner account and package name are configured.
+`publish` uploads the exact tarball from `dist/` to npm first, then attaches the same file to the GitHub Release, so both channels serve byte-identical artifacts. npm versions are immutable: if `dsh-grafana@<version>` already exists on npm, the npm step is skipped and only the GitHub Release is created. The script never overwrites an existing GitHub Release.
 
-### Reserving the npm name later
+### npm prerequisites
 
-npm has no separate placeholder operation: the first valid publication reserves the package name. When ready:
+One-time setup before the first npm publish:
 
-1. Create an account at npmjs.com, verify the email address, and enable two-factor authentication for writes.
+1. Use an npmjs.com account with a verified email and two-factor authentication enabled for writes.
 2. Run `npm login` and confirm with `npm whoami`.
-3. Recheck availability with `npm view dsh-grafana`; a `404` means it is still unclaimed.
-4. Decide between the current unscoped name `dsh-grafana` and an npm organization scope such as `@guhanfei-ai/dsh-grafana`. A scoped name requires changing `package.json` first.
-5. From an immutable release commit, run `npm publish --access public`.
+3. The unscoped name `dsh-grafana` is already reserved under the package owner account. Switching to an organization scope such as `@guhanfei-ai/dsh-grafana` requires changing `package.json` first; `deploy.sh` reads the package name from there.
 
-For provenance, configure npm Trusted Publishing with a dedicated CI workflow first, then add `--provenance` in that workflow. Local username/password or 2FA login does not provide the CI OIDC identity required for trusted provenance. npm publishing remains deliberately absent from `publish.sh` until that setup is complete.
+With write 2FA enabled, `npm publish` prompts for a one-time password interactively. For non-interactive runs, pass it through the `NPM_OTP` environment variable.
 
-Do not publish an empty placeholder package. Publish the verified plugin release so the reserved name has useful, auditable contents.
+For supply-chain provenance, prefer npm Trusted Publishing from a dedicated CI workflow with `--provenance` over local publishing: a local login cannot provide the CI OIDC identity that provenance requires.
 
 ## License
 
