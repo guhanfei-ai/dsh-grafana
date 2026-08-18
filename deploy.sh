@@ -33,7 +33,7 @@ die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 
 need_cmd() {
   for c in "$@"; do
-    command -v "$c" >/dev/null 2>&1 || die "缺少命令：$c，请先安装"
+    command -v "$c" >/dev/null 2>&1 || die "缺少命令：${c}，请先安装"
   done
 }
 
@@ -48,13 +48,13 @@ confirm() {
 guard_main() {
   local branch
   branch="$(git rev-parse --abbrev-ref HEAD)"
-  [[ "$branch" == "$RELEASE_BRANCH" ]] || die "发布相关命令仅允许在 $RELEASE_BRANCH 分支执行（当前分支：$branch）"
+  [[ "$branch" == "$RELEASE_BRANCH" ]] || die "发布相关命令仅允许在 $RELEASE_BRANCH 分支执行（当前分支：${branch}）"
 }
 
 # tag 守卫：确认当前版本已通过 release 锁定在 HEAD 上
 guard_tag() {
   git tag --points-at HEAD | grep -Fxq "$GIT_TAG" || {
-    die "当前HEAD上不存在tag $GIT_TAG，请先执行 ./deploy.sh release 锁定版本"
+    die "当前HEAD上不存在tag ${GIT_TAG}，请先执行 ./deploy.sh release 锁定版本"
   }
 }
 
@@ -100,7 +100,7 @@ cmd_release() {
   gh auth status >/dev/null
   git fetch --tags origin "$RELEASE_BRANCH"
   git merge-base --is-ancestor "origin/$RELEASE_BRANCH" HEAD || {
-    die "本地 $RELEASE_BRANCH 未包含 origin/$RELEASE_BRANCH，请先 rebase 或 merge"
+    die "本地 $RELEASE_BRANCH 未包含 origin/${RELEASE_BRANCH}，请先 rebase 或 merge"
   }
 
   # 解析新版本号：参数指定 或 交互输入；支持 patch/minor/major 或显式 x.y.z，回车默认 patch
@@ -138,9 +138,9 @@ cmd_release() {
 
   # 确认
   if [[ "$relock" == "true" ]]; then
-    confirm "确认重锁 $next_tag（tag 将强制移动到当前HEAD）？[y/N] " || { printf '已取消\n'; exit 0; }
+    confirm "确认重锁 ${next_tag}（tag 将强制移动到当前HEAD）？[y/N] " || { printf '已取消\n'; exit 0; }
   else
-    confirm "确认发布 $next_tag（当前 v$VERSION → $next_tag）？[y/N] " || { printf '已取消\n'; exit 0; }
+    confirm "确认发布 ${next_tag}（当前 v$VERSION → ${next_tag}）？[y/N] " || { printf '已取消\n'; exit 0; }
   fi
 
   # 发布前完整验证
