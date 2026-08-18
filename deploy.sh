@@ -206,7 +206,7 @@ cmd_publish() {
 
   # build 每次都会重建 dist/，其中只有一个 .tgz 产物
   local asset
-  asset="$(find dist -maxdepth 1 -name '*.tgz' 2>/dev/null | head -n 1)"
+  asset="$(find ./dist -maxdepth 1 -name '*.tgz' 2>/dev/null | head -n 1)"
   [[ -n "$asset" ]] || die "缺少打包产物 dist/*.tgz，请先执行 ./deploy.sh build"
 
   # npm 版本不可变：已发布过的版本直接跳过 npm 步骤，保证失败后可安全重跑
