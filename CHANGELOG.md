@@ -28,6 +28,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Changed
 
+- Make the settings card collapsible: it renders collapsed by default (title, description, and a chevron) and expands on click, matching the official plugin cards in Settings → Plugins.
 - Allow plain HTTP for non-loopback Grafana hosts by default so internal deployments without TLS work without extra configuration; HTTPS-only enforcement remains available via `allowInsecureHttp: false`.
 - Localize the settings card (Simplified Chinese and English, following the GUI locale preference with browser-language fallback), move the remove buttons next to their inputs, and display the configured Grafana URL via a same-origin local mirror.
 - Default dashboard writes to `overwrite: false`.

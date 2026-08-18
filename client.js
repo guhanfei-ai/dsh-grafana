@@ -84,7 +84,14 @@ window.__ModuleLoader__.load({
 		}
 
 		const S = {
-			card: { border: "1px solid var(--dsw-alias-border-l2)", borderRadius: "12px", background: "var(--dsw-alias-bg-layer-2)", padding: "16px", marginBottom: "12px", display: "flex", flexDirection: "column", gap: "12px" },
+			// 折叠卡片外壳对齐官方 PluginCard（ui-settings-plugins 包）的观感：
+			// 收起时用 bg-layer-3，展开后切换到 bg-layer-2。
+			card: { border: "1px solid var(--dsw-alias-border-l2)", borderRadius: "12px", background: "var(--dsw-alias-bg-layer-3)", marginBottom: "12px" },
+			cardOpen: { background: "var(--dsw-alias-bg-layer-2)" },
+			header: { display: "flex", alignItems: "center", gap: "12px", width: "100%", padding: "16px", margin: 0, background: "none", border: "none", cursor: "pointer", textAlign: "left", font: "inherit", color: "inherit" },
+			headerText: { display: "flex", flexDirection: "column", gap: "4px", flex: "1 1 auto", minWidth: 0 },
+			chevron: { flexShrink: 0, display: "inline-flex", transition: "transform .16s", color: "var(--dsw-alias-label-tertiary)" },
+			body: { borderTop: "1px solid var(--dsw-alias-border-l2)", margin: "0 16px", padding: "16px 0", display: "flex", flexDirection: "column", gap: "12px" },
 			title: { margin: 0, fontSize: "15px", fontWeight: 600, color: "var(--dsw-alias-label-primary)" },
 			desc: { margin: 0, fontSize: "13px", color: "var(--dsw-alias-label-secondary)" },
 			row: { display: "flex", flexDirection: "column", gap: "6px" },
@@ -111,6 +118,8 @@ window.__ModuleLoader__.load({
 			const [error, setError] = react.useState("");
 			const [tokenFocus, setTokenFocus] = react.useState(false);
 			const [lang, setLang] = react.useState(detectLanguage);
+			// 展开状态是卡片本地的阅读手势，Host 与设置页都不参与（同官方 PluginCard）。
+			const [open, setOpen] = react.useState(false);
 			const T = STRINGS[lang] ?? STRINGS.en;
 
 			// 已配置时显示虚假掩码；聚焦后展示空白的替换草稿。
@@ -185,49 +194,70 @@ window.__ModuleLoader__.load({
 				}
 			}
 
-			return (0, react_jsx_runtime.jsxs)("section", { style: S.card, children: [
-				(0, react_jsx_runtime.jsx)("h3", { style: S.title, children: T.title }),
-				(0, react_jsx_runtime.jsx)("p", { style: S.desc, children: T.desc }),
-				(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
-					(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
-						(0, react_jsx_runtime.jsx)("label", { style: S.label, children: T.tokenLabel }),
-						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.token ? S.badgeOk : {}) }, children: status.token ? T.configured : T.notConfigured }) : null
+			return (0, react_jsx_runtime.jsxs)("section", { style: open ? { ...S.card, ...S.cardOpen } : S.card, children: [
+				(0, react_jsx_runtime.jsxs)("button", {
+					type: "button",
+					style: S.header,
+					"aria-expanded": open,
+					onClick: () => setOpen(!open),
+					children: [
+						(0, react_jsx_runtime.jsxs)("span", { style: S.headerText, children: [
+							(0, react_jsx_runtime.jsx)("span", { style: S.title, children: T.title }),
+							(0, react_jsx_runtime.jsx)("span", { style: S.desc, children: T.desc })
+						] }),
+						(0, react_jsx_runtime.jsx)("svg", {
+							width: 14,
+							height: 14,
+							viewBox: "0 0 14 14",
+							fill: "none",
+							"aria-hidden": "true",
+							style: { ...S.chevron, transform: open ? "rotate(180deg)" : "none" },
+							children: (0, react_jsx_runtime.jsx)("path", { d: "M3.5 5.25 7 8.75 10.5 5.25", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round", strokeLinejoin: "round" })
+						})
+					]
+				}),
+				open ? (0, react_jsx_runtime.jsxs)("div", { style: S.body, children: [
+					(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
+						(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
+							(0, react_jsx_runtime.jsx)("label", { style: S.label, children: T.tokenLabel }),
+							status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.token ? S.badgeOk : {}) }, children: status.token ? T.configured : T.notConfigured }) : null
+						] }),
+						(0, react_jsx_runtime.jsxs)("div", { style: S.inputRow, children: [
+							(0, react_jsx_runtime.jsx)("input", {
+								type: "password",
+								style: S.input,
+								placeholder: T.tokenPlaceholder,
+								value: tokenValue,
+								onFocus: () => setTokenFocus(true),
+								onBlur: () => { if (tokenDraft === "") setTokenFocus(false); },
+								onChange: (e) => {
+									let v = e.target.value;
+									// 处理聚焦后立即输入的边界情况，剥离视觉占位符。
+									if (v.startsWith(MASK)) v = v.slice(MASK.length);
+									setTokenDraft(v);
+								}
+							}),
+							status.token ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("token"), children: T.removeToken }) : null
+						] }),
+						(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: status.token ? T.tokenHintConfigured : T.tokenHintEmpty })
 					] }),
-					(0, react_jsx_runtime.jsxs)("div", { style: S.inputRow, children: [
-						(0, react_jsx_runtime.jsx)("input", {
-							type: "password",
-							style: S.input,
-							placeholder: T.tokenPlaceholder,
-							value: tokenValue,
-							onFocus: () => setTokenFocus(true),
-							onBlur: () => { if (tokenDraft === "") setTokenFocus(false); },
-							onChange: (e) => {
-								let v = e.target.value;
-								// 处理聚焦后立即输入的边界情况，剥离视觉占位符。
-								if (v.startsWith(MASK)) v = v.slice(MASK.length);
-								setTokenDraft(v);
-							}
-						}),
-						status.token ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("token"), children: T.removeToken }) : null
+					(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
+						(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
+							(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Grafana URL" }),
+							status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.base ? S.badgeOk : {}) }, children: status.base ? T.configured : T.notConfigured }) : null
+						] }),
+						(0, react_jsx_runtime.jsxs)("div", { style: S.inputRow, children: [
+							(0, react_jsx_runtime.jsx)("input", { type: "url", style: S.input, placeholder: status.base ? T.urlPlaceholderConfigured : T.urlPlaceholderEmpty, value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
+							status.base ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("base"), children: T.removeUrl }) : null
+						] }),
+						(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: T.urlHint })
 					] }),
-					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: status.token ? T.tokenHintConfigured : T.tokenHintEmpty })
-				] }),
-				(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
-					(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
-						(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Grafana URL" }),
-						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.base ? S.badgeOk : {}) }, children: status.base ? T.configured : T.notConfigured }) : null
-					] }),
-					(0, react_jsx_runtime.jsxs)("div", { style: S.inputRow, children: [
-						(0, react_jsx_runtime.jsx)("input", { type: "url", style: S.input, placeholder: status.base ? T.urlPlaceholderConfigured : T.urlPlaceholderEmpty, value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
-						status.base ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("base"), children: T.removeUrl }) : null
-					] }),
-					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: T.urlHint })
-				] }),
-				(0, react_jsx_runtime.jsxs)("div", { style: S.footer, children: [
-					(0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: onSave, children: saving ? T.saving : T.save }),
-					saved ? (0, react_jsx_runtime.jsx)("p", { style: S.msg, children: T.saved }) : null,
-					error ? (0, react_jsx_runtime.jsx)("p", { style: S.err, children: error }) : null
-				] })
+					(0, react_jsx_runtime.jsxs)("div", { style: S.footer, children: [
+						(0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: onSave, children: saving ? T.saving : T.save }),
+						saved ? (0, react_jsx_runtime.jsx)("p", { style: S.msg, children: T.saved }) : null,
+						error ? (0, react_jsx_runtime.jsx)("p", { style: S.err, children: error }) : null
+					] })
+				] }) : null
 			] });
 		}
 
