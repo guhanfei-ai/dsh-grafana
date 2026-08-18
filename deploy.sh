@@ -12,8 +12,12 @@ set -Eeuo pipefail
 #   ./deploy.sh publish  --->  分发：凭证校验后，先将安装包发布到 npm，
 #                              再创建GitHub Release并上传同一产物
 #
+#   ./deploy.sh all      --->  一键三连：依次执行 release → build → publish，
+#                              版本号输入与确认提示照常交互
+#
 # 不运行本脚本时，日常提交推送完全不受影响。
-# 发布新版本时按 release → build → publish 三步执行，版本号由脚本维护，无需手改任何文件。
+# 发布新版本时按 release → build → publish 三步执行（或用 all 一键串联），
+# 版本号由脚本维护，无需手改任何文件。
 
 ######################################
 # 全局配置
@@ -69,12 +73,13 @@ verify_and_install() {
 usage() {
   cat <<'EOF'
 
-用法：./deploy.sh <release|build|publish>
+用法：./deploy.sh <release|build|publish|all>
 
 发布流程（三步走）：
   ./deploy.sh release  ->  锁版本：交互输入版本号（patch/minor/major 或 x.y.z），自动提交/打tag/推送
   ./deploy.sh build    ->  打包：验证 + npm pack，产物输出到 dist/（纯JS插件，无编译步骤）
   ./deploy.sh publish  ->  分发：先将 dist/ 安装包发布到 npm，再创建 GitHub Release 上传同一产物
+  ./deploy.sh all      ->  一键三连：依次执行 release → build → publish（版本号等提示照常交互）
 
 以上命令仅限 main 分支执行，其它分支会被强制拦截；
 日常开发时随意提交推送，互不影响。
@@ -244,6 +249,22 @@ cmd_publish() {
 }
 
 ######################################
+# 子命令：一键三连（release → build → publish）
+# 等价于依次手动执行三步；版本号输入与各步确认提示照常交互
+######################################
+cmd_all() {
+  banner '一键发布：release → build → publish'
+  cmd_release "$@"
+
+  # release 可能已递增版本号，重新读取，保证 build/publish 使用新 tag
+  VERSION="$(node -p 'require("./package.json").version')"
+  GIT_TAG="v${VERSION}"
+
+  cmd_build
+  cmd_publish
+}
+
+######################################
 # 入口：分发子命令；无参数时只显示帮助
 ######################################
 cd "$(git rev-parse --show-toplevel)"
@@ -252,6 +273,7 @@ case "${1:-}" in
   release) shift; cmd_release "$@" ;;
   build)   cmd_build ;;
   publish) cmd_publish ;;
+  all)     shift; cmd_all "$@" ;;
   -h|--help|help|'') usage ;;
   *) usage >&2; exit 2 ;;
 esac
