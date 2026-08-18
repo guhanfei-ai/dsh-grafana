@@ -1,12 +1,14 @@
+# Dependabot 配置：自动为依赖与 GitHub Actions 提交升级 PR。
 version: 2
 updates:
+  # 1) npm 依赖：每周检查一次，最多同时打开 5 个升级 PR。
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  # 2) GitHub Actions：每月检查一次，让工作流使用的 action 版本保持更新。
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
-
