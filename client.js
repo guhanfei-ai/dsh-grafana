@@ -1,7 +1,5 @@
-// dsh-grafana — 浏览器端：在「设置 → 插件」页注册配置卡片。
-// 由 dsh-client-modules 按 /plugins/dsh-grafana/client.js 加载，
-// 通过 window.__ModuleLoader__.load 注册；工厂内为纯 CJS，
-// require 由 shell 模块表解析（仅平台种子词与已注册客户端包可用）。
+// dsh-grafana 浏览器设置卡片。凭证值只通过 DSH 的 loopback same-origin
+// 凭证 RPC 单向写入，客户端永远不会读回明文。
 window.__ModuleLoader__.load({
 	id: "dsh-grafana",
 	factory: (require) => {
@@ -13,7 +11,7 @@ window.__ModuleLoader__.load({
 
 		const TOKEN_REF = "GRAFANA_TOKEN";
 		const BASE_URL_REF = "GRAFANA_BASE_URL";
-		// 已配置时的占位星号串（虚假值，仅视觉提示，绝不写入凭证库）
+		// 仅用于视觉提示的占位符，永远不会写入凭证库。
 		const MASK = "*".repeat(28);
 
 		const inject = ["slots", "connection"];
@@ -37,7 +35,7 @@ window.__ModuleLoader__.load({
 
 		function GrafanaCard(props) {
 			const face = props.grafanaCard;
-			const [status, setStatus] = react.useState({ loaded: false, token: false });
+			const [status, setStatus] = react.useState({ loaded: false, token: false, base: false });
 			const [tokenDraft, setTokenDraft] = react.useState("");
 			const [baseDraft, setBaseDraft] = react.useState("");
 			const [saving, setSaving] = react.useState(false);
@@ -45,16 +43,13 @@ window.__ModuleLoader__.load({
 			const [error, setError] = react.useState("");
 			const [tokenFocus, setTokenFocus] = react.useState(false);
 
-			// 已配置且未聚焦且无新输入时，用虚假星号占位；否则显示真实草稿（草稿在聚焦后才可能产生）
+			// 已配置时显示虚假掩码；聚焦后展示空白的替换草稿。
 			const tokenValue = status.token && !tokenFocus && tokenDraft === "" ? MASK : tokenDraft;
 
 			react.useEffect(() => {
 				let alive = true;
 				face.describe().then((r) => {
-					if (alive) setStatus({ loaded: true, token: r.tokenConfigured });
-				}).catch(() => {});
-				face.loadConfig().then((c) => {
-					if (alive) setBaseDraft(c.baseUrl || '');
+					if (alive) setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
 				}).catch(() => {});
 				return () => { alive = false; };
 			}, [face]);
@@ -65,9 +60,32 @@ window.__ModuleLoader__.load({
 					const t = tokenDraft.trim();
 					const b = baseDraft.trim();
 					if (t !== "") await face.setToken(t);
-					if (b !== "") await face.saveBaseUrl(b);
+					if (b !== "") {
+						const url = new URL(b);
+						if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+							throw new Error("Grafana URL must be an absolute HTTP(S) URL without credentials, query, or fragment.");
+						}
+						await face.setBaseUrl(b);
+					}
 					const r = await face.describe();
-					setStatus({ loaded: true, token: r.tokenConfigured });
+					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
+					setTokenDraft(""); setBaseDraft(""); setTokenFocus(false);
+					setSaved(true);
+				} catch (e) {
+					setError(String(e?.message ?? e));
+				} finally {
+					setSaving(false);
+				}
+			}
+
+			async function onClear(kind) {
+				const label = kind === "token" ? "service-account token" : "Grafana URL";
+				if (!window.confirm(`Remove the stored ${label}?`)) return;
+				setSaving(true); setSaved(false); setError("");
+				try {
+					await face.unset(kind === "token" ? TOKEN_REF : BASE_URL_REF);
+					const r = await face.describe();
+					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
 					setTokenDraft(""); setBaseDraft(""); setTokenFocus(false);
 					setSaved(true);
 				} catch (e) {
@@ -78,37 +96,42 @@ window.__ModuleLoader__.load({
 			}
 
 			return (0, react_jsx_runtime.jsxs)("section", { style: S.card, children: [
-				(0, react_jsx_runtime.jsx)("h3", { style: S.title, children: "Grafana 大盘编辑" }),
-				(0, react_jsx_runtime.jsx)("p", { style: S.desc, children: "贴大盘 URL 给 AI，对话微调后写回 Grafana。在此配置连接信息，保存后对后续对话生效。" }),
+				(0, react_jsx_runtime.jsx)("h3", { style: S.title, children: "Grafana dashboard editor" }),
+				(0, react_jsx_runtime.jsx)("p", { style: S.desc, children: "Fetch and safely update Grafana dashboards through conversation. Credential values are stored locally and never displayed." }),
 				(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
 					(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
 						(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Service Account Token" }),
-						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.token ? S.badgeOk : {}) }, children: status.token ? "已配置" : "未配置" }) : null
+						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.token ? S.badgeOk : {}) }, children: status.token ? "Configured" : "Not configured" }) : null
 					] }),
 					(0, react_jsx_runtime.jsx)("input", {
 						type: "password",
 						style: S.input,
-						placeholder: "留空保持现有凭证；粘贴 glsa_… 后点保存",
+						placeholder: "Leave blank to keep the current token; enter a new token to replace it",
 						value: tokenValue,
 						onFocus: () => setTokenFocus(true),
 						onBlur: () => { if (tokenDraft === "") setTokenFocus(false); },
 						onChange: (e) => {
 							let v = e.target.value;
-							// 防御：若值仍带占位星号前缀（聚焦后立即输入的理论边界），剥离后再存草稿
+							// 处理聚焦后立即输入的边界情况，剥离视觉占位符。
 							if (v.startsWith(MASK)) v = v.slice(MASK.length);
 							setTokenDraft(v);
 						}
 					}),
-					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: status.token ? "已配置（星号为占位，不回显真实 token）。聚焦输入新值即可覆盖。" : "写入本机凭证库（~/.dsh/.credentials.yaml，600 权限）；界面永不回显。" })
+					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: status.token ? "Configured. The stars are a placeholder, not the stored value." : "Stored in the local DSH credential store; the value is never read back." }),
+					status.token ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("token"), children: "Remove token" }) : null
 				] }),
 				(0, react_jsx_runtime.jsxs)("div", { style: S.row, children: [
-					(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Grafana 地址" }),
-					(0, react_jsx_runtime.jsx)("input", { type: "text", style: S.input, placeholder: "如 https://grafana.example.com", value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
-					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: "同样写入本机凭证库（GRAFANA_BASE_URL），保存后即生效。" })
+					(0, react_jsx_runtime.jsxs)("div", { style: S.head, children: [
+						(0, react_jsx_runtime.jsx)("label", { style: S.label, children: "Grafana URL" }),
+						status.loaded ? (0, react_jsx_runtime.jsx)("span", { style: { ...S.badge, ...(status.base ? S.badgeOk : {}) }, children: status.base ? "Configured" : "Not configured" }) : null
+					] }),
+					(0, react_jsx_runtime.jsx)("input", { type: "url", style: S.input, placeholder: status.base ? "Configured; enter a new URL to replace it" : "https://grafana.example.com", value: baseDraft, onChange: (e) => setBaseDraft(e.target.value) }),
+					(0, react_jsx_runtime.jsx)("p", { style: S.hint, children: "HTTPS is required by default. The stored URL is intentionally not displayed." }),
+					status.base ? (0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: () => onClear("base"), children: "Remove URL" }) : null
 				] }),
 				(0, react_jsx_runtime.jsxs)("div", { style: S.footer, children: [
-					(0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: onSave, children: saving ? "保存中…" : "保存" }),
-					saved ? (0, react_jsx_runtime.jsx)("p", { style: S.msg, children: "已保存，后续对话使用新配置。" }) : null,
+					(0, react_jsx_runtime.jsx)("button", { style: S.button, disabled: saving, onClick: onSave, children: saving ? "Saving…" : "Save" }),
+					saved ? (0, react_jsx_runtime.jsx)("p", { style: S.msg, children: "Saved. New conversations will use the updated configuration." }) : null,
 					error ? (0, react_jsx_runtime.jsx)("p", { style: S.err, children: error }) : null
 				] })
 			] });
@@ -126,20 +149,8 @@ window.__ModuleLoader__.load({
 					};
 				},
 				setToken: (value) => api.credentials.set({ ref: TOKEN_REF, value }),
-				loadConfig: async () => {
-					const r = await fetch('/dsh-grafana/config')
-					if (!r.ok) throw new Error(`读取配置失败：HTTP ${r.status}`)
-					return r.json()
-				},
-				saveBaseUrl: async (value) => {
-					const r = await fetch('/dsh-grafana/config', {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ baseUrl: value })
-					})
-					if (!r.ok) throw new Error(`保存失败：HTTP ${r.status}`)
-					return r.json()
-				}
+				setBaseUrl: (value) => api.credentials.set({ ref: BASE_URL_REF, value }),
+				unset: (ref) => api.credentials.unset({ ref })
 			};
 			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
 				name: "settings.plugin.item",

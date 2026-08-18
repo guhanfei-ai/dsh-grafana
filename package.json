@@ -4,10 +4,19 @@
   "description": "Grafana dashboard editor for DeepSeek Harness: paste a dashboard URL, edit JSON via conversation, push back via HTTP API",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check test/index.test.js && node --check test/client.test.js",
+    "test": "node --test",
+    "verify": "npm run check && npm test",
+    "prepack": "npm run verify"
+  },
   "files": [
     "index.js",
     "client.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "dsh": {
     "bundle": {
@@ -24,8 +33,11 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "engines": {
+    "node": ">=20.11"
   },
   "keywords": [
     "deepseek",
@@ -35,12 +47,19 @@
     "grafana",
     "dashboard"
   ],
+  "author": "guhanfei-ai",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/guhanfei-ai/dsh-grafana.git"
   },
-  "homepage": "https://github.com/guhanfei-ai/dsh-grafana",
+  "homepage": "https://github.com/guhanfei-ai/dsh-grafana#readme",
+  "bugs": {
+    "url": "https://github.com/guhanfei-ai/dsh-grafana/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
