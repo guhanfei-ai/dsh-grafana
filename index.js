@@ -5,6 +5,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 export const name = 'grafana'
 export const inject = ['tools', 'systemPrompt', 'credentials']
 
+// 设置页卡片按 Host 端 settings namespace 派发（keyed slot），
+// 必须与 client.js 中 slots.register 的 key 保持一致。
+export const SETTINGS_NAMESPACE = 'grafana'
+
 const TOKEN_REF = 'GRAFANA_TOKEN'
 const BASE_URL_REF = 'GRAFANA_BASE_URL'
 const UID_PATTERN = /^[A-Za-z0-9_-]{1,40}$/
@@ -167,13 +171,28 @@ function approvalReason(args) {
 }
 
 export function apply(ctx, config = {}) {
-  const resolvedConfig = {
+  const entryConfig = {
     baseUrl: '',
     tokenRef: TOKEN_REF,
     allowInsecureHttp: true,
     ...config,
   }
-  validateCredentialRef(resolvedConfig.tokenRef)
+  validateCredentialRef(entryConfig.tokenRef)
+
+  // 当前生效配置：settings 服务可用时以 settings 命名空间的解析值为准
+  // （schema 默认值 → 组合层 base → 用户设置层），否则回退为入口配置。
+  // 与官方插件的 installSettingsSection 同一模式（见 packages/settings/settings）。
+  let activeConfig = () => entryConfig
+  ctx.inject(['settings'], (sctx) => {
+    const scope = sctx.settings.register(SETTINGS_NAMESPACE, Config, {
+      base: entryConfig,
+      validate: (value) => validateCredentialRef(value.tokenRef),
+    })
+    activeConfig = () => scope.get()
+    sctx.effect(() => () => {
+      activeConfig = () => entryConfig
+    })
+  })
 
   const snapshots = new Map()
   ctx.systemPrompt.section({ name: 'tool:grafana', order: 107, text: GUIDANCE })
@@ -185,16 +204,18 @@ export function apply(ctx, config = {}) {
   })
 
   async function authHeaders() {
-    const result = await ctx.credentials.resolve(resolvedConfig.tokenRef)
+    const { tokenRef } = activeConfig()
+    const result = await ctx.credentials.resolve(tokenRef)
     if (!result?.value) {
-      throw new Error(`Credential ${resolvedConfig.tokenRef} is not configured. Set it in Settings → Plugins or in the DSH credential store.`)
+      throw new Error(`Credential ${tokenRef} is not configured. Set it in Settings → Plugins or in the DSH credential store.`)
     }
     return { Authorization: `Bearer ${result.value}` }
   }
 
   async function resolveBaseUrl() {
+    const { allowInsecureHttp, baseUrl } = activeConfig()
     const stored = await ctx.credentials.resolve(BASE_URL_REF)
-    return normalizeBaseUrl(stored?.value || resolvedConfig.baseUrl, resolvedConfig.allowInsecureHttp)
+    return normalizeBaseUrl(stored?.value || baseUrl, allowInsecureHttp)
   }
 
   async function api(path, init = {}, parentSignal) {

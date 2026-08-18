@@ -55,6 +55,8 @@ On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itsel
 
 In DSH Web, open **Settings → Plugins → Grafana dashboard editor**.
 
+> Note: the settings page dispatches plugin cards by the settings namespace registered on the Host (`grafana`). The served-namespace list is re-read only on settings-document commits or connection resets, so if the card does not appear right after upgrading the plugin, refresh the page (or reconnect the Web UI).
+
 Configure:
 
 - **Service Account Token**: a Grafana service-account token such as `glsa_...`.

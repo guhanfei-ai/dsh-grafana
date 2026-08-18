@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { apply, internals } from '../index.js'
+import { apply, Config, internals, SETTINGS_NAMESPACE } from '../index.js'
 
 function execution() {
   return { signal: new AbortController().signal }
@@ -19,6 +19,8 @@ function createContext({ baseUrl = 'https://grafana.example.com', token = 'test-
         return undefined
       },
     },
+    // 无 settings 服务时注入回调不会执行（与真实 cordis 行为一致）。
+    inject() {},
     on(name, listener) {
       listeners.set(name, listener)
       return () => listeners.delete(name)
@@ -209,4 +211,66 @@ test('grafana_push requires an explicit flag before moving folders', async () =>
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+function createSettingsContext(userSection = {}) {
+  const tools = []
+  let section = { ...userSection }
+  const registrations = []
+  const ctx = {
+    credentials: {
+      async resolve() { return undefined },
+    },
+    inject(services, callback) {
+      if (!services.includes('settings')) return
+      callback({
+        ...ctx,
+        effect(setup) { setup() },
+        settings: {
+          register(ns, schema, options = {}) {
+            const scope = {
+              get: () => schema({ ...options.base, ...section }),
+              async update(patch) { section = { ...section, ...patch } },
+            }
+            options.validate?.(scope.get())
+            registrations.push({ ns, options, scope })
+            return scope
+          },
+        },
+      })
+    },
+    on() { return () => {} },
+    systemPrompt: { section() {} },
+    tools: {
+      register(tool) { tools.push(tool); return () => {} },
+    },
+  }
+  apply(ctx, {})
+  return { registrations, tools }
+}
+
+test('apply registers a grafana settings namespace and resolves config through it', async () => {
+  const { registrations, tools } = createSettingsContext()
+  assert.equal(registrations.length, 1)
+  const [{ ns, options, scope }] = registrations
+  assert.equal(ns, SETTINGS_NAMESPACE)
+  assert.equal(typeof options.validate, 'function')
+  assert.throws(() => options.validate({ ...scope.get(), tokenRef: 'bad ref' }), /Invalid credential reference/)
+
+  // 用户设置层的值优先于组合层 base，健康检查按其解析 base URL。
+  await scope.update({ baseUrl: 'https://grafana.internal' })
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return jsonResponse({ status: 'ok' })
+  }
+  try {
+    await toolByName(tools, 'grafana_health').execute({}, execution())
+  } catch {
+    // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(calls[0], 'https://grafana.internal/api/health')
 })

@@ -58,6 +58,10 @@ test('browser module uses only the privileged credential RPC for configuration',
         callback()
       },
       register(specification) {
+        // keyed slot：key 必须与 index.js 的 SETTINGS_NAMESPACE 一致。
+        assert.equal(specification.key, 'grafana')
+        assert.equal('id' in specification, false)
+        assert.equal('order' in specification, false)
         face = specification.inject().grafanaCard
         return () => {}
       },

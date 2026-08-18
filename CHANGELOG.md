@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore the settings card after the DSH marketplace update: the `settings.plugin.item` slot is now keyed by Host-side settings namespace, so the plugin registers a `grafana` settings namespace on the Host (configuration now also honors the user settings layer, resolved above the composition entry) and the browser card registers with the matching `key` instead of the removed `id`/`order` list options.
+
 ### Security
 
 - Route browser configuration through DSH's privileged credential RPC instead of a custom unauthenticated HTTP route.

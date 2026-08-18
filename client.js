@@ -256,9 +256,10 @@ window.__ModuleLoader__.load({
 				}
 			};
 			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
+				// keyed slot：设置页按 Host 端 settings namespace（见 index.js 的
+				// SETTINGS_NAMESPACE）派发卡片，没有 key 的注册永远不会被渲染。
 				name: "settings.plugin.item",
-				id: "grafana",
-				order: 30,
+				key: "grafana",
 				inject: () => ({ grafanaCard: face })
 			}, GrafanaCard));
 		}
