@@ -10,7 +10,7 @@ All notable changes to this project are documented here. Release-specific notes 
 - Require native DSH approval for every dashboard write.
 - Validate dashboard identity and version immediately before writing.
 - Preserve the current folder by default and require explicit confirmation for folder moves.
-- Require HTTPS for non-loopback Grafana hosts unless explicitly overridden.
+- Support HTTP and HTTPS out of the box, with an `allowInsecureHttp: false` opt-out for HTTPS-only enforcement.
 - Add request timeouts, cancellation, redirect rejection, bounded bodies, and sanitized API errors.
 - Treat Grafana content as untrusted model data and document model-provider data boundaries.
 
@@ -24,8 +24,11 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Changed
 
+- Allow plain HTTP for non-loopback Grafana hosts by default so internal deployments without TLS work without extra configuration; HTTPS-only enforcement remains available via `allowInsecureHttp: false`.
+- Localize the settings card (Simplified Chinese and English, following the GUI locale preference with browser-language fallback), move the remove buttons next to their inputs, and display the configured Grafana URL via a same-origin local mirror.
 - Default dashboard writes to `overwrite: false`.
 - Add Grafana version-history messages, title/tag search limits, and Grafana-compatible UID validation.
 - Pin the current DSH RC dependencies and declare the Node.js runtime baseline.
+- Declare `@deepseek-ai/dsh-tools` as a host-provided peer dependency instead of a bundled dependency, avoiding a duplicate copy that could shadow the host version at runtime.
 
 [Unreleased]: https://github.com/guhanfei-ai/dsh-grafana/commits/main

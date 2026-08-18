@@ -62,11 +62,10 @@ Configure:
 
 Both values use DSH's privileged loopback credential RPC. Stored values are never read back or displayed. The UI supports replacing and removing each value.
 
-HTTPS is required for non-loopback hosts by default. Plain HTTP can be enabled explicitly in plugin configuration:
+HTTP and HTTPS both work out of the box — internal deployments without TLS certificates can use an `http://` URL with no extra setup. Note that plain HTTP sends the service-account token in cleartext; always use HTTPS over untrusted networks. To enforce HTTPS only, disable it in plugin configuration:
 
 ```yaml
-baseUrl: http://grafana.internal:3000
-allowInsecureHttp: true
+allowInsecureHttp: false
 ```
 
 An explicit `GRAFANA_BASE_URL` credential takes precedence over `baseUrl`. The token reference defaults to `GRAFANA_TOKEN` and can be changed with `tokenRef`.

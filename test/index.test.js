@@ -59,11 +59,12 @@ test('parseUid accepts Grafana-compatible UIDs and dashboard URLs', () => {
   assert.throws(() => internals.parseUid('not/a/dashboard'), /Cannot parse/)
 })
 
-test('normalizeBaseUrl enforces safe URL defaults', () => {
+test('normalizeBaseUrl allows HTTP out of the box and can enforce HTTPS only', () => {
   assert.equal(internals.normalizeBaseUrl('https://grafana.example.com/'), 'https://grafana.example.com')
   assert.equal(internals.normalizeBaseUrl('http://127.0.0.1:3000/'), 'http://127.0.0.1:3000')
+  assert.equal(internals.normalizeBaseUrl('http://grafana.internal/'), 'http://grafana.internal')
   assert.equal(internals.normalizeBaseUrl('http://grafana.internal/', true), 'http://grafana.internal')
-  assert.throws(() => internals.normalizeBaseUrl('http://grafana.internal/'), /Plain HTTP is disabled/)
+  assert.throws(() => internals.normalizeBaseUrl('http://grafana.internal/', false), /Plain HTTP is disabled/)
   assert.throws(() => internals.normalizeBaseUrl('https://user:pass@grafana.example.com'), /embedded credentials/)
   assert.throws(() => internals.normalizeBaseUrl('https://grafana.example.com?target=x'), /query string or fragment/)
 })

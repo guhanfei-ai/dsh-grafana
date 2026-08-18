@@ -32,7 +32,7 @@ If a version conflict occurs, fetch the dashboard again and reapply the requeste
 export const Config = Schema.object({
   baseUrl: Schema.string().default('').description('Static Grafana base URL. When empty, resolve GRAFANA_BASE_URL from the credential store.'),
   tokenRef: Schema.string().default(TOKEN_REF).description('Credential reference containing the Grafana service-account token.'),
-  allowInsecureHttp: Schema.boolean().default(false).description('Allow plain HTTP for non-loopback Grafana hosts. HTTPS is required by default.'),
+  allowInsecureHttp: Schema.boolean().default(true).description('Allow plain HTTP for non-loopback Grafana hosts. Enabled by default so internal HTTP deployments work out of the box; set to false to enforce HTTPS only.'),
 })
 
 function parseUid(input) {
@@ -43,7 +43,7 @@ function parseUid(input) {
   throw new Error(`Cannot parse a Grafana dashboard UID from ${JSON.stringify(value)}. Use a 1-40 character UID or a /d/<uid>/<slug> URL.`)
 }
 
-function normalizeBaseUrl(input, allowInsecureHttp = false) {
+function normalizeBaseUrl(input, allowInsecureHttp = true) {
   const value = String(input ?? '').trim()
   if (!value) throw new Error('Grafana base URL is not configured. Set it in Settings → Plugins or provide baseUrl in the plugin configuration.')
 
@@ -170,7 +170,7 @@ export function apply(ctx, config = {}) {
   const resolvedConfig = {
     baseUrl: '',
     tokenRef: TOKEN_REF,
-    allowInsecureHttp: false,
+    allowInsecureHttp: true,
     ...config,
   }
   validateCredentialRef(resolvedConfig.tokenRef)

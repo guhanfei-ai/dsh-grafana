@@ -62,11 +62,10 @@ Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件�
 
 两项配置都使用 DSH 仅允许 loopback same-origin 访问的特权凭证 RPC。保存后的值不会被读取或回显，界面支持替换和删除。
 
-默认情况下，非本机地址必须使用 HTTPS。如确实需要访问内网 HTTP，可在插件配置中显式启用：
+HTTP 与 HTTPS 开箱即用，内网未配置证书的环境可直接填写 `http://` 地址，无需额外设置。注意：HTTP 会明文传输服务账号令牌，不可信网络环境请务必使用 HTTPS。如需强制仅允许 HTTPS，可在插件配置中关闭：
 
 ```yaml
-baseUrl: http://grafana.internal:3000
-allowInsecureHttp: true
+allowInsecureHttp: false
 ```
 
 `GRAFANA_BASE_URL` 凭证优先于 `baseUrl`。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
