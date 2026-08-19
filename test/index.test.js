@@ -213,13 +213,16 @@ test('grafana_push requires an explicit flag before moving folders', async () =>
   }
 })
 
-function createSettingsContext(userSection = {}) {
+function createSettingsContext(userSection = {}, credentialState = {}) {
   const tools = []
   let section = { ...userSection }
   const registrations = []
+  // 可变的凭证状态：resolve 返回 { value }，unset 清空对应 ref。
+  const creds = { ...credentialState }
   const ctx = {
     credentials: {
-      async resolve() { return undefined },
+      async resolve(ref) { return creds[ref] ? { value: creds[ref] } : undefined },
+      async unset(ref) { delete creds[ref] },
     },
     inject(services, callback) {
       if (!services.includes('settings')) return
@@ -231,9 +234,17 @@ function createSettingsContext(userSection = {}) {
             const scope = {
               get: () => schema({ ...options.base, ...section }),
               async update(patch) { section = { ...section, ...patch } },
+              async mutate(ops) {
+                for (const op of ops ?? []) {
+                  if (op.op === 'unset' && op.path?.[0] === 'baseUrl') {
+                    const { baseUrl, ...rest } = section
+                    section = rest
+                  }
+                }
+              },
             }
             options.validate?.(scope.get())
-            registrations.push({ ns, options, scope })
+            registrations.push({ ns, options, scope, creds })
             return scope
           },
         },
@@ -246,7 +257,7 @@ function createSettingsContext(userSection = {}) {
     },
   }
   apply(ctx, {})
-  return { registrations, tools }
+  return { registrations, tools, creds }
 }
 
 test('apply registers a grafana settings namespace and resolves config through it', async () => {
@@ -273,4 +284,61 @@ test('apply registers a grafana settings namespace and resolves config through i
     globalThis.fetch = originalFetch
   }
   assert.equal(calls[0], 'https://grafana.internal/api/health')
+})
+
+test('apply migrates a legacy credential-stored URL into the settings namespace on startup', async () => {
+  // 旧版本把 URL 存在 GRAFANA_BASE_URL 凭证里；settings.baseUrl 为空。
+  const { registrations, tools, creds } = createSettingsContext(
+    {},
+    { GRAFANA_BASE_URL: 'https://grafana.legacy.example.com' },
+  )
+  const [{ scope }] = registrations
+  // 迁移 IIFE 是 fire-and-forget，flush 一次微任务让它跑完。
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // URL 已搬到 settings namespace，凭证条目已清空。
+  assert.equal(scope.get().baseUrl, 'https://grafana.legacy.example.com')
+  assert.equal(creds.GRAFANA_BASE_URL, undefined)
+
+  // 迁移后 resolveBaseUrl 从 settings 解析（settings 优先，凭证兜底已空）。
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return jsonResponse({ status: 'ok' })
+  }
+  try {
+    await toolByName(tools, 'grafana_health').execute({}, execution())
+  } catch {
+    // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(calls[0], 'https://grafana.legacy.example.com/api/health')
+})
+
+test('resolveBaseUrl prefers settings.baseUrl over the credential value', async () => {
+  // settings 有值、凭证也有旧值时，以 settings 为权威源。
+  const { tools, creds } = createSettingsContext(
+    { baseUrl: 'https://grafana.from-settings.example.com' },
+    { GRAFANA_BASE_URL: 'https://grafana.from-credential.example.com' },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return jsonResponse({ status: 'ok' })
+  }
+  try {
+    await toolByName(tools, 'grafana_health').execute({}, execution())
+  } catch {
+    // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  // settings 值胜出；凭证未被迁移清空（因 settings 已非空，迁移 IIFE 跳过）。
+  assert.equal(calls[0], 'https://grafana.from-settings.example.com/api/health')
+  assert.equal(creds.GRAFANA_BASE_URL, 'https://grafana.from-credential.example.com')
 })

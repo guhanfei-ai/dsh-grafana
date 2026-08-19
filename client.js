@@ -1,7 +1,8 @@
-// dsh-grafana 浏览器设置卡片。凭证值只通过 DSH 的 loopback same-origin
-// 凭证 RPC 单向写入，客户端永远不会读回明文。
-// URL 不属于敏感信息：保存时在本浏览器 localStorage 镜像一份用于回显，
-// 凭证库本身依旧只写不读。
+// dsh-grafana 浏览器设置卡片。
+// Token 走 DSH 凭证库的 loopback same-origin RPC：仅写不读，
+// describe 只返回 configured 布尔，客户端永远不会读回明文，故以星号占位。
+// URL 不是敏感信息，存 settings namespace（grafana）：settings.describe 对
+// 非 secret 字段返回明文 value，因此保存后可直接回显核对。
 window.__ModuleLoader__.load({
 	id: "dsh-grafana",
 	factory: (require) => {
@@ -13,22 +14,11 @@ window.__ModuleLoader__.load({
 
 		const TOKEN_REF = "GRAFANA_TOKEN";
 		const BASE_URL_REF = "GRAFANA_BASE_URL";
+		const SETTINGS_NS = "grafana";
 		// 仅用于视觉提示的占位符，永远不会写入凭证库。
 		const MASK = "*".repeat(28);
-		// URL 回显镜像的 localStorage 键（same-origin，仅本浏览器可见）。
-		const MIRROR_KEY = "dsh-grafana:baseUrl";
 
 		const inject = ["slots", "connection"];
-
-		function readMirror() {
-			try { return window.localStorage.getItem(MIRROR_KEY) ?? ""; } catch { return ""; }
-		}
-		function writeMirror(value) {
-			try {
-				if (value) window.localStorage.setItem(MIRROR_KEY, value);
-				else window.localStorage.removeItem(MIRROR_KEY);
-			} catch { /* localStorage 不可用时静默降级为不回显。 */ }
-		}
 
 		const STRINGS = {
 			zh: {
@@ -41,9 +31,9 @@ window.__ModuleLoader__.load({
 				tokenHintConfigured: "已配置。星号只是占位符，并非存储的值。",
 				tokenHintEmpty: "存储在本地 DSH 凭证库中，凭证值永远不会被读回。",
 				removeToken: "移除令牌",
-				urlPlaceholderConfigured: "已配置；输入新 URL 以替换",
+				urlPlaceholderConfigured: "输入新 URL 以替换",
 				urlPlaceholderEmpty: "https://grafana.example.com",
-				urlHint: "支持 HTTP 与 HTTPS（HTTP 会明文传输令牌，建议优先使用 HTTPS）。URL 保存后会在此显示以便核对。",
+				urlHint: "支持 HTTP 与 HTTPS（HTTP 会明文传输令牌，建议优先使用 HTTPS）。URL 保存在设置中，保存后会在此显示以便核对。",
 				removeUrl: "移除 URL",
 				saving: "保存中…",
 				save: "保存",
@@ -62,9 +52,9 @@ window.__ModuleLoader__.load({
 				tokenHintConfigured: "Configured. The stars are a placeholder, not the stored value.",
 				tokenHintEmpty: "Stored in the local DSH credential store; the value is never read back.",
 				removeToken: "Remove token",
-				urlPlaceholderConfigured: "Configured; enter a new URL to replace it",
+				urlPlaceholderConfigured: "Enter a new URL to replace it",
 				urlPlaceholderEmpty: "https://grafana.example.com",
-				urlHint: "HTTP and HTTPS are both supported (HTTP sends the token in cleartext; HTTPS is recommended). The URL is shown here after saving.",
+				urlHint: "HTTP and HTTPS are both supported (HTTP sends the token in cleartext; HTTPS is recommended). The URL is stored in settings and shown here after saving.",
 				removeUrl: "Remove URL",
 				saving: "Saving…",
 				save: "Save",
@@ -130,13 +120,8 @@ window.__ModuleLoader__.load({
 				face.describe().then((r) => {
 					if (!alive) return;
 					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
-					// 凭证库已配置且本浏览器有镜像时回显 URL；未配置则清掉孤儿镜像。
-					if (r.baseConfigured) {
-						const mirror = readMirror();
-						if (mirror) setBaseDraft(mirror);
-					} else {
-						writeMirror("");
-					}
+					// URL 存 settings namespace（非 secret），describe 直接返回明文，可靠回显。
+					if (r.baseUrl) setBaseDraft(r.baseUrl);
 				}).catch(() => {});
 				return () => { alive = false; };
 			}, [face]);
@@ -162,12 +147,11 @@ window.__ModuleLoader__.load({
 							throw new Error(T.invalidUrl);
 						}
 						await face.setBaseUrl(b);
-						writeMirror(b);
 					}
 					const r = await face.describe();
 					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
 					setTokenDraft(""); setTokenFocus(false);
-					setBaseDraft(b !== "" ? b : (r.baseConfigured ? readMirror() : ""));
+					setBaseDraft(b !== "" ? b : (r.baseConfigured ? r.baseUrl : ""));
 					setSaved(true);
 				} catch (e) {
 					setError(String(e?.message ?? e));
@@ -181,8 +165,8 @@ window.__ModuleLoader__.load({
 				if (!window.confirm(message)) return;
 				setSaving(true); setSaved(false); setError("");
 				try {
-					await face.unset(kind === "token" ? TOKEN_REF : BASE_URL_REF);
-					if (kind !== "token") writeMirror("");
+					// token 走凭证库；base URL 走 settings namespace，移除路径不同。
+					await (kind === "token" ? face.unsetToken() : face.unsetBaseUrl());
 					const r = await face.describe();
 					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
 					setTokenDraft(""); setBaseDraft(""); setTokenFocus(false);
@@ -265,16 +249,28 @@ window.__ModuleLoader__.load({
 			const { api } = ctx.get("connection");
 			const face = {
 				describe: async () => {
-					const res = await api.credentials.describe({ refs: [TOKEN_REF, BASE_URL_REF] });
-					const creds = res?.result?.value?.credentials ?? {};
+					// token 走凭证库（只返回 configured）；URL 走 settings namespace（非 secret，返回明文）。
+					const [credRes, setRes] = await Promise.all([
+						api.credentials.describe({ refs: [TOKEN_REF, BASE_URL_REF] }),
+						api.settings?.describe ? api.settings.describe({}) : Promise.resolve(null),
+					]);
+					const creds = credRes?.result?.value?.credentials ?? {};
+					const grafanaNs = (setRes?.result?.value?.namespaces ?? []).find((n) => n?.ns === SETTINGS_NS);
+					const baseUrl = typeof grafanaNs?.value?.baseUrl === "string" ? grafanaNs.value.baseUrl : "";
 					return {
 						tokenConfigured: creds[TOKEN_REF]?.configured ?? false,
-						baseConfigured: creds[BASE_URL_REF]?.configured ?? false
+						baseConfigured: Boolean(baseUrl),
+						baseUrl
 					};
 				},
 				setToken: (value) => api.credentials.set({ ref: TOKEN_REF, value }),
-				setBaseUrl: (value) => api.credentials.set({ ref: BASE_URL_REF, value }),
-				unset: (ref) => api.credentials.unset({ ref }),
+				// URL 存 settings namespace：update 做 deep-merge，不动 tokenRef/allowInsecureHttp。
+				setBaseUrl: (value) => api.settings.update({ ns: SETTINGS_NS, patch: { baseUrl: value } }),
+				// token 移除走凭证库。
+				unsetToken: () => api.credentials.unset({ ref: TOKEN_REF }),
+				// URL 移除走 settings.mutate：浏览器只持有 redacted 视图，
+				// replace wholesale 会误删 schema 里其它已存字段，故用单字段 op。
+				unsetBaseUrl: () => api.settings.mutate({ ns: SETTINGS_NS, ops: [{ op: "unset", path: ["baseUrl"] }] }),
 				// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
 				localePreference: async () => {
 					if (!api.settings?.describe) return "";

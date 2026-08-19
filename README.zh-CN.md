@@ -62,7 +62,7 @@ Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件�
 - **Service Account Token**：例如 `glsa_...`。
 - **Grafana URL**：例如 `https://grafana.example.com` 或 `https://example.com/grafana`。
 
-两项配置都使用 DSH 仅允许 loopback same-origin 访问的特权凭证 RPC。保存后的值不会被读取或回显，界面支持替换和删除。
+Token 使用 DSH 仅允许 loopback same-origin 访问的特权凭证 RPC：仅写不读，保存后的值不会被读取或回显。URL 存储在 `grafana` settings namespace 的非 secret 字段中，因此可读回明文并在卡片中显示以便核对。界面支持替换和删除。
 
 HTTP 与 HTTPS 开箱即用，内网未配置证书的环境可直接填写 `http://` 地址，无需额外设置。注意：HTTP 会明文传输服务账号令牌，不可信网络环境请务必使用 HTTPS。如需强制仅允许 HTTPS，可在插件配置中关闭：
 
@@ -70,7 +70,7 @@ HTTP 与 HTTPS 开箱即用，内网未配置证书的环境可直接填写 `htt
 allowInsecureHttp: false
 ```
 
-`GRAFANA_BASE_URL` 凭证优先于 `baseUrl`。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
+settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL` 凭证中的 URL 会在启动时自动迁移到 settings，之后凭证值仅作兜底。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
 
 ### Grafana 权限
 

@@ -6,6 +6,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Fixed
 
+- Show the configured Grafana URL in the settings card. The URL no longer lives in the write-only credential store (whose `describe` never returns the plaintext, so the card could only show "Configured" once the local mirror was lost); it is now stored in the `grafana` settings namespace as a non-secret field, read back in plaintext, and reliably displayed after saving. On startup the Host migrates any legacy `GRAFANA_BASE_URL` credential into settings and clears the credential entry; the credential value then serves only as a fallback. Token storage is unchanged (still write-only in the credential store).
 - Restore the settings card after the DSH marketplace update: the `settings.plugin.item` slot is now keyed by Host-side settings namespace, so the plugin registers a `grafana` settings namespace on the Host (configuration now also honors the user settings layer, resolved above the composition entry) and the browser card registers with the matching `key` instead of the removed `id`/`order` list options.
 
 ### Security
@@ -30,7 +31,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 - Make the settings card collapsible: it renders collapsed by default (title, description, and a chevron) and expands on click, matching the official plugin cards in Settings → Plugins.
 - Allow plain HTTP for non-loopback Grafana hosts by default so internal deployments without TLS work without extra configuration; HTTPS-only enforcement remains available via `allowInsecureHttp: false`.
-- Localize the settings card (Simplified Chinese and English, following the GUI locale preference with browser-language fallback), move the remove buttons next to their inputs, and display the configured Grafana URL via a same-origin local mirror.
+- Localize the settings card (Simplified Chinese and English, following the GUI locale preference with browser-language fallback) and move the remove buttons next to their inputs.
 - Default dashboard writes to `overwrite: false`.
 - Add Grafana version-history messages, title/tag search limits, and Grafana-compatible UID validation.
 - Pin the current DSH RC dependencies and declare the Node.js runtime baseline.

@@ -62,7 +62,7 @@ Configure:
 - **Service Account Token**: a Grafana service-account token such as `glsa_...`.
 - **Grafana URL**: the absolute base URL, for example `https://grafana.example.com` or `https://example.com/grafana`.
 
-Both values use DSH's privileged loopback credential RPC. Stored values are never read back or displayed. The UI supports replacing and removing each value.
+The token uses DSH's privileged loopback credential RPC — write-only, the stored value is never read back or displayed. The URL is stored in the `grafana` settings namespace as a non-secret field, so it is read back in plaintext and shown in the card for verification. The UI supports replacing and removing each value.
 
 HTTP and HTTPS both work out of the box — internal deployments without TLS certificates can use an `http://` URL with no extra setup. Note that plain HTTP sends the service-account token in cleartext; always use HTTPS over untrusted networks. To enforce HTTPS only, disable it in plugin configuration:
 
@@ -70,7 +70,7 @@ HTTP and HTTPS both work out of the box — internal deployments without TLS cer
 allowInsecureHttp: false
 ```
 
-An explicit `GRAFANA_BASE_URL` credential takes precedence over `baseUrl`. The token reference defaults to `GRAFANA_TOKEN` and can be changed with `tokenRef`.
+The settings `baseUrl` is the authoritative source; a legacy `GRAFANA_BASE_URL` credential (from earlier versions) is migrated into settings on startup and then used only as a fallback. The token reference defaults to `GRAFANA_TOKEN` and can be changed with `tokenRef`.
 
 ### Grafana permissions
 

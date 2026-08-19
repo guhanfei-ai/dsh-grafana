@@ -192,6 +192,20 @@ export function apply(ctx, config = {}) {
     sctx.effect(() => () => {
       activeConfig = () => entryConfig
     })
+
+    // 一次性迁移：URL 不属于敏感信息，早期版本错误地存进了凭证库。
+    // 凭证库 describe 不返回明文，浏览器无法回显已配置 URL。这里在 Host 侧
+    // （能读凭证明文）把旧 URL 搬到 settings namespace，然后清掉凭证条目。
+    // 失败静默兜底：resolveBaseUrl 仍会兜底读凭证值，不阻断功能。
+    ;(async () => {
+      try {
+        const stored = await sctx.credentials.resolve(BASE_URL_REF)
+        if (stored?.value && !scope.get().baseUrl) {
+          await scope.update({ baseUrl: stored.value })
+          await sctx.credentials.unset(BASE_URL_REF)
+        }
+      } catch { /* 迁移失败不阻断插件加载，下次仍可重试。 */ }
+    })()
   })
 
   const snapshots = new Map()
@@ -214,8 +228,9 @@ export function apply(ctx, config = {}) {
 
   async function resolveBaseUrl() {
     const { allowInsecureHttp, baseUrl } = activeConfig()
+    // settings.baseUrl 为权威源；凭证值仅在迁移未完成时兜底。
     const stored = await ctx.credentials.resolve(BASE_URL_REF)
-    return normalizeBaseUrl(stored?.value || baseUrl, allowInsecureHttp)
+    return normalizeBaseUrl(baseUrl || stored?.value, allowInsecureHttp)
   }
 
   async function api(path, init = {}, parentSignal) {

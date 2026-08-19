@@ -4,3 +4,4 @@ node_modules/
 .qwen
 dist/
 .reasonix
+.zcode
