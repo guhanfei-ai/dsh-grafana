@@ -28,7 +28,7 @@ jobs:
         node: [20, 22, 24]
     steps:
       # 拉取源码。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # 安装指定版本的 Node，并缓存 npm 依赖以加速后续构建。
       - uses: actions/setup-node@v4
         with:
