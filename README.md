@@ -10,6 +10,7 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 
 - Fetch a dashboard by browser URL or UID.
 - Search dashboards by title and tag.
+- Duplicate a dashboard into a brand-new copy and get its URL back.
 - Edit panels, queries, thresholds, variables, and layout through conversation.
 - Preserve the dashboard folder automatically.
 - Detect concurrent edits before writing.
@@ -88,6 +89,7 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 | --- | --- |
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. |
 | `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
+| `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_health` | Checks connectivity and service-account validity. |
 
@@ -100,6 +102,8 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 5. Refresh Grafana and fetch again before another write.
 
 `grafana_push` defaults to `overwrite: false`. It preserves the current folder, re-fetches the dashboard immediately before writing, and rejects stale versions. Folder moves require `allowFolderMove: true`. Forced overwrite requires `forceOverwrite: true` and still triggers approval.
+
+The dashboard identity shown in the approval prompt (uid, title, version, folder) and the "fetched X minutes ago" label come entirely from the server-trusted snapshot recorded by `grafana_get`, never from the model-submitted dashboard JSON, so a hallucinated or tampered title cannot mislead the approver. Without a recent trusted snapshot the prompt states that the write will be rejected and asks for `grafana_get` first. Right before the prompt appears, the plugin also re-checks the live Grafana state: version or folder mismatches are surfaced as prominent warnings with both version numbers, and an unreachable Grafana is called out as "unable to confirm the current state". This live check only enriches the approval copy; the final validation always runs again at write time.
 
 ## Security and data boundaries
 

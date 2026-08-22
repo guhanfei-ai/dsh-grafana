@@ -87,11 +87,12 @@ test('API error details expose only bounded status and message fields', () => {
   assert.equal(detail, 'version-mismatch: changed elsewhere')
 })
 
-test('apply registers four tools and a hard approval gate for writes', async () => {
+test('apply registers five tools and a hard approval gate for writes', async () => {
   const { listeners, sections, tools } = createContext()
   assert.deepEqual(tools.map((tool) => tool.name), [
     'grafana_get',
     'grafana_push',
+    'grafana_clone',
     'grafana_search',
     'grafana_health',
   ])
@@ -103,6 +104,7 @@ test('apply registers four tools and a hard approval gate for writes', async () 
     await gate({ name: 'grafana_get', arguments: {} }, async () => ({ kind: 'allow' })),
     { kind: 'allow' },
   )
+  // 无可信快照：gate 仍返回 ask，文案说明写回会被拒绝并要求先 grafana_get。
   const decision = await gate({
     name: 'grafana_push',
     arguments: {
@@ -111,7 +113,259 @@ test('apply registers four tools and a hard approval gate for writes', async () 
     },
   }, async () => ({ kind: 'allow' }))
   assert.equal(decision.kind, 'ask')
+  assert.match(decision.reason, /no recent trusted snapshot/)
   assert.match(decision.reason, /Adjust CPU threshold/)
+  const cloneDecision = await gate({
+    name: 'grafana_clone',
+    arguments: { sourceUrlOrUid: 'abc', newTitle: 'Overview copy' },
+  }, async () => ({ kind: 'allow' }))
+  assert.equal(cloneDecision.kind, 'ask')
+  assert.match(cloneDecision.reason, /cloning source uid=abc/)
+  assert.match(cloneDecision.reason, /Overview copy/)
+  assert.match(cloneDecision.reason, /in the source folder/)
+
+  const cloneToGeneralDecision = await gate({
+    name: 'grafana_clone',
+    arguments: { sourceUrlOrUid: 'abc', folderUid: '' },
+  }, async () => ({ kind: 'allow' }))
+  assert.equal(cloneToGeneralDecision.kind, 'ask')
+  assert.match(cloneToGeneralDecision.reason, /into General/)
+})
+
+test('approval gate builds the reason from the trusted snapshot, not from dashboardJson', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const dashboard = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return jsonResponse({ meta: { folderUid: 'folder1', folderTitle: 'Team Folder', canSave: true }, dashboard })
+  }
+
+  try {
+    const { listeners, tools } = createContext()
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc123' }, execution())
+    // args 里的标题是伪造的，审批文案必须展示快照里的可信标题。
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: {
+        dashboardJson: JSON.stringify({ id: 7, uid: 'abc123', title: 'Tampered Title', version: 3, panels: [] }),
+        changeSummary: 'Adjust CPU threshold',
+      },
+    }, async () => ({ kind: 'allow' }))
+
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /uid=abc123/)
+    assert.match(decision.reason, /title="Overview"/)
+    assert.doesNotMatch(decision.reason, /Tampered Title/)
+    assert.match(decision.reason, /snapshot version 3/)
+    assert.match(decision.reason, /fetched less than a minute ago/)
+    // 快照中的 folderTitle（P3）出现在审批文案里。
+    assert.match(decision.reason, /folder "Team Folder"/)
+    assert.match(decision.reason, /Grafana-side version matches/)
+    // 请求序列：grafana_get 一次 + 审批前实时复核一次。
+    assert.equal(calls.length, 2)
+    assert.match(calls[1], /\/api\/dashboards\/uid\/abc123$/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('approval gate warns about version conflicts and folder changes found by the live check', async () => {
+  const originalFetch = globalThis.fetch
+  let getCount = 0
+  const initial = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
+  globalThis.fetch = async () => {
+    getCount += 1
+    const dashboard = getCount === 1 ? initial : { ...initial, version: 5 }
+    const meta = getCount === 1
+      ? { folderUid: 'folder1', folderTitle: 'Team Folder', canSave: true }
+      : { folderUid: 'folder2', folderTitle: 'Other Folder', canSave: true }
+    return jsonResponse({ meta, dashboard })
+  }
+
+  try {
+    const { listeners, tools } = createContext()
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc123' }, execution())
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: {
+        dashboardJson: JSON.stringify(initial),
+        changeSummary: 'Adjust CPU threshold',
+      },
+    }, async () => ({ kind: 'allow' }))
+
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /⚠️ VERSION CONFLICT/)
+    assert.match(decision.reason, /Grafana-side version 5/)
+    assert.match(decision.reason, /snapshot version 3/)
+    assert.match(decision.reason, /⚠️ FOLDER CHANGED/)
+    assert.match(decision.reason, /Team Folder/)
+    assert.match(decision.reason, /Other Folder/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('approval gate explains a missing snapshot without any live request', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return jsonResponse({})
+  }
+
+  try {
+    const { listeners } = createContext()
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: {
+        dashboardJson: JSON.stringify({ uid: 'never-fetched', title: 'Overview' }),
+        changeSummary: 'Adjust CPU threshold',
+      },
+    }, async () => ({ kind: 'allow' }))
+
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /no recent trusted snapshot/)
+    assert.match(decision.reason, /the write will be rejected/)
+    assert.match(decision.reason, /Call grafana_get first/)
+    // 没有可信快照时不发起实时复核请求，也不静默放行。
+    assert.equal(calls.length, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('approval gate still asks for approval when the live check fails', async () => {
+  const originalFetch = globalThis.fetch
+  let getCount = 0
+  const dashboard = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
+  globalThis.fetch = async () => {
+    getCount += 1
+    if (getCount === 1) return jsonResponse({ meta: { folderUid: 'folder1', folderTitle: 'Team Folder', canSave: true }, dashboard })
+    throw new Error('network down')
+  }
+
+  try {
+    const { listeners, tools } = createContext()
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc123' }, execution())
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: {
+        dashboardJson: JSON.stringify(dashboard),
+        changeSummary: 'Adjust CPU threshold',
+      },
+    }, async () => ({ kind: 'allow' }))
+
+    // 复核失败不阻断审批：仍返回 ask，文案注明无法确认 Grafana 端状态。
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /uid=abc123/)
+    assert.match(decision.reason, /title="Overview"/)
+    assert.match(decision.reason, /⚠️ unable to confirm the current Grafana-side state/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('approvalReason turns a snapshot plus live result into approval copy deterministically', () => {
+  const args = {
+    dashboardJson: JSON.stringify({ uid: 'abc123', title: 'Untrusted Title' }),
+    changeSummary: 'Tweak panels',
+  }
+
+  // 无快照：文案必须声明写回会被拒绝并要求先 grafana_get，不透传不可信标题。
+  const noSnapshot = internals.approvalReason(args, null, null)
+  assert.match(noSnapshot, /no recent trusted snapshot/)
+  assert.match(noSnapshot, /the write will be rejected/)
+  assert.match(noSnapshot, /Call grafana_get first/)
+  assert.match(noSnapshot, /Tweak panels/)
+  assert.doesNotMatch(noSnapshot, /Untrusted Title/)
+
+  const snapshot = {
+    id: 7,
+    uid: 'abc123',
+    version: 3,
+    canSave: true,
+    fetchedAt: Date.now() - 5 * 60_000,
+    title: 'Trusted Overview',
+    folderUid: 'folder1',
+    folderTitle: 'Team Folder',
+  }
+
+  // 有快照、未复核：只用快照里的 uid/title/version，并显示快照获取时间。
+  const trusted = internals.approvalReason(args, snapshot, null)
+  assert.match(trusted, /uid=abc123/)
+  assert.match(trusted, /title="Trusted Overview"/)
+  assert.match(trusted, /snapshot version 3/)
+  assert.match(trusted, /5 minutes ago/)
+  assert.match(trusted, /folder "Team Folder"/)
+  assert.doesNotMatch(trusted, /Untrusted Title/)
+
+  // 实时复核一致 / 冲突 / 失败三种结果。
+  const matching = internals.approvalReason(args, snapshot, { ok: true, current: { dashboard: { version: 3 }, meta: { folderUid: 'folder1', folderTitle: 'Team Folder' } } })
+  assert.match(matching, /Grafana-side version matches/)
+  assert.doesNotMatch(matching, /VERSION CONFLICT/)
+
+  const conflict = internals.approvalReason(args, snapshot, { ok: true, current: { dashboard: { version: 4 }, meta: { folderUid: 'folder1' } } })
+  assert.match(conflict, /⚠️ VERSION CONFLICT/)
+  assert.match(conflict, /Grafana-side version 4/)
+  assert.match(conflict, /snapshot version 3/)
+
+  const offline = internals.approvalReason(args, snapshot, { ok: false })
+  assert.match(offline, /⚠️ unable to confirm the current Grafana-side state/)
+
+  // folderTitle 为空时用 folderUid 兜底显示。
+  const fallback = internals.approvalReason(args, { ...snapshot, folderTitle: '' }, null)
+  assert.match(fallback, /folder "folder1"/)
+
+  // 显式空 folderUid 表示移动到 General，审批文案必须展示目标与确认标志。
+  const moveToGeneral = internals.approvalReason({
+    ...args,
+    folderUid: '',
+    allowFolderMove: true,
+  }, snapshot, null)
+  assert.match(moveToGeneral, /⚠️ REQUESTED FOLDER MOVE/)
+  assert.match(moveToGeneral, /current folder "Team Folder"/)
+  assert.match(moveToGeneral, /destination "General"/)
+  assert.match(moveToGeneral, /allowFolderMove=true/)
+
+  // 未确认的目录移动会在审批文案中说明执行阶段将拒绝。
+  const unconfirmedMove = internals.approvalReason({ ...args, folderUid: 'folder2' }, snapshot, null)
+  assert.match(unconfirmedMove, /destination "folder2"/)
+  assert.match(unconfirmedMove, /allowFolderMove is not true/)
+})
+
+test('approvalUid trusts only a valid uid inside dashboardJson', () => {
+  assert.equal(internals.approvalUid({ dashboardJson: JSON.stringify({ uid: 'abc123' }) }), 'abc123')
+  assert.equal(internals.approvalUid({ dashboardJson: JSON.stringify({ title: 'no uid here' }) }), null)
+  assert.equal(internals.approvalUid({ dashboardJson: JSON.stringify({ uid: 'not a uid!' }) }), null)
+  assert.equal(internals.approvalUid({ dashboardJson: 'not json at all' }), null)
+  assert.equal(internals.approvalUid({}), null)
+})
+
+test('snapshots record title, folderTitle, and folderUid with a folderUid fallback', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
+  // meta 不带 folderTitle：快照的 folderTitle 字段应兜底为 folderUid。
+  globalThis.fetch = async () => jsonResponse({ meta: { folderUid: 'folder9', canSave: true }, dashboard })
+
+  try {
+    const { listeners, tools } = createContext()
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc123' }, execution())
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: {
+        dashboardJson: JSON.stringify(dashboard),
+        changeSummary: 'Adjust CPU threshold',
+      },
+    }, async () => ({ kind: 'allow' }))
+
+    // 快照字段断言：title 来自 dashboard.title；folderTitle 缺失时兜底为 folderUid。
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /title="Overview"/)
+    assert.match(decision.reason, /folder "folder9"/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('grafana_push preserves the current folder and disables overwrite by default', async () => {
@@ -208,6 +462,104 @@ test('grafana_push requires an explicit flag before moving folders', async () =>
       /allowFolderMove: true/,
     )
     assert.equal(postCount, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_clone duplicates a dashboard into a brand-new one and returns its URL', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const source = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [{ id: 1, type: 'timeseries' }] }
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    if (init.method === 'POST') {
+      return jsonResponse({ uid: 'new456', status: 'success', version: 1, url: '/d/new456/overview-copy' })
+    }
+    if (String(url).endsWith('/api/dashboards/uid/abc123')) {
+      return jsonResponse({ meta: { folderUid: 'folder1', canSave: true }, dashboard: source })
+    }
+    throw new Error(`Unexpected request: ${String(url)}`)
+  }
+
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_clone').execute({
+      sourceUrlOrUid: 'https://grafana.example.com/d/abc123/overview',
+    }, execution())
+
+    assert.match(output, /Dashboard cloned: uid=new456/)
+    // 返回的是可直接打开的完整地址，而非 Grafana 的相对路径。
+    assert.match(output, /url=https:\/\/grafana\.example\.com\/d\/new456\/overview-copy/)
+    // 未提供 newTitle 时默认追加 " (copy)" 后缀。
+    assert.match(output, /New title: "Overview \(copy\)"/)
+    assert.match(output, /Call grafana_get on the new dashboard before any further write/)
+
+    // 请求序列：GET 源 → POST 创建。新盘快照由后续 grafana_get 显式建立。
+    assert.equal(calls.length, 2)
+    const request = JSON.parse(calls[1].init.body)
+    assert.equal(request.dashboard.id, null)
+    assert.equal(request.dashboard.uid, undefined)
+    assert.equal(request.dashboard.version, undefined)
+    assert.equal(request.dashboard.title, 'Overview (copy)')
+    assert.equal(request.dashboard.panels.length, 1)
+    assert.equal(request.overwrite, false)
+    assert.equal(request.folderUid, 'folder1')
+    assert.match(request.message, /Cloned from abc123/)
+    assert.equal(calls[1].init.headers.Authorization, 'Bearer test-token')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_clone honors an explicit title and folder, and requires grafana_get before a follow-up push', async () => {
+  const originalFetch = globalThis.fetch
+  let postCount = 0
+  const source = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
+  const created = { id: 99, uid: 'new456', title: 'Staging overview', version: 1, panels: [] }
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      postCount += 1
+      if (postCount === 1) return jsonResponse({ uid: 'new456', status: 'success', version: 1, url: '/d/new456/staging-overview' })
+      return jsonResponse({ uid: 'new456', status: 'success', version: 2, url: '/d/new456/staging-overview' })
+    }
+    if (String(url).endsWith('/api/dashboards/uid/abc123')) {
+      return jsonResponse({ meta: { folderUid: 'folder1', canSave: true }, dashboard: source })
+    }
+    return jsonResponse({ meta: { folderUid: 'folder2', canSave: true }, dashboard: created })
+  }
+
+  try {
+    const { tools } = createContext()
+    const clone = toolByName(tools, 'grafana_clone')
+    const output = await clone.execute({
+      sourceUrlOrUid: 'abc123',
+      newTitle: 'Staging overview',
+      folderUid: 'folder2',
+    }, execution())
+    assert.match(output, /Dashboard cloned: uid=new456/)
+
+    const push = toolByName(tools, 'grafana_push')
+    await assert.rejects(
+      push.execute({
+        dashboardJson: JSON.stringify({ ...created, title: 'Staging overview v2' }),
+        changeSummary: 'Rename the clone',
+        message: 'Rename clone',
+      }, execution()),
+      /No recent trusted snapshot/,
+    )
+    assert.equal(postCount, 1)
+
+    // 显式获取新盘后，调用方同时拿到完整 JSON 并建立可信快照。
+    const fetched = JSON.parse(await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'new456' }, execution()))
+    fetched.dashboard.title = 'Staging overview v2'
+    const pushOutput = await push.execute({
+      dashboardJson: JSON.stringify(fetched.dashboard),
+      changeSummary: 'Rename the clone',
+      message: 'Rename clone',
+    }, execution())
+    assert.match(pushOutput, /Dashboard updated/)
+    assert.equal(postCount, 2)
   } finally {
     globalThis.fetch = originalFetch
   }
