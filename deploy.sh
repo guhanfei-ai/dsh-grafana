@@ -12,8 +12,8 @@ set -Eeuo pipefail
 #   ./deploy.sh publish  --->  分发：凭证校验后，先将安装包发布到 npm，
 #                              再创建GitHub Release并上传同一产物
 #
-#   ./deploy.sh all      --->  一键三连：依次执行 release → build → publish，
-#                              版本号输入与确认提示照常交互
+#   ./deploy.sh all      --->  一键三连：先做 gh/npm 凭证预检，再依次执行
+#                              release → build → publish，版本号输入与确认提示照常交互
 #
 # 不运行本脚本时，日常提交推送完全不受影响。
 # 发布新版本时按 release → build → publish 三步执行（或用 all 一键串联），
@@ -62,6 +62,15 @@ guard_tag() {
   }
 }
 
+# 凭证预检：发布链路的终点是 npm + GitHub Release，双凭证在链路最前置的
+# 位置统一校验，避免版本已锁、tag 已推、包已打好之后才发现未登录白跑一遍。
+# （npm whoami 会真实请求 registry，token 过期/失效同样能提前暴露）
+guard_credentials() {
+  need_cmd gh npm
+  gh auth status >/dev/null 2>&1 || die "未登录 GitHub CLI，请先执行 gh auth login"
+  npm whoami >/dev/null 2>&1 || die "未登录 npm，请先执行 npm login（账号需为写操作开启2FA）"
+}
+
 verify_and_install() {
   npm --cache "$NPM_CACHE" ci --ignore-scripts
   npm --cache "$NPM_CACHE" run verify
@@ -79,7 +88,7 @@ usage() {
   ./deploy.sh release  ->  锁版本：交互输入版本号（patch/minor/major 或 x.y.z），自动提交/打tag/推送
   ./deploy.sh build    ->  打包：验证 + npm pack，产物输出到 dist/（纯JS插件，无编译步骤）
   ./deploy.sh publish  ->  分发：先将 dist/ 安装包发布到 npm，再创建 GitHub Release 上传同一产物
-  ./deploy.sh all      ->  一键三连：依次执行 release → build → publish（版本号等提示照常交互）
+  ./deploy.sh all      ->  一键三连：先做 gh/npm 凭证预检，再依次执行 release → build → publish（版本号等提示照常交互）
 
 以上命令仅限 main 分支执行，其它分支会被强制拦截；
 日常开发时随意提交推送，互不影响。
@@ -102,7 +111,8 @@ cmd_release() {
   # 工作区必须干净（版本辐射要产生唯一明确的release commit）
   [[ -z "$(git status --porcelain)" ]] || die "工作区存在未提交变更，请先提交或stash"
 
-  gh auth status >/dev/null
+  # release 会打 tag 并推送远端，是链路里最难回退的一步：先完成凭证预检
+  guard_credentials
   git fetch --tags origin "$RELEASE_BRANCH"
   git merge-base --is-ancestor "origin/$RELEASE_BRANCH" HEAD || {
     die "本地 $RELEASE_BRANCH 未包含 origin/${RELEASE_BRANCH}，请先 rebase 或 merge"
@@ -206,8 +216,7 @@ cmd_publish() {
   need_cmd gh npm
   guard_main
   guard_tag
-  gh auth status >/dev/null
-  npm whoami >/dev/null 2>&1 || die "未登录 npm，请先执行 npm login（账号需为写操作开启2FA）"
+  guard_credentials
 
   # build 每次都会重建 dist/，其中只有一个 .tgz 产物
   local asset
@@ -254,6 +263,10 @@ cmd_publish() {
 ######################################
 cmd_all() {
   banner '一键发布：release → build → publish'
+  # 凭证预检前置到一切动作之前：release 会提交/打tag/推送，build 会重新打包，
+  # 若 npm/gh 未登录，宁可在一开始就失败，也不要让前两步白跑一遍
+  guard_credentials
+  printf '>> 凭证预检通过：gh 与 npm 均已登录\n'
   cmd_release "$@"
 
   # release 可能已递增版本号，重新读取，保证 build/publish 使用新 tag

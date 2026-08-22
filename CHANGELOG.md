@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ## [Unreleased]
 
+### Changed
+
+- `deploy.sh` now pre-checks GitHub CLI and npm credentials at the very start of `all` and before `release` commits, tags, and pushes (previously the npm login check only ran in the final `publish` step, so an expired or missing login was discovered only after the version was locked and the tarball built, forcing a full re-run). `publish` keeps its own check for direct invocations.
+
 ### Fixed
 
 - Show the configured Grafana URL in the settings card. The URL no longer lives in the write-only credential store (whose `describe` never returns the plaintext, so the card could only show "Configured" once the local mirror was lost); it is now stored in the `grafana` settings namespace as a non-secret field, read back in plaintext, and reliably displayed after saving. On startup the Host migrates any legacy `GRAFANA_BASE_URL` credential into settings and clears the credential entry; the credential value then serves only as a fallback. Token storage is unchanged (still write-only in the credential store).
