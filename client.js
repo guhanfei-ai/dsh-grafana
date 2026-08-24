@@ -140,14 +140,16 @@ window.__ModuleLoader__.load({
 				try {
 					const t = tokenDraft.trim();
 					const b = baseDraft.trim();
-					if (t !== "") await face.setToken(t);
+					// 先完成全部校验再开始任何写入，避免 URL 非法时 token 已落库的半保存状态。
 					if (b !== "") {
-						const url = new URL(b);
+						let url;
+						try { url = new URL(b); } catch { throw new Error(T.invalidUrl); }
 						if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
 							throw new Error(T.invalidUrl);
 						}
-						await face.setBaseUrl(b);
 					}
+					if (t !== "") await face.setToken(t);
+					if (b !== "") await face.setBaseUrl(b);
 					const r = await face.describe();
 					setStatus({ loaded: true, token: r.tokenConfigured, base: r.baseConfigured });
 					setTokenDraft(""); setTokenFocus(false);

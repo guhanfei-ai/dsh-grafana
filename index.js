@@ -100,6 +100,8 @@ async function abortableDelay(ms, signal) {
 async function readLimitedText(response, maxBytes = MAX_RESPONSE_BYTES) {
   const contentLength = Number(response.headers?.get?.('content-length'))
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    // 提前拒绝时主动释放响应体，避免连接挂到超时才关闭。
+    try { await response.body?.cancel?.() } catch { /* 释放失败忽略即可 */ }
     throw new Error(`Grafana response is too large (${contentLength} bytes; limit ${maxBytes} bytes).`)
   }
 
@@ -580,9 +582,11 @@ export function apply(ctx, config = {}) {
     output: { schema: { type: 'string' }, render: (_args, value) => textOut(value) },
     timeoutMs: TOOL_TIMEOUT_MS,
     async execute(_args, exec) {
+      // Grafana 的 /api/health 返回 { commit, database, version }，没有 status
+      // 字段；database 才是健康状态（ok / failing）。
       const health = await api('/api/health', {}, exec.signal)
       const rows = await authenticatedApi('/api/search?type=dash-db&limit=3', {}, exec.signal)
-      return `health=${health?.status ?? 'ok'}; credential=valid; sampleDashboards=${Array.isArray(rows) ? rows.length : '?'}`
+      return `health=${health?.database ?? 'unknown'}; credential=valid; sampleDashboards=${Array.isArray(rows) ? rows.length : '?'}`
     },
   }))
 }

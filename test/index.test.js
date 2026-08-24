@@ -565,6 +565,25 @@ test('grafana_clone honors an explicit title and folder, and requires grafana_ge
   }
 })
 
+test('grafana_health reports the database field from the real /api/health shape', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/health')) {
+      // 真实 Grafana /api/health 返回 { commit, database, version }，没有 status 字段。
+      return jsonResponse({ commit: 'd14a6b3', database: 'ok', version: '11.0.0' })
+    }
+    return jsonResponse([{ uid: 'a' }, { uid: 'b' }])
+  }
+
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_health').execute({}, execution())
+    assert.equal(output, 'health=ok; credential=valid; sampleDashboards=2')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 function createSettingsContext(userSection = {}, credentialState = {}) {
   const tools = []
   let section = { ...userSection }
@@ -626,7 +645,7 @@ test('apply registers a grafana settings namespace and resolves config through i
   const calls = []
   globalThis.fetch = async (url) => {
     calls.push(String(url))
-    return jsonResponse({ status: 'ok' })
+    return jsonResponse({ database: 'ok' })
   }
   try {
     await toolByName(tools, 'grafana_health').execute({}, execution())
@@ -657,7 +676,7 @@ test('apply migrates a legacy credential-stored URL into the settings namespace 
   const calls = []
   globalThis.fetch = async (url) => {
     calls.push(String(url))
-    return jsonResponse({ status: 'ok' })
+    return jsonResponse({ database: 'ok' })
   }
   try {
     await toolByName(tools, 'grafana_health').execute({}, execution())
@@ -681,7 +700,7 @@ test('resolveBaseUrl prefers settings.baseUrl over the credential value', async 
   const calls = []
   globalThis.fetch = async (url) => {
     calls.push(String(url))
-    return jsonResponse({ status: 'ok' })
+    return jsonResponse({ database: 'ok' })
   }
   try {
     await toolByName(tools, 'grafana_health').execute({}, execution())

@@ -10,6 +10,9 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Fixed
 
+- `grafana_health` now reports the real `database` field from `GET /api/health` (e.g. `ok`/`failing`) instead of reading a nonexistent `status` field that made the output always read `health=ok`.
+- The settings card now validates the Grafana URL before writing anything, so an invalid URL can no longer leave a half-saved state where the token was already stored; malformed URLs also show the localized error message instead of the native `new URL` exception.
+- Release the response body when rejecting an oversized response early via its `Content-Length` header, so the connection no longer lingers until the request timeout.
 - Show the configured Grafana URL in the settings card. The URL no longer lives in the write-only credential store (whose `describe` never returns the plaintext, so the card could only show "Configured" once the local mirror was lost); it is now stored in the `grafana` settings namespace as a non-secret field, read back in plaintext, and reliably displayed after saving. On startup the Host migrates any legacy `GRAFANA_BASE_URL` credential into settings and clears the credential entry; the credential value then serves only as a fallback. Token storage is unchanged (still write-only in the credential store).
 - Restore the settings card after the DSH marketplace update: the `settings.plugin.item` slot is now keyed by Host-side settings namespace, so the plugin registers a `grafana` settings namespace on the Host (configuration now also honors the user settings layer, resolved above the composition entry) and the browser card registers with the matching `key` instead of the removed `id`/`order` list options.
 
