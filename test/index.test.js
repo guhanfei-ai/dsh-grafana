@@ -1072,3 +1072,25 @@ test('resolveBaseUrl prefers settings.baseUrl over the credential value', async 
   assert.equal(calls[0], 'https://grafana.from-settings.example.com/api/health')
   assert.equal(creds.GRAFANA_BASE_URL, 'https://grafana.from-credential.example.com')
 })
+
+test('internals exports the stable debug surface across the lib/ split', () => {
+  // internals 是测试与调试依赖的稳定契约：lib/ 拆分后键集合不得增减或更名。
+  assert.deepEqual(Object.keys(internals).sort(), [
+    'approvalReason',
+    'approvalUid',
+    'cloneApprovalReason',
+    'dashboardSummary',
+    'diffDashboards',
+    'interpolateVariables',
+    'normalizeBaseUrl',
+    'parseDashboardUrl',
+    'parseUid',
+    'readLimitedText',
+    'safeApiErrorDetail',
+    'summarizeFrames',
+  ])
+  for (const key of Object.keys(internals)) {
+    assert.equal(typeof internals[key], 'function', `internals.${key} must stay a function`)
+  }
+  assert.ok(Object.isFrozen(internals))
+})

@@ -6,6 +6,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Changed
 
+- Internal refactor with no behavior change: the single 1130-line `index.js` is split into layered modules under `lib/` (constants, generic utilities, approval copy, dashboard diff, query summary, stateful runtime, and per-tool definitions), leaving `index.js` as a thin assembly entry. All exports (`name`/`inject`/`SETTINGS_NAMESPACE`/`Config`/`apply`/`internals`), tool schemas, error messages, timeouts, and limits are unchanged; the npm package now ships the `lib/` directory alongside `index.js` and `client.js`.
 - `deploy.sh` now pre-checks GitHub CLI and npm credentials at the very start of `all` and before `release` commits, tags, and pushes (previously the npm login check only ran in the final `publish` step, so an expired or missing login was discovered only after the version was locked and the tarball built, forcing a full re-run). `publish` keeps its own check for direct invocations.
 
 ### Fixed
