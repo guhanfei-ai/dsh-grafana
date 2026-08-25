@@ -1,6 +1,6 @@
 {
   "name": "dsh-grafana",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Grafana dashboard editor for DeepSeek Harness: paste a dashboard URL, edit JSON via conversation, push back via HTTP API",
   "type": "module",
   "main": "index.js",
