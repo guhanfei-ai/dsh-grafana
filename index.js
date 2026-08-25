@@ -21,6 +21,11 @@ const SNAPSHOT_TTL_MS = 30 * 60 * 1000
 const MAX_SNAPSHOTS = 100
 const APPROVAL_LIVE_TIMEOUT_MS = 5_000
 const RETRYABLE_STATUS = new Set([502, 503, 504])
+const MAX_DIFF_LINES = 24
+const MAX_DIFF_VALUE_CHARS = 80
+const MAX_DIFF_CHANGED_KEYS = 8
+// diff 不比较身份字段与已单独分节展示的 panels/templating。
+const DIFF_SKIP_FIELDS = new Set(['panels', 'templating', 'id', 'uid', 'version'])
 
 const GUIDANCE = `## Grafana dashboard editing (dsh-grafana)
 
@@ -210,8 +215,9 @@ function requestedFolderApprovalLine(args, snapshot, live) {
 }
 
 // 纯函数：根据调用参数 + 可信快照 + 实时复核结果生成审批文案，便于单测。
-// snapshot / live 为 null 表示对应信息缺失（无快照 / 未做实时复核）。
-function approvalReason(args, snapshot, live = null) {
+// snapshot / live 为 null 表示对应信息缺失（无快照 / 未做实时复核）；
+// diffLines 为实时复核成功时生成的内容 diff 行，仅用于展示预览。
+function approvalReason(args, snapshot, live = null, diffLines = null) {
   const summary = String(args?.changeSummary ?? 'No summary supplied').replace(/[\r\n\t]+/g, ' ').slice(0, 300)
   const force = args?.forceOverwrite === true ? ' FORCE OVERWRITE requested.' : ''
   const uid = approvalUid(args)
@@ -226,6 +232,10 @@ function approvalReason(args, snapshot, live = null) {
     `Write Grafana dashboard uid=${snapshot.uid}, title=${JSON.stringify(snapshot.title || 'unknown')}, snapshot version ${snapshot.version} (fetched ${snapshotAgeLabel(snapshot.fetchedAt)}), folder ${folderLabel(snapshot.folderTitle, snapshot.folderUid)}.`,
     `Changes: ${summary}.${force}`,
   ]
+  if (Array.isArray(diffLines)) {
+    if (diffLines.length === 0) lines.push('Diff vs current Grafana dashboard: no content differences detected.')
+    else lines.push('Diff vs current Grafana dashboard:', ...diffLines.map((line) => `  ${line}`))
+  }
   const requestedFolder = requestedFolderApprovalLine(args, snapshot, live)
   if (requestedFolder) lines.push(requestedFolder)
   if (live?.ok) {
@@ -262,6 +272,104 @@ function cloneApprovalReason(args) {
     else folder = ' with an invalid destination folder UID (the write will be rejected)'
   }
   return `Create a new Grafana dashboard by cloning source uid=${sourceUid}${target}${folder}.`
+}
+
+// 审批文案单行清洗：压掉换行/制表符并截断，防止 JSON 内容伪造审批行。
+function oneLine(value, maxLength) {
+  return String(value ?? '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, maxLength)
+}
+
+function flattenPanels(dashboard) {
+  const byId = new Map()
+  const walk = (panels) => {
+    if (!Array.isArray(panels)) return
+    for (const panel of panels) {
+      if (!panel || typeof panel !== 'object' || Array.isArray(panel)) continue
+      if (Number.isInteger(panel.id)) byId.set(panel.id, panel)
+      // row 面板内嵌的 panels 一并展开，避免嵌套改动漏报。
+      if (Array.isArray(panel.panels)) walk(panel.panels)
+    }
+  }
+  walk(dashboard?.panels)
+  return byId
+}
+
+function panelLabel(panel) {
+  const title = typeof panel.title === 'string' && panel.title.trim() ? ` ${JSON.stringify(oneLine(panel.title, 60))}` : ''
+  const type = typeof panel.type === 'string' && panel.type ? ` type=${oneLine(panel.type, 40)}` : ''
+  return `id=${panel.id}${title}${type}`
+}
+
+function changedKeyNames(before, after) {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)])
+  const changed = []
+  for (const key of keys) {
+    if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(oneLine(key, 40))
+  }
+  if (changed.length > MAX_DIFF_CHANGED_KEYS) {
+    return `${changed.slice(0, MAX_DIFF_CHANGED_KEYS).join(', ')} +${changed.length - MAX_DIFF_CHANGED_KEYS} more`
+  }
+  return changed.join(', ')
+}
+
+function variableMapOf(dashboard) {
+  const list = Array.isArray(dashboard?.templating?.list) ? dashboard.templating.list : []
+  return new Map(list
+    .filter((variable) => variable && typeof variable === 'object' && typeof variable.name === 'string' && variable.name)
+    .map((variable) => [variable.name, variable]))
+}
+
+// 纯函数：以实时复核的当前大盘为基线，与待写 JSON 比对出有界、清洗过的内容
+// diff 行（面板增/删/改、模板变量增/删/改、顶层字段变化），供审批文案展示。
+// proposed 侧全部来自不可信数据，所有文本都经 oneLine 清洗，无法伪造换行。
+function diffDashboards(current, proposed) {
+  if (!current || typeof current !== 'object' || !proposed || typeof proposed !== 'object') return []
+  const lines = []
+
+  const currentPanels = flattenPanels(current)
+  const proposedPanels = flattenPanels(proposed)
+  for (const [id, panel] of currentPanels) {
+    if (!proposedPanels.has(id)) lines.push(`- panel ${panelLabel(panel)}`)
+  }
+  for (const [id, panel] of proposedPanels) {
+    const before = currentPanels.get(id)
+    if (!before) {
+      lines.push(`+ panel ${panelLabel(panel)}`)
+      continue
+    }
+    const changed = changedKeyNames(before, panel)
+    if (changed) lines.push(`~ panel ${panelLabel(panel)}: changed ${changed}`)
+  }
+
+  const currentVars = variableMapOf(current)
+  const proposedVars = variableMapOf(proposed)
+  for (const [name] of currentVars) {
+    if (!proposedVars.has(name)) lines.push(`- variable ${JSON.stringify(oneLine(name, 60))}`)
+  }
+  for (const [name, variable] of proposedVars) {
+    const before = currentVars.get(name)
+    if (!before) {
+      lines.push(`+ variable ${JSON.stringify(oneLine(name, 60))}`)
+      continue
+    }
+    const changed = changedKeyNames(before, variable)
+    if (changed) lines.push(`~ variable ${JSON.stringify(oneLine(name, 60))}: changed ${changed}`)
+  }
+
+  const fieldKeys = new Set([...Object.keys(current), ...Object.keys(proposed)])
+  for (const key of fieldKeys) {
+    if (DIFF_SKIP_FIELDS.has(key)) continue
+    const before = JSON.stringify(current[key])
+    const after = JSON.stringify(proposed[key])
+    if (before === after) continue
+    lines.push(`~ field ${oneLine(key, 40)}: ${oneLine(before ?? '(absent)', MAX_DIFF_VALUE_CHARS)} -> ${oneLine(after ?? '(absent)', MAX_DIFF_VALUE_CHARS)}`)
+  }
+
+  if (lines.length > MAX_DIFF_LINES) {
+    const hidden = lines.length - MAX_DIFF_LINES
+    return [...lines.slice(0, MAX_DIFF_LINES), `…${hidden} more change(s) not shown.`]
+  }
+  return lines
 }
 
 export function apply(ctx, config = {}) {
@@ -312,7 +420,18 @@ export function apply(ctx, config = {}) {
       const snapshot = trustedSnapshotFor(approvalUid(exec.arguments))
       // 实时复核只用于丰富审批文案；写前校验仍在 execute() 内原样执行（TOCTOU 防护）。
       const live = snapshot ? await liveDashboardCheck(snapshot.uid) : null
-      return { kind: 'ask', reason: approvalReason(exec.arguments, snapshot, live) }
+      // diff 预览基于实时复核结果与待写 JSON；后者是不可信数据，diff 行全部经
+      // 清洗与截断，无法伪造审批文案；解析失败按无 diff 处理（execute 会拒绝）。
+      let diffLines = null
+      if (live?.ok) {
+        try {
+          const proposed = JSON.parse(String(exec.arguments?.dashboardJson ?? ''))
+          if (proposed && typeof proposed === 'object' && !Array.isArray(proposed)) {
+            diffLines = diffDashboards(live.current.dashboard, proposed)
+          }
+        } catch { /* 非法 JSON 会在 execute() 阶段被拒绝，无需 diff 预览。 */ }
+      }
+      return { kind: 'ask', reason: approvalReason(exec.arguments, snapshot, live, diffLines) }
     }
     if (exec.name === 'grafana_clone') return { kind: 'ask', reason: cloneApprovalReason(exec.arguments) }
     return decision
@@ -595,6 +714,7 @@ export const internals = Object.freeze({
   approvalReason,
   approvalUid,
   cloneApprovalReason,
+  diffDashboards,
   normalizeBaseUrl,
   parseUid,
   readLimitedText,
