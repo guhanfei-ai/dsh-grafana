@@ -552,6 +552,155 @@ test('grafana_query batches panel queries and never records a write snapshot', a
   }
 })
 
+test('summarizeFrames keeps real bucket names for table frames and reports per-panel failures', () => {
+  const records = [
+    { panel: { id: 6, title: 'Top IPs' }, refId: 'A', originalRefId: 'A' },
+    { panel: { id: 7, title: 'Broken' }, refId: 'B', originalRefId: 'B', failed: 'request timed out' },
+  ]
+  const results = {
+    A: {
+      frames: [{
+        schema: { fields: [{ name: 'ip', type: 'string' }, { name: 'Value', type: 'number' }] },
+        data: { values: [['139.9.128.14', '8.8.8.8', '9.9.9.9'], [342000, 11560, 11950]] },
+      }],
+    },
+  }
+  const text = internals.summarizeFrames(records, results).join('\n')
+  // terms 表格帧的桶名是排行榜类面板的核心数据，必须原样展示，不能退化成 "?"。
+  assert.match(text, /139\.9\.128\.14=/)
+  assert.match(text, /9\.9\.9\.9=/)
+  assert.doesNotMatch(text, /\?=/)
+  // 降级逐面板重试后仍失败的面板：逐条记录，不隐藏。
+  assert.match(text, /query B: failed: request timed out/)
+})
+
+test('grafana_query passes server-side expressions through and skips unresolvable panels', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 9, uid: 'abc123', title: 'Overview', version: 1,
+    panels: [
+      { id: 2, type: 'stat', title: 'Broken', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'up{env="$nope"}' }] },
+      {
+        id: 8, type: 'timeseries', title: 'QPS',
+        targets: [
+          { refId: 'A', datasource: { type: 'elasticsearch', uid: 'es' }, query: 'count(*)' },
+          { refId: 'B', datasource: { type: '__expr__', uid: '__expr__' }, expression: '$A / 60' },
+        ],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // Expression 里的 $A 是 refId 引用，由服务端表达式引擎解析，原样透传。
+    assert.equal(queryBodies.length, 1)
+    assert.equal(queryBodies[0].queries.length, 2)
+    const expressionQuery = queryBodies[0].queries.find((query) => query.refId === 'B')
+    assert.equal(expressionQuery.expression, '$A / 60')
+
+    // 模板变量解析失败的面板只跳过并说明，不阻断整盘。
+    assert.match(output, /panel id=2 "Broken": skipped/)
+    assert.match(output, /nope/)
+    assert.match(output, /panel id=8 "QPS":/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query falls back to per-panel queries when the batch request fails', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  let queryCalls = 0
+  const dashboard = {
+    id: 9, uid: 'abc123', title: 'Overview', version: 1,
+    panels: [
+      { id: 1, type: 'stat', title: 'One', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'one' }] },
+      { id: 2, type: 'stat', title: 'Two', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'two' }] },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      const body = JSON.parse(init.body)
+      queryBodies.push(body)
+      queryCalls += 1
+      // 第一次批量请求超时，触发逐面板降级。
+      if (queryCalls === 1) throw new Error('request timed out')
+      return jsonResponse({
+        results: Object.fromEntries(body.queries.map((query) => [query.refId, {
+          frames: [{ schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[7]] } }],
+        }])),
+      })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // 1 次批量失败 + 2 次逐面板降级。
+    assert.equal(queryBodies.length, 3)
+    assert.equal(queryBodies[0].queries.length, 2)
+    assert.equal(queryBodies[1].queries.length, 1)
+    assert.equal(queryBodies[2].queries.length, 1)
+    assert.match(output, /Batch query failed \(Grafana API request failed: POST \/api\/ds\/query: request timed out\); fell back to per-panel queries\./)
+    assert.match(output, /panel id=1 "One":/)
+    assert.match(output, /panel id=2 "Two":/)
+    assert.match(output, /last=7/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_get summary mode returns a compact overview without recording a write snapshot', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 5,
+    templating: { list: [{ name: 'env', type: 'custom' }] },
+    panels: [
+      {
+        id: 1, type: 'stat', title: 'QPS', datasource: { type: 'prometheus', uid: 'prom' },
+        targets: [{ refId: 'A', expr: 'sum(rate(http_requests_total[5m]))' }],
+        fieldConfig: {
+          defaults: { thresholds: { steps: [{ color: 'green' }, { color: 'red', value: 900 }] } },
+          overrides: [{ matcher: { id: 'byName' }, properties: [] }],
+        },
+      },
+      { id: 2, type: 'text', title: 'Note' },
+    ],
+  }
+  globalThis.fetch = async () => jsonResponse({ meta: { folderTitle: 'Prod', folderUid: 'prod', canSave: true }, dashboard })
+  try {
+    const { listeners, tools } = createContext()
+    const output = await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc123', summary: true }, execution())
+
+    assert.match(output, /dashboard uid=abc123 "Overview" version=5 folder="Prod"/)
+    assert.match(output, /variables: env\(custom\)/)
+    assert.match(output, /panel id=1 "QPS" type=stat/)
+    assert.match(output, /datasource: prometheus uid=prom/)
+    assert.match(output, /query A: sum\(rate\(http_requests_total\[5m\]\)\)/)
+    assert.match(output, /thresholds: base=green, 900=red/)
+    assert.match(output, /overrides: 1 rule\(s\)/)
+
+    // 摘要模式只读：随后立即写入仍被审批门拒绝。
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: { dashboardJson: JSON.stringify(dashboard), changeSummary: 'x' },
+    }, async () => ({ kind: 'allow' }))
+    assert.match(decision.reason, /no recent trusted snapshot/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('snapshots record title, folderTitle, and folderUid with a folderUid fallback', async () => {
   const originalFetch = globalThis.fetch
   const dashboard = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }

@@ -8,7 +8,7 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 
 ## Why dsh-grafana
 
-- Fetch a dashboard by browser URL or UID.
+- Fetch a dashboard by browser URL or UID, or request a compact structural summary for large dashboards.
 - Search dashboards by title and tag.
 - Query the live data behind panels by pasting the dashboard or panel-view URL.
 - Duplicate a dashboard into a brand-new copy and get its URL back.
@@ -89,10 +89,10 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 
 | Tool | Behavior |
 | --- | --- |
-| `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. |
+| `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. With `summary: true` it returns a compact structural overview (panels, queries, thresholds, variables) instead of the full JSON and records no write snapshot — preferred for large dashboards. |
 | `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
 | `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
-| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Read-only; records no write snapshot. |
+| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard, and a failed batch request automatically falls back to per-panel queries. Read-only; records no write snapshot. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_health` | Checks connectivity and service-account validity. |
 

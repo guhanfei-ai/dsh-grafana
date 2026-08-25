@@ -10,6 +10,9 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Fixed
 
+- `grafana_query` no longer aborts the whole dashboard on an Expression panel: `$A`-style refId references inside `__expr__` targets are server-side expression references, not template variables, and are now passed through untouched; panels whose variable interpolation still fails are skipped and reported in the summary instead of failing the entire query.
+- `grafana_query` no longer fails the whole dashboard when the batched `POST /api/ds/query` times out or errors: it automatically falls back to per-panel requests (each panel's failure is recorded individually) and reports whatever succeeded. Datasource queries get a dedicated 30s per-request timeout and the tool itself a 90s ceiling to leave room for the fallback.
+- `grafana_query` table frames (for example Elasticsearch `terms` top-N panels) now show the real bucket keys in the recent-points section instead of `?=…`, which made ranking panels unusable.
 - `grafana_health` now reports the real `database` field from `GET /api/health` (e.g. `ok`/`failing`) instead of reading a nonexistent `status` field that made the output always read `health=ok`.
 - The settings card now validates the Grafana URL before writing anything, so an invalid URL can no longer leave a half-saved state where the token was already stored; malformed URLs also show the localized error message instead of the native `new URL` exception.
 - Release the response body when rejecting an oversized response early via its `Content-Length` header, so the connection no longer lingers until the request timeout.
@@ -32,6 +35,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Added
 
+- `grafana_get` accepts `summary: true` for a compact structural overview of large dashboards (panel title/type/datasource, queries, thresholds, overrides, and template variables) instead of the full JSON. Summary mode is read-only and records no write snapshot.
 - `grafana_query`: paste the dashboard or panel-view browser URL (or a UID) and the tool executes the panel datasource queries via `POST /api/ds/query`, returning a bounded statistical summary of the live data (per series: min/max/avg/last plus recent points). A `?viewPanel=` URL parameter limits the query to that single panel, and the URL `from`/`to` time range is honored. Template variables are interpolated from the dashboard's current values or an explicit `variables` override; global built-ins (`$__interval`, `$__rate_interval`, …) pass through to the datasource. Read-only: no approval gate, no write snapshot recorded, and all returned text is sanitized and capped.
 - `grafana_clone`: duplicate an existing dashboard into a brand-new dashboard (fresh UID, version 1) with panels, variables, and layout unchanged. It keeps the source folder by default (an explicit `folderUid` or empty-string General target is honored), defaults the title to `<source> (copy)`, returns the full new dashboard URL, requires `grafana_get` before a follow-up write, and goes through the same native approval gate as every other write.
 - Automated tests and a Node 20/22/24 CI matrix.
