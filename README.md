@@ -10,6 +10,7 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 
 - Fetch a dashboard by browser URL or UID.
 - Search dashboards by title and tag.
+- Query the live data behind panels by pasting the dashboard or panel-view URL.
 - Duplicate a dashboard into a brand-new copy and get its URL back.
 - Edit panels, queries, thresholds, variables, and layout through conversation.
 - Preserve the dashboard folder automatically.
@@ -80,6 +81,7 @@ Prefer least-privilege RBAC with only the required dashboard and folder scopes:
 - `dashboards:read`
 - `dashboards:write`
 - `folders:read` for the folders being edited
+- `datasources:query` plus access to the datasources queried by `grafana_query`
 
 When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Avoid Admin tokens.
 
@@ -90,6 +92,7 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. |
 | `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
 | `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
+| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Read-only; records no write snapshot. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_health` | Checks connectivity and service-account validity. |
 

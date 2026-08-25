@@ -32,6 +32,7 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Added
 
+- `grafana_query`: paste the dashboard or panel-view browser URL (or a UID) and the tool executes the panel datasource queries via `POST /api/ds/query`, returning a bounded statistical summary of the live data (per series: min/max/avg/last plus recent points). A `?viewPanel=` URL parameter limits the query to that single panel, and the URL `from`/`to` time range is honored. Template variables are interpolated from the dashboard's current values or an explicit `variables` override; global built-ins (`$__interval`, `$__rate_interval`, …) pass through to the datasource. Read-only: no approval gate, no write snapshot recorded, and all returned text is sanitized and capped.
 - `grafana_clone`: duplicate an existing dashboard into a brand-new dashboard (fresh UID, version 1) with panels, variables, and layout unchanged. It keeps the source folder by default (an explicit `folderUid` or empty-string General target is honored), defaults the title to `<source> (copy)`, returns the full new dashboard URL, requires `grafana_get` before a follow-up write, and goes through the same native approval gate as every other write.
 - Automated tests and a Node 20/22/24 CI matrix.
 - English default documentation and a Simplified Chinese translation.

@@ -10,6 +10,7 @@
 
 - 通过浏览器 URL 或 UID 获取大盘。
 - 按标题和标签搜索大盘。
+- 粘贴大盘或面板视图 URL，直接查询面板背后的真实数据。
 - 把大盘复制为全新大盘，并返回新大盘地址。
 - 通过对话调整面板、查询、阈值、变量和布局。
 - 写回时自动保持大盘所在文件夹。
@@ -80,6 +81,7 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 - `dashboards:read`
 - `dashboards:write`
 - 目标文件夹的 `folders:read`
+- `grafana_query` 需要 `datasources:query` 以及对所查数据源的访问权限
 
 不支持细粒度 RBAC 时才使用 Editor 角色，避免使用 Admin token。
 
@@ -90,6 +92,7 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_get` | 获取完整大盘，并保存一个短期可信的版本和目录快照。 |
 | `grafana_push` | 在审批、身份校验、版本校验和目录保持后写回最近读取的大盘。 |
 | `grafana_clone` | 把大盘复制为全新大盘（全新 UID、版本 1），默认留在源文件夹，并返回新大盘完整地址。同样需要审批，继续写入前必须先调用 `grafana_get`。 |
+| `grafana_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。只读，不记录写快照。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_health` | 检查 Grafana 连通性与 Service Account 凭证。 |
 

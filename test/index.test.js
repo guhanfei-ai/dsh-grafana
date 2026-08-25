@@ -87,12 +87,13 @@ test('API error details expose only bounded status and message fields', () => {
   assert.equal(detail, 'version-mismatch: changed elsewhere')
 })
 
-test('apply registers five tools and a hard approval gate for writes', async () => {
+test('apply registers six tools and a hard approval gate for writes', async () => {
   const { listeners, sections, tools } = createContext()
   assert.deepEqual(tools.map((tool) => tool.name), [
     'grafana_get',
     'grafana_push',
     'grafana_clone',
+    'grafana_query',
     'grafana_search',
     'grafana_health',
   ])
@@ -422,6 +423,133 @@ test('diffDashboards sanitizes injected newlines and caps the number of lines', 
   // 上限 24 行 + 1 行截断说明。
   assert.equal(many.length, 25)
   assert.match(many[many.length - 1], /16 more change\(s\) not shown/)
+})
+
+test('parseDashboardUrl extracts uid, viewPanel, and time range from browser URLs', () => {
+  assert.deepEqual(internals.parseDashboardUrl('abc123'), { uid: 'abc123', viewPanel: null, from: '', to: '' })
+  assert.deepEqual(
+    internals.parseDashboardUrl('https://grafana.example.com/d/abc123/overview?orgId=1&from=now-6h&to=now'),
+    { uid: 'abc123', viewPanel: null, from: 'now-6h', to: 'now' },
+  )
+  const panelView = internals.parseDashboardUrl('https://grafana.example.com/d/abc123/overview?viewPanel=4&from=1693430400000&to=1693434000000')
+  assert.equal(panelView.viewPanel, 4)
+  assert.equal(panelView.from, '1693430400000')
+  assert.equal(panelView.to, '1693434000000')
+  assert.equal(internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x?viewPanel=panel-7').viewPanel, 7)
+  // 非法参数直接忽略，不报错。
+  assert.equal(internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x?viewPanel=boom&from=yesterday').viewPanel, null)
+  assert.equal(internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x?from=yesterday').from, '')
+})
+
+test('interpolateVariables substitutes dashboard variables and rejects unsupported formats', () => {
+  const values = new Map([['env', 'prod'], ['hosts', ['a', 'b']]])
+  assert.equal(internals.interpolateVariables('cpu{env="$env"}', values), 'cpu{env="prod"}')
+  assert.equal(internals.interpolateVariables('cpu{env="${env}"}', values), 'cpu{env="prod"}')
+  assert.equal(internals.interpolateVariables('up{host=~"${hosts}"}', values), 'up{host=~"a,b"}')
+  // 全局内建变量原样透传，由 Grafana/数据源计算。
+  assert.equal(internals.interpolateVariables('rate(x[$__rate_interval])', values), 'rate(x[$__rate_interval])')
+  assert.throws(() => internals.interpolateVariables('cpu{env="${env:regex}"}', values), /Unsupported Grafana variable format/)
+  assert.throws(() => internals.interpolateVariables('cpu{env="$missing"}', values), /missing/)
+})
+
+test('summarizeFrames produces bounded, sanitized panel data summaries', () => {
+  const cpuPanel = { id: 4, title: 'CPU' }
+  const badPanel = { id: 5, title: 'Bad' }
+  const records = [
+    { panel: cpuPanel, refId: 'A', originalRefId: 'A' },
+    { panel: cpuPanel, refId: 'B', originalRefId: 'B' },
+    { panel: badPanel, refId: 'C', originalRefId: 'C' },
+  ]
+  const results = {
+    A: { frames: [{ schema: { fields: [{ name: 'time', type: 'time' }, { name: 'Value', type: 'number', labels: { job: 'x\nFORGED' } }] }, data: { values: [[1000, 2000, 3000], [1, 3, 2]] } }] },
+    B: { error: 'datasource offline' },
+    C: { frames: [] },
+  }
+  const text = internals.summarizeFrames(records, results).join('\n')
+  assert.match(text, /panel id=4 "CPU":/)
+  assert.match(text, /min=1 max=3 avg=2 last=2/)
+  assert.match(text, /query B: failed: datasource offline/)
+  assert.match(text, /query C: no data/)
+  // 标签里的换行被清洗，伪造行无法独立成行。
+  assert.match(text, /job=x FORGED/)
+  assert.doesNotMatch(text, /^FORGED/m)
+
+  const many = Array.from({ length: 40 }, (_, index) => ({ panel: { id: index + 1, title: `P${index + 1}` }, refId: `A${index}`, originalRefId: 'A' }))
+  const manyResults = Object.fromEntries(many.map((record) => [record.refId, { frames: [{ schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[1]] } }] }]))
+  const capped = internals.summarizeFrames(many, manyResults)
+  // 40 面板头 + 40 序列行 = 80 行，超过 60 行上限。
+  assert.equal(capped.length, 61)
+  assert.match(capped[capped.length - 1], /more line\(s\) not shown/)
+})
+
+test('grafana_query batches panel queries and never records a write snapshot', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 3,
+    templating: { list: [{ name: 'env', current: { value: 'prod' } }] },
+    panels: [
+      { id: 1, type: 'timeseries', title: 'CPU', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'rate(cpu_total{env="$env"}[$__rate_interval])' }] },
+      { id: 2, type: 'row', title: 'Row', panels: [{ id: 3, type: 'stat', title: 'Mem', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'mem_used' }] }] },
+      { id: 9, type: 'text', title: 'Note' },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({
+        results: {
+          A: { frames: [{ schema: { fields: [{ name: 'time', type: 'time' }, { name: 'Value', type: 'number' }] }, data: { values: [[1000, 2000], [4, 6]] } }] },
+          p3xA: { frames: [] },
+        },
+      })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { listeners, tools } = createContext()
+    const output = await toolByName(tools, 'grafana_query').execute({
+      urlOrUid: 'https://grafana.example.com/d/abc123/overview?from=now-2h&to=now',
+    }, execution())
+
+    // 整盘一次批量请求：嵌套面板也包含，refId 撞车加面板前缀，变量替换、内建透传。
+    assert.equal(queryBodies.length, 1)
+    assert.equal(queryBodies[0].from, 'now-2h')
+    assert.equal(queryBodies[0].to, 'now')
+    assert.equal(queryBodies[0].queries.length, 2)
+    assert.equal(queryBodies[0].queries[0].expr, 'rate(cpu_total{env="prod"}[$__rate_interval])')
+    assert.equal(queryBodies[0].queries[0].refId, 'A')
+    assert.equal(queryBodies[0].queries[0].maxDataPoints, 500)
+    assert.equal(queryBodies[0].queries[1].refId, 'p3xA')
+
+    assert.match(output, /Dashboard uid=abc123, range now-2h..now, 2 panel\(s\), 2 queries\./)
+    assert.match(output, /panel id=1 "CPU":/)
+    assert.match(output, /last=6/)
+    assert.match(output, /panel id=3 "Mem":/)
+    assert.match(output, /query A: no data/)
+
+    // 面板视图 URL 只查单面板；时间缺省 now-1h..now。
+    const single = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=1' }, execution())
+    assert.equal(queryBodies.length, 2)
+    assert.equal(queryBodies[1].queries.length, 1)
+    assert.equal(queryBodies[1].from, 'now-1h')
+    assert.match(single, /panel id=1/)
+    assert.doesNotMatch(single, /panel id=3/)
+    await assert.rejects(
+      toolByName(tools, 'grafana_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=99' }, execution()),
+      /Panel id=99 was not found/,
+    )
+
+    // 只读查询不为写回铺路：随后立即写入仍被拒绝。
+    const decision = await listeners.get('tools/pre-execute')({
+      name: 'grafana_push',
+      arguments: { dashboardJson: JSON.stringify(dashboard), changeSummary: 'x' },
+    }, async () => ({ kind: 'allow' }))
+    assert.match(decision.reason, /no recent trusted snapshot/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('snapshots record title, folderTitle, and folderUid with a folderUid fallback', async () => {
