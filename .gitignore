@@ -6,3 +6,9 @@ dist/
 .reasonix
 .zcode
 .codebuddy
+-**/
+._**/
+.workbuddy
+_logs/
+_plans/
+_prompts

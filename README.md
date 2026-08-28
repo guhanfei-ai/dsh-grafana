@@ -92,9 +92,88 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. With `summary: true` it returns a compact structural overview (panels, queries, thresholds, variables) instead of the full JSON and records no write snapshot — preferred for large dashboards. |
 | `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
 | `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
-| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard, and a failed batch request automatically falls back to per-panel queries. Read-only; records no write snapshot. |
+| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_health` | Checks connectivity and service-account validity. |
+
+### Template variable overrides (`grafana_query`)
+
+The `variables` argument is a JSON object keyed by variable name. Every overrideable variable in the dashboard (`query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` types) can be overridden; unsupported types throw an explicit error.
+
+Single value — replaces the variable everywhere it appears (`$env`, `${env}`):
+
+```json
+{ "env": "prod" }
+```
+
+Multi-value — pass an array. The expansion follows the Grafana format modifier used in the query itself, so dashboards written for multi-select variables keep working:
+
+```json
+{ "host": ["www.ttpai.cn", "m.ttpai.cn"] }
+```
+
+For **Prometheus and Loki targets** a bare multi-value reference (`$host` with no modifier) renders as `(www.ttpai.cn|m.ttpai.cn)` — the alternation form that works inside `=~` label matchers, matching Grafana's own rendering. Values are not regex-escaped (Grafana does not escape them either; escaping a `.` as `\.` inside a double-quoted PromQL string is a syntax error). Use the explicit `${host:regex}` modifier when you need exact matching.
+
+| Query placeholder | Expands to |
+| --- | --- |
+| `$host` / `${host}` | `www.ttpai.cn,m.ttpai.cn` (CSV, Grafana default) |
+| `${host:csv}` | `www.ttpai.cn,m.ttpai.cn` |
+| `${host:doublequote}` | `"www.ttpai.cn","m.ttpai.cn"` |
+| `${host:singlequote}` | `'www.ttpai.cn','m.ttpai.cn'` |
+| `${host:json}` | `["www.ttpai.cn","m.ttpai.cn"]` |
+| `${host:raw}` | `www.ttpai.cn,m.ttpai.cn` |
+| `${host:pipe}` | `www.ttpai.cn\|m.ttpai.cn` |
+| `${host:percent}` | each value URL-encoded, comma-joined (`www.ttpai.cn,m.ttpai.cn`; `["a b"]` → `a%20b`) |
+| `${host:querystring}` | `host=www.ttpai.cn&host=m.ttpai.cn` (keyed by the variable name) |
+| `${host:regex}` | `www\.ttpai\.cn\|m\.ttpai\.cn` (each value regex-escaped, joined with `\|`) |
+| `${host:lucene}` | each value Lucene-escaped, space-joined |
+| `${host:sqlstring}` | `'www.ttpai.cn','m.ttpai.cn'` (single quotes doubled inside values) |
+
+A single-value variable without a modifier expands to the bare value (byte-for-byte `String(value)`); modifiers apply to single values too (`${host:json}` → `"www.ttpai.cn"`, `${host:pipe}` → `www.ttpai.cn`). Unknown format modifiers throw an error. Built-in variables (`$__interval`, `$__rate_interval`, `${__from:date}`, …) always pass through untouched.
+
+Adhoc filter override — replace the dashboard's saved adhoc filters entirely (`[]` clears them):
+
+```json
+{
+  "adhoc": [
+    { "key": "host.keyword", "operator": "=", "value": "www.ttpai.cn" },
+    { "key": "status", "operator": "!=", "value": "404" }
+  ]
+}
+```
+
+An unbound adhoc entry applies to every datasource; add `"datasourceUid": "<uid>"` to bind it to one datasource. Translation depends on the datasource type:
+
+| Datasource type | Translation | Supported operators |
+| --- | --- | --- |
+| Elasticsearch | Lucene clause merged into each target's query string (`host.keyword:"www.ttpai.cn"`; a non-empty panel query is wrapped in parentheses and combined with `AND`) | `=` `!=` always; `>` `<` numeric only; `=~` `!~` as Lucene regex `field:/pattern/` (`/` inside the pattern is escaped; an empty pattern throws) |
+| Prometheus | Label matchers injected into every vector selector (`host="www.ttpai.cn"`; bare metric names get `{...}` added) | `=` `!=` `=~` `!~`; `>` `<` throw |
+| Loki | Matchers injected into the stream selector (`{app="api", host="www.ttpai.cn"}`); pipeline stages are left untouched | `=` `!=` `=~` `!~`; `>` `<` throw |
+| SQL (MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse) | `${__adhoc}` / `$__adhoc` placeholder in `rawSql` replaced with a `WHERE`-style clause (`host = 'www.ttpai.cn'`; values single-quote-escaped) | `=` `!=` `>` `<` (numeric) `=~` `!~` (mapped to `LIKE`/`NOT LIKE`) |
+| Anything else | Explicit error listing the supported types | — |
+
+Datasource-type variables — override with a datasource uid string:
+
+```json
+{ "datasource": "prom-prod" }
+```
+
+Panels whose datasource references the variable (`{"type":"prometheus","uid":"$datasource"}`) are re-pointed at the given uid. A non-string value (number, array) throws an explicit error.
+
+### Legacy datasource references (`grafana_query`)
+
+Older dashboards reference datasources in shapes that `/api/ds/query` cannot use directly. `grafana_query` resolves them transparently:
+
+| Panel datasource shape | Resolution |
+| --- | --- |
+| Plain string uid (`"9CWBz0bik"`-style, Grafana 8 and earlier) | Looked up via `GET /api/datasources`; the resolved `{type, uid}` is sent with each query |
+| `{"uid":"$datasource"}` / `{"type":"prometheus","uid":"$datasource"}` (datasource-type template variable) | The variable's saved `current` value is interpolated into the uid |
+| Saved value `"default"` | Mapped to the server's default datasource (`"default"` is a reserved pseudo-uid that `/api/ds/query` rejects) |
+| Index unavailable (403) or uid unknown | The raw `{uid}` is passed through so Grafana itself reports the problem; if active adhoc filters cannot be translated for an untyped datasource, an explicit error is thrown instead |
+
+The datasource index is fetched lazily — only when a dashboard actually contains references that need resolution. When every panel is skipped, the error lists each panel's id, title, and skip reason instead of a bare "no executable query".
+
+A real-machine verification matrix (variable overrides × operators × datasource types, legacy dashboard shapes) is recorded in [INTEGRATION.md](INTEGRATION.md).
 
 ### Safe update workflow
 

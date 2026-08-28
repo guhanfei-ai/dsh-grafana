@@ -92,9 +92,88 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_get` | 获取完整大盘，并保存一个短期可信的版本和目录快照。传 `summary: true` 时改为返回结构化摘要（面板、查询、阈值、变量），不记录写快照，适合超大盘。 |
 | `grafana_push` | 在审批、身份校验、版本校验和目录保持后写回最近读取的大盘。 |
 | `grafana_clone` | 把大盘复制为全新大盘（全新 UID、版本 1），默认留在源文件夹，并返回新大盘完整地址。同样需要审批，继续写入前必须先调用 `grafana_get`。 |
-| `grafana_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘；批量请求失败时自动降级为逐面板查询。只读，不记录写快照。 |
+| `grafana_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_health` | 检查 Grafana 连通性与 Service Account 凭证。 |
+
+### 模板变量覆盖（`grafana_query`）
+
+`variables` 参数是一个以变量名为键的 JSON 对象。大盘中所有可覆盖变量（`query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型）均可覆盖；不支持的类型显式报错。
+
+单值——替换该变量出现的所有位置（`$env`、`${env}`）：
+
+```json
+{ "env": "prod" }
+```
+
+多值——传数组，展开方式遵循查询里使用的 Grafana 格式修饰符，为多选变量编写的大盘无需改动即可工作：
+
+```json
+{ "host": ["www.ttpai.cn", "m.ttpai.cn"] }
+```
+
+**Prometheus / Loki target** 里无修饰符的裸多值引用（`$host`）渲染为 `(www.ttpai.cn|m.ttpai.cn)`——即 `=~` label matcher 里可用的交替形式，与 Grafana 自身渲染一致。值不做正则转义（Grafana 也不转义；双引号 PromQL 字符串里把 `.` 转义成 `\.` 是语法错误）。需要精确匹配时使用显式 `${host:regex}` 修饰符。
+
+| 查询占位符 | 展开结果 |
+| --- | --- |
+| `$host` / `${host}` | `www.ttpai.cn,m.ttpai.cn`（CSV，Grafana 默认） |
+| `${host:csv}` | `www.ttpai.cn,m.ttpai.cn` |
+| `${host:doublequote}` | `"www.ttpai.cn","m.ttpai.cn"` |
+| `${host:singlequote}` | `'www.ttpai.cn','m.ttpai.cn'` |
+| `${host:json}` | `["www.ttpai.cn","m.ttpai.cn"]` |
+| `${host:raw}` | `www.ttpai.cn,m.ttpai.cn` |
+| `${host:pipe}` | `www.ttpai.cn\|m.ttpai.cn` |
+| `${host:percent}` | 逐值 URL 编码后逗号连接（`www.ttpai.cn,m.ttpai.cn`；`["a b"]` → `a%20b`） |
+| `${host:querystring}` | `host=www.ttpai.cn&host=m.ttpai.cn`（以变量名为键） |
+| `${host:regex}` | `www\.ttpai\.cn\|m\.ttpai\.cn`（逐值正则转义后以 `\|` 连接） |
+| `${host:lucene}` | 逐值 Lucene 转义后以空格连接 |
+| `${host:sqlstring}` | `'www.ttpai.cn','m.ttpai.cn'`（值内单引号翻倍） |
+
+无修饰符的单值变量展开为裸值（与 `String(value)` 逐字节一致）；修饰符对单值同样生效（`${host:json}` → `"www.ttpai.cn"`，`${host:pipe}` → `www.ttpai.cn`）。未知格式修饰符显式报错。内建变量（`$__interval`、`$__rate_interval`、`${__from:date}` 等）始终原样透传。
+
+adhoc 过滤覆盖——整体替换大盘保存的 adhoc filters（`[]` 表示清空）：
+
+```json
+{
+  "adhoc": [
+    { "key": "host.keyword", "operator": "=", "value": "www.ttpai.cn" },
+    { "key": "status", "operator": "!=", "value": "404" }
+  ]
+}
+```
+
+未绑定的 adhoc 条目对所有数据源生效；加 `"datasourceUid": "<uid>"` 可绑定到单个数据源。翻译方式取决于数据源类型：
+
+| 数据源类型 | 翻译方式 | 支持的运算符 |
+| --- | --- | --- |
+| Elasticsearch | Lucene 条件拼进各 target 的查询串（`host.keyword:"www.ttpai.cn"`；面板自带查询串非空时括号包裹后以 `AND` 连接） | `=` `!=` 恒可；`>` `<` 仅数字；`=~` `!~` 映射为 Lucene 正则 `field:/pattern/`（模式内的 `/` 会转义；空模式报错） |
+| Prometheus | label matcher 注入每个 vector selector（`host="www.ttpai.cn"`；裸 metric 名补上 `{...}`） | `=` `!=` `=~` `!~`；`>` `<` 报错 |
+| Loki | matcher 注入 stream selector（`{app="api", host="www.ttpai.cn"}`）；pipeline 阶段不动 | `=` `!=` `=~` `!~`；`>` `<` 报错 |
+| SQL（MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse） | `rawSql` 中的 `${__adhoc}` / `$__adhoc` 占位符替换为 WHERE 风格条件（`host = 'www.ttpai.cn'`；值做单引号转义） | `=` `!=` `>` `<`（数字）、`=~` `!~`（映射为 `LIKE`/`NOT LIKE`） |
+| 其它类型 | 显式报错并列出支持类型 | — |
+
+datasource 型变量——用数据源 uid 字符串覆盖：
+
+```json
+{ "datasource": "prom-prod" }
+```
+
+datasource 引用了该变量的面板（`{"type":"prometheus","uid":"$datasource"}`）会改查指定的 uid。传入非字符串值（数字、数组）会显式报错。
+
+### 旧格式 datasource 引用（`grafana_query`）
+
+旧版大盘的 datasource 引用形状无法直接用于 `/api/ds/query`，`grafana_query` 会透明解析：
+
+| 面板 datasource 形状 | 解析方式 |
+| --- | --- |
+| 纯字符串 uid（Grafana 8 及更早） | 经 `GET /api/datasources` 查找，随查询发送解析出的 `{type, uid}` |
+| `{"uid":"$datasource"}` / `{"type":"prometheus","uid":"$datasource"}`（datasource 型模板变量） | 用该变量保存的 `current` 值插值进 uid |
+| 保存值为 `"default"` | 映射到服务端默认数据源（`"default"` 是 `/api/ds/query` 不接受的保留伪 uid） |
+| 索引不可用（403）或 uid 未知 | 裸 `{uid}` 透传，由 Grafana 自行报错；若此时还有生效的 adhoc 过滤无法对未知类型翻译，则显式报错 |
+
+数据源索引按需懒加载——仅当大盘确实存在需要解析的引用时才请求一次。当所有面板都被跳过时，报错会列出每个面板的 id、标题与跳过原因，而不是一句干巴巴的 "no executable query"。
+
+真机验收矩阵（变量覆盖 × 运算符 × 数据源类型、旧格式大盘形状）记录于 [INTEGRATION.md](INTEGRATION.md)。
 
 ### 安全写回流程
 

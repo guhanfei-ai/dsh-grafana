@@ -446,10 +446,65 @@ test('interpolateVariables substitutes dashboard variables and rejects unsupport
   assert.equal(internals.interpolateVariables('cpu{env="$env"}', values), 'cpu{env="prod"}')
   assert.equal(internals.interpolateVariables('cpu{env="${env}"}', values), 'cpu{env="prod"}')
   assert.equal(internals.interpolateVariables('up{host=~"${hosts}"}', values), 'up{host=~"a,b"}')
-  // 全局内建变量原样透传，由 Grafana/数据源计算。
+  // 全局内建变量原样透传，由 Grafana/数据源计算（含带格式修饰符的内建形态）。
   assert.equal(internals.interpolateVariables('rate(x[$__rate_interval])', values), 'rate(x[$__rate_interval])')
-  assert.throws(() => internals.interpolateVariables('cpu{env="${env:regex}"}', values), /Unsupported Grafana variable format/)
+  assert.equal(internals.interpolateVariables('rate(x[${__rate_interval}])', values), 'rate(x[${__rate_interval}])')
+  assert.equal(internals.interpolateVariables('from=${__from:date}', values), 'from=${__from:date}')
+  // 未知格式修饰符 → 显式报错（regex 已是受支持格式）。
+  assert.throws(() => internals.interpolateVariables('cpu{env="${env:mystery}"}', values), /Unsupported Grafana variable format/)
+  assert.throws(() => internals.interpolateVariables('cpu{env="${env:}"}', values), /Unsupported Grafana variable format/)
   assert.throws(() => internals.interpolateVariables('cpu{env="$missing"}', values), /missing/)
+})
+
+test('interpolateVariables expands multi-value variables with Grafana format modifiers', () => {
+  const values = new Map([
+    ['single', 'prod'],
+    ['hosts', ['a', 'b']],
+    ['tricky', ["o'brien", 'a"b', 'c\\d']],
+  ])
+  const t = (text) => internals.interpolateVariables(text, values)
+
+  // 默认与 csv：逗号连接；单值保持逐字节不变。
+  assert.equal(t('${hosts}'), 'a,b')
+  assert.equal(t('$hosts'), 'a,b')
+  assert.equal(t('${hosts:csv}'), 'a,b')
+  assert.equal(t('${single}'), 'prod')
+  assert.equal(t('${single:csv}'), 'prod')
+  assert.equal(t('${single:raw}'), 'prod')
+
+  // 引号包裹类格式。
+  assert.equal(t('${hosts:doublequote}'), '"a","b"')
+  assert.equal(t('${hosts:singlequote}'), "'a','b'")
+  // sqlstring：单引号包裹且内部 ' 翻倍转义（防注入）。
+  assert.equal(t("${tricky:sqlstring}"), "'o''brien','a\"b','c\\d'")
+
+  // json：多值为数组、单值为字符串。
+  assert.equal(t('${hosts:json}'), '["a","b"]')
+  assert.equal(t('${single:json}'), '"prod"')
+
+  // pipe / percent / querystring。
+  assert.equal(t('${hosts:pipe}'), 'a|b')
+  assert.equal(t('${hosts:percent}'), 'a,b')
+  assert.equal(t('${hosts:querystring}'), 'hosts=a&hosts=b')
+  assert.equal(t('${single:querystring}'), 'single=prod')
+
+  // regex：特殊字符转义，多值以 | 连接（可直接放进 =~"(...)"）。
+  assert.equal(t('${hosts:regex}'), 'a|b')
+  assert.equal(t('${tricky:regex}'), 'o\'brien|a"b|c\\\\d')
+
+  // lucene：特殊字符转义，多值以空格连接。
+  assert.equal(t('${hosts:lucene}'), 'a b')
+  assert.equal(t('${tricky:lucene}'), 'o\'brien a\\"b c\\\\d')
+
+  // 未知格式（含大小写敏感）→ 显式报错。
+  assert.throws(() => t('${hosts:CSV}'), /Unsupported Grafana variable format/)
+  assert.throws(() => t('${hosts:nonsense}'), /Unsupported Grafana variable format/)
+})
+
+test('interpolateVariables rejects adhoc filter variables used as text', () => {
+  const values = new Map([['Filters', [{ key: 'host.keyword', operator: '=', value: 'x' }]]])
+  assert.throws(() => internals.interpolateVariables('q{h="$Filters"}', values), /adhoc filter variable/)
+  assert.throws(() => internals.interpolateVariables('q{h="${Filters:csv}"}', values), /adhoc filter variable/)
 })
 
 test('summarizeFrames produces bounded, sanitized panel data summaries', () => {
@@ -1071,6 +1126,1133 @@ test('resolveBaseUrl prefers settings.baseUrl over the credential value', async 
   // settings 值胜出；凭证未被迁移清空（因 settings 已非空，迁移 IIFE 跳过）。
   assert.equal(calls[0], 'https://grafana.from-settings.example.com/api/health')
   assert.equal(creds.GRAFANA_BASE_URL, 'https://grafana.from-credential.example.com')
+})
+
+test('grafana_query adhoc default state: saved adhoc filters expand into the ES target Lucene query', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'c336bd55-e7bd-4e79-8fdc-16293e6575f0' },
+        // Grafana 10 的 adhoc 保存态存在 filters 字段（无 current）。
+        filters: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }],
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Requests',
+      datasource: { type: 'elasticsearch', uid: 'c336bd55-e7bd-4e79-8fdc-16293e6575f0' },
+      targets: [{ refId: 'A', query: 'count(*)' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    assert.equal(queryBodies.length, 1)
+    const body = queryBodies[0]
+    // adhoc 条件拼进 target 的 lucene 查询串（原串非空时括号包裹再 AND）。
+    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    // 请求体不得再出现请求级 adhocFilters（Grafana 10.x 的 /api/ds/query 不消费该字段）。
+    assert.ok(!('adhocFilters' in body), 'request must not carry top-level adhocFilters')
+    // scopedVars 包含 adhoc 变量。
+    assert.ok(body.scopedVars, 'request should include scopedVars')
+    assert.ok(body.scopedVars.Filters, 'scopedVars should include Filters')
+    assert.ok(Array.isArray(body.scopedVars.Filters.value), 'scopedVars.Filters.value should be array')
+    assert.equal(body.scopedVars.Filters.value[0].key, 'host.keyword')
+    assert.match(output, /panel id=1/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc override: passed filters fully replace saved adhoc filters', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        current: { value: [{ key: 'old.field', operator: '=', value: 'old' }] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'QPS',
+      datasource: { type: 'elasticsearch', uid: 'es' },
+      targets: [{ refId: 'A', query: 'count(*)' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ Filters: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] }),
+    }, execution())
+
+    assert.equal(queryBodies.length, 1)
+    const body = queryBodies[0]
+    // 整体替换：lucene 串只含传入条件，不含保存态。
+    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.ok(!('adhocFilters' in body), 'request must not carry top-level adhocFilters')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc multi-operator: = != and numeric > < are expanded into the Lucene query', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        current: { value: [
+          { key: 'a', operator: '=', value: 'x' },
+          { key: 'b', operator: '!=', value: 'y' },
+          { key: 'c', operator: '>', value: '10' },
+          { key: 'd', operator: '<', value: '20.5' },
+          // 值含引号与空格：双引号包裹，内部引号转义。
+          { key: 'msg', operator: '=', value: 'say "hello" world' },
+        ] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Multi',
+      datasource: { type: 'elasticsearch', uid: 'es' },
+      targets: [{ refId: 'A', query: 'count(*)' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    const body = queryBodies[0]
+    assert.equal(
+      body.queries[0].query,
+      '(count(*)) AND a:"x" AND NOT b:"y" AND c:>10 AND d:<20.5 AND msg:"say \\"hello\\" world"',
+    )
+    assert.ok(!('adhocFilters' in body), 'request must not carry top-level adhocFilters')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc regex operators map to Lucene regex; non-numeric ranges and bad fields throw', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const makeDashboard = (filters) => ({
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        current: { value: filters },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'QPS',
+      datasource: { type: 'elasticsearch', uid: 'es' },
+      targets: [{ refId: 'A', query: 'count(*)' }],
+    }],
+  })
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: makeDashboard([{ key: 'a', operator: '=', value: 'x' }]) })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+
+    // =~ / !~ → Lucene 正则 field:/pattern/；值内 / 转义为 \/。
+    await tool.execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ Filters: [
+        { key: 'path', operator: '=~', value: '/api/v[12]/.*' },
+        { key: 'host.keyword', operator: '!~', value: 'www.ttpai.cn|m.ttpai.cn' },
+      ] }),
+    }, execution())
+    assert.equal(
+      queryBodies[0].queries[0].query,
+      '(count(*)) AND path:/\\/api\\/v[12]\\/.*/ AND NOT host.keyword:/www.ttpai.cn|m.ttpai.cn/',
+    )
+
+    // 空正则 → 显式报错，禁止生成 field://。
+    await assert.rejects(
+      tool.execute({
+        urlOrUid: 'abc123',
+        variables: JSON.stringify({ Filters: [{ key: 'a', operator: '=~', value: '  ' }] }),
+      }, execution()),
+      /regex pattern is empty/,
+    )
+
+    // > 搭配非数字值 → lucene 不支持字符串范围 → 显式报错。
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: makeDashboard([{ key: 'a', operator: '>', value: 'abc' }]) })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      /numeric/,
+    )
+
+    // 含 lucene 特殊字符的字段名 → 拒绝拼接，避免注入歧义。
+    await assert.rejects(
+      tool.execute({
+        urlOrUid: 'abc123',
+        variables: JSON.stringify({ Filters: [{ key: 'a:b', operator: '=', value: 'x' }] }),
+      }, execution()),
+      /cannot be safely mapped/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc priority: query/custom override and [] clears adhoc', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [
+        { name: 'env', type: 'query', current: { value: 'staging' } },
+        {
+          name: 'Filters',
+          type: 'adhoc',
+          datasource: { type: 'elasticsearch', uid: 'es' },
+          current: { value: [{ key: 'host.keyword', operator: '=', value: 'old.example.com' }] },
+        },
+      ],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'QPS',
+      datasource: { type: 'elasticsearch', uid: 'es' },
+      targets: [{ refId: 'A', expr: 'rate{env="$env"}', query: '' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    // query 变量 override 生效 + adhoc 清空。
+    await toolByName(tools, 'grafana_query').execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ env: 'prod', Filters: [] }),
+    }, execution())
+
+    assert.equal(queryBodies.length, 1)
+    const body = queryBodies[0]
+    // query 变量被 override 为 prod。
+    assert.equal(body.queries[0].expr, 'rate{env="prod"}')
+    // adhoc 被清空：查询串保持原样（空串），请求体无 adhocFilters 键。
+    assert.equal(body.queries[0].query, '')
+    assert.ok(!('adhocFilters' in body), 'adhoc filters should be cleared with [] — no adhocFilters key')
+    // scopedVars 包含两个变量。
+    assert.equal(body.scopedVars.env.value, 'prod')
+    assert.deepEqual(body.scopedVars.Filters.value, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc explicit errors: unsupported type, unknown variable, invalid filter, non-ES panel', async () => {
+  const originalFetch = globalThis.fetch
+  const makeDashboard = (extraVars = [], extraPanels = []) => ({
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [
+        { name: 'env', type: 'custom', current: { value: 'prod' } },
+        {
+          name: 'Filters',
+          type: 'adhoc',
+          datasource: { type: 'elasticsearch', uid: 'es' },
+          current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
+        },
+        { name: 'ds', type: 'datasource', current: { value: 'prom' } },
+        ...extraVars,
+      ],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'QPS',
+      datasource: { type: 'elasticsearch', uid: 'es' },
+      targets: [{ refId: 'A', query: 'count(*)' }],
+    }, ...extraPanels],
+  })
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: makeDashboard() })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+
+    // override 指向 datasource 类型变量但值不是 uid 字符串 → rejects。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ ds: 123 }) }, execution()),
+      /is a datasource variable/,
+    )
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ ds: ['prom'] }) }, execution()),
+      /is a datasource variable/,
+    )
+
+    // override 指向不存在的变量名 → rejects。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ nonexistent: 'x' }) }, execution()),
+      /does not exist/,
+    )
+
+    // adhoc filter 缺 key → rejects。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ Filters: [{ operator: '=', value: 'x' }] }) }, execution()),
+      /missing or empty "key"/,
+    )
+
+    // adhoc filter operator 非法（~= 不在允许列表） → rejects。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ Filters: [{ key: 'f', operator: '~=', value: 'x' }] }) }, execution()),
+      /unsupported operator/,
+    )
+
+    // 不支持 adhoc 的数据源类型 + 生效 adhoc filters → 整工具报错（含支持矩阵）。
+    const unsupportedDsDashboard = {
+      id: 7, uid: 'abc123', title: 'Overview', version: 1,
+      templating: {
+        list: [{
+          name: 'Filters',
+          type: 'adhoc',
+          current: { value: [{ key: 'host.keyword', operator: '=', value: 'x' }] },
+        }],
+      },
+      panels: [{
+        id: 1, type: 'timeseries', title: 'Influx',
+        datasource: { type: 'influxdb', uid: 'influx' },
+        targets: [{ refId: 'A', query: 'from(bucket: "b")' }],
+      }],
+    }
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: unsupportedDsDashboard })
+    }
+    // prometheus/loki/SQL 已受支持；influxdb 等其余类型 → 显式报错并给出支持矩阵。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      /not supported for datasource type "influxdb".*Supported: elasticsearch.*prometheus.*loki.*SQL/s,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc scoping: bound uid expands per target and expression panels stay in one batch request', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es1' },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      {
+        // QPS 面板：A 是 ES 查询，B 是表达式 $A / 60 —— 必须在同一个批量请求里，
+        // 否则表达式引擎找不到 refId A 会 500。
+        id: 8, type: 'timeseries', title: 'QPS',
+        targets: [
+          { refId: 'A', datasource: { type: 'elasticsearch', uid: 'es1' }, query: 'count(*)' },
+          { refId: 'B', datasource: { type: '__expr__', uid: '__expr__' }, expression: '$A / 60' },
+        ],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'ES2 Panel',
+        datasource: { type: 'elasticsearch', uid: 'es2' },
+        targets: [{ refId: 'B', query: 'rate(*)' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] }, p2xB: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // 单次批量请求：含 __expr__ 面板时表达式引用天然正常（回归：不再按数据源分组拆分）。
+    assert.equal(queryBodies.length, 1, 'should send a single batch request')
+    assert.equal(queryBodies[0].queries.length, 3)
+    assert.ok(!('adhocFilters' in queryBodies[0]), 'request must not carry top-level adhocFilters')
+
+    // es1 target（面板 8 的 A）：adhoc 变量绑定 es1 → 拼进 lucene 串。
+    const es1Query = queryBodies[0].queries.find((query) => query.refId === 'A')
+    assert.ok(es1Query, 'should have es1 query')
+    assert.equal(es1Query.query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+
+    // 表达式 target（面板 8 的 B）：原样透传，不拼 adhoc。
+    const exprQuery = queryBodies[0].queries.find((query) => query.refId === 'B')
+    assert.ok(exprQuery, 'should have expression query')
+    assert.equal(exprQuery.expression, '$A / 60')
+    assert.ok(!('query' in exprQuery), 'expression query should not gain a query field')
+
+    // es2 target（面板 2）：adhoc 变量绑定 es1，es2 不受影响 → 查询串原样。
+    const es2Query = queryBodies[0].queries.find((query) => query.refId === 'p2xB')
+    assert.ok(es2Query, 'should have es2 query')
+    assert.equal(es2Query.query, 'rate(*)')
+
+    assert.match(output, /panel id=8/)
+    assert.match(output, /panel id=2/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc scoping: unbound adhoc expands into all non-expr targets in one batch request', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        // 未绑定 uid（无 datasource 字段）→ 通配所有非 __expr__ 数据源。
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'ES1 Panel',
+        datasource: { type: 'elasticsearch', uid: 'es1' },
+        targets: [{ refId: 'A', query: 'count(*)' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'ES2 Panel',
+        datasource: { type: 'elasticsearch', uid: 'es2' },
+        targets: [{ refId: 'B', query: 'rate(*)' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // 仍是单次批量请求；两个 ES target 的 lucene 串都拼上条件（未绑定 → 通配）。
+    assert.equal(queryBodies.length, 1, 'should send a single batch request')
+    assert.equal(queryBodies[0].queries.length, 2)
+    for (const query of queryBodies[0].queries) {
+      assert.match(query.query, /AND host\.keyword:"www\.ttpai\.cn"$/)
+    }
+    assert.ok(!('adhocFilters' in queryBodies[0]), 'request must not carry top-level adhocFilters')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Lucene clause', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  let queryCalls = 0
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      { id: 1, type: 'stat', title: 'One', datasource: { type: 'elasticsearch', uid: 'es' }, targets: [{ refId: 'A', query: 'count(*)' }] },
+      { id: 2, type: 'stat', title: 'Two', datasource: { type: 'elasticsearch', uid: 'es' }, targets: [{ refId: 'A', query: 'sum(bytes)' }] },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      const body = JSON.parse(init.body)
+      queryBodies.push(body)
+      queryCalls += 1
+      // 第一次批量请求失败，触发逐面板降级。
+      if (queryCalls === 1) throw new Error('request timed out')
+      return jsonResponse({
+        results: Object.fromEntries(body.queries.map((query) => [query.refId, { frames: [] }])),
+      })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // 1 次批量失败 + 2 次逐面板降级；降级请求体同样不含请求级 adhocFilters，
+    // 且每个 target 的 lucene 串都带着展开后的 adhoc 条件。
+    assert.equal(queryBodies.length, 3)
+    for (const body of queryBodies) {
+      assert.ok(!('adhocFilters' in body), 'no request-level adhocFilters on any path')
+      for (const query of body.queries) {
+        assert.match(query.query, /AND host\.keyword:"www\.ttpai\.cn"$/)
+      }
+    }
+    assert.equal(queryBodies[1].queries.length, 1)
+    assert.equal(queryBodies[2].queries.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc prometheus: label matchers injected into every vector selector', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'prometheus', uid: 'prom' },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Prom',
+      datasource: { type: 'prometheus', uid: 'prom' },
+      targets: [
+        // 裸 metric 名 → 补 {matcher}。
+        { refId: 'A', expr: 'up' },
+        // 已有选择器 + 内建区间变量 → 追加 matcher，$__rate_interval 不受影响。
+        { refId: 'B', expr: 'rate(http_requests_total{env="prod"}[$__rate_interval])' },
+        // by()/on()/group_left() 的标签列表不是 metric，不得误伤。
+        { refId: 'C', expr: 'sum by (instance) (cpu_total) / on(job) group_left(node) mem_used' },
+        // 子查询与字符串字面量。
+        { refId: 'D', expr: 'max_over_time(({__name__="cpu"}[5m:1m]) > 10) or label_replace(up, "d", "$1", "src", "(.*)")' },
+      ],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: Object.fromEntries(['A', 'B', 'C', 'D'].map((refId) => [refId, { frames: [] }])) })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    assert.equal(queryBodies.length, 1)
+    const queries = queryBodies[0].queries
+    const m = 'host="www.ttpai.cn"'
+    assert.equal(queries.find((query) => query.refId === 'A').expr, `up{${m}}`)
+    assert.equal(
+      queries.find((query) => query.refId === 'B').expr,
+      `rate(http_requests_total{env="prod",${m}}[$__rate_interval])`,
+    )
+    assert.equal(
+      queries.find((query) => query.refId === 'C').expr,
+      `sum by (instance) (cpu_total{${m}}) / on(job) group_left(node) mem_used{${m}}`,
+    )
+    // 子查询选择器与 {__name__} 形态也注入；label_replace 的字符串参数原样。
+    assert.equal(
+      queries.find((query) => query.refId === 'D').expr,
+      `max_over_time(({__name__="cpu",${m}}[5m:1m]) > 10) or label_replace(up{${m}}, "d", "$1", "src", "(.*)")`,
+    )
+    assert.ok(!('adhocFilters' in queryBodies[0]))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc prometheus: regex operators map to matchers, numeric range throws', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const makeDashboard = (filters) => ({
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: {
+      list: [{ name: 'Filters', type: 'adhoc', datasource: { type: 'prometheus', uid: 'prom' }, current: { value: filters } }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Prom',
+      datasource: { type: 'prometheus', uid: 'prom' },
+      targets: [{ refId: 'A', expr: 'up{job="api"}' }],
+    }],
+  })
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: makeDashboard([{ key: 'a', operator: '=', value: 'x' }]) })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+
+    // =~ / !~ 在 PromQL 里原生支持 → 直接映射为正则 matcher。
+    await tool.execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=~', value: 'www|m\\.' }, { key: 'env', operator: '!~', value: 'staging' }] }),
+    }, execution())
+    assert.equal(queryBodies[0].queries[0].expr, 'up{job="api",host=~"www|m\\\\.",env!~"staging"}')
+
+    // > / < 无法用 label matcher 表达数值比较 → 显式报错。
+    await assert.rejects(
+      tool.execute({
+        urlOrUid: 'abc123',
+        variables: JSON.stringify({ Filters: [{ key: 'latency', operator: '>', value: '100' }] }),
+      }, execution()),
+      /not supported for label matchers/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc loki: matchers injected into stream selectors only', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Logs', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'loki', uid: 'loki' },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }, { key: 'level', operator: '!=', value: 'debug' }] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'logs', title: 'Logs',
+      datasource: { type: 'loki', uid: 'loki' },
+      targets: [
+        // pipeline 阶段（json 等裸标识符）不是 stream selector，不得注入。
+        { refId: 'A', expr: '{app="api"} |= "error" | json | line_format "{{.level}}"' },
+        { refId: 'B', expr: 'rate({job="x"}[5m])' },
+      ],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    assert.equal(queryBodies.length, 1)
+    const matchers = 'host="www.ttpai.cn",level!="debug"'
+    assert.equal(
+      queryBodies[0].queries.find((query) => query.refId === 'A').expr,
+      `{app="api",${matchers}} |= "error" | json | line_format "{{.level}}"`,
+    )
+    assert.equal(
+      queryBodies[0].queries.find((query) => query.refId === 'B').expr,
+      `rate({job="x",${matchers}}[5m])`,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc sql: conditions replace the ${__adhoc} placeholder in rawSql', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'SQL', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        // 未绑定 → 通配所有数据源（含 MySQL 面板）。
+        current: { value: [{ key: 'host', operator: '=', value: "www.ttpai'cn" }] },
+      }],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'PG',
+        datasource: { type: 'postgres', uid: 'pg' },
+        targets: [{ refId: 'A', rawSql: 'SELECT * FROM logs WHERE ${__adhoc} AND level > 1' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'MySQL',
+        datasource: { type: 'mysql', uid: 'my' },
+        targets: [{ refId: 'B', rawSql: 'SELECT count(*) FROM t WHERE $__adhoc' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+
+    // = 映射为带转义的字符串字面量；${__adhoc} 与 $__adhoc 两种占位符都替换。
+    await tool.execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=', value: "www.ttpai'cn" }] }),
+    }, execution())
+    const body = queryBodies[0]
+    // 值内单引号翻倍转义，防注入。
+    assert.equal(body.queries.find((query) => query.refId === 'A').rawSql, "SELECT * FROM logs WHERE host = 'www.ttpai''cn' AND level > 1")
+    assert.equal(body.queries.find((query) => query.refId === 'B').rawSql, "SELECT count(*) FROM t WHERE host = 'www.ttpai''cn'")
+
+    // != → <>；=~ → LIKE；> 数字 → 裸数字比较。
+    queryBodies.length = 0
+    await tool.execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ Filters: [
+        { key: 'host', operator: '!=', value: 'old' },
+        { key: 'path', operator: '=~', value: '/api%' },
+        { key: 'status', operator: '>', value: '399' },
+      ] }),
+    }, execution())
+    assert.equal(
+      queryBodies[0].queries.find((query) => query.refId === 'A').rawSql,
+      "SELECT * FROM logs WHERE host <> 'old' AND path LIKE '%/api%%' AND status > 399 AND level > 1",
+    )
+
+    // rawSql 缺占位符 → 无法应用过滤 → 面板 skipped；全部面板都失败时报错。
+    queryBodies.length = 0
+    const noPlaceholder = JSON.parse(JSON.stringify(dashboard))
+    noPlaceholder.panels = [{
+      id: 1, type: 'timeseries', title: 'PG',
+      datasource: { type: 'postgres', uid: 'pg' },
+      targets: [{ refId: 'A', rawSql: 'SELECT * FROM logs' }],
+    }]
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: noPlaceholder })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      /no executable query.*\$\{__adhoc\} placeholder/s,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc mixed datasources stay in one batch request with per-type translation', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Mixed', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        // 未绑定 → 通配所有非 __expr__ 数据源。
+        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'ES',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        targets: [{ refId: 'A', query: 'count(*)' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'Prom',
+        datasource: { type: 'prometheus', uid: 'prom' },
+        targets: [{ refId: 'B', expr: 'up' }],
+      },
+      {
+        id: 3, type: 'timeseries', title: 'PG',
+        datasource: { type: 'postgres', uid: 'pg' },
+        targets: [{ refId: 'C', rawSql: 'SELECT 1 FROM t WHERE ${__adhoc}' }],
+      },
+      {
+        id: 4, type: 'timeseries', title: 'Expr',
+        targets: [{ refId: 'D', datasource: { type: '__expr__', uid: '__expr__' }, expression: '$A * 2' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] }, C: { frames: [] }, D: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+
+    // 单次批量请求：混合数据源（含表达式面板）不拆分。
+    assert.equal(queryBodies.length, 1)
+    assert.equal(queryBodies[0].queries.length, 4)
+    const byRef = Object.fromEntries(queryBodies[0].queries.map((query) => [query.refId, query]))
+    // 各类型各自翻译。
+    assert.equal(byRef.A.query, '(count(*)) AND host:"www.ttpai.cn"')
+    assert.equal(byRef.B.expr, 'up{host="www.ttpai.cn"}')
+    assert.equal(byRef.C.rawSql, "SELECT 1 FROM t WHERE host = 'www.ttpai.cn'")
+    // 表达式 target 原样透传。
+    assert.equal(byRef.D.expression, '$A * 2')
+    assert.ok(!('adhocFilters' in queryBodies[0]))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query multi-value variables expand with format modifiers in queries', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Multi', version: 1,
+    templating: {
+      list: [{ name: 'hosts', type: 'query', current: { value: 'a' } }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Prom',
+      datasource: { type: 'prometheus', uid: 'prom' },
+      targets: [{ refId: 'A', expr: 'up{host=~"(${hosts:regex})"}' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    // 多值 override + regex 格式修饰符：Grafana 语义是逐值转义正则特殊字符再以 | 连接。
+    await toolByName(tools, 'grafana_query').execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ hosts: ['www.ttpai.cn', 'm.ttpai.cn'] }),
+    }, execution())
+    assert.equal(queryBodies[0].queries[0].expr, 'up{host=~"(www\\.ttpai\\.cn|m\\.ttpai\\.cn)"}')
+
+    // csv 等格式修饰符的展开在 target JSON 插值阶段统一生效。
+    queryBodies.length = 0
+    await toolByName(tools, 'grafana_query').execute({
+      urlOrUid: 'abc123',
+      variables: JSON.stringify({ hosts: ['a', 'b'] }),
+    }, execution())
+    assert.equal(queryBodies[0].queries[0].expr, 'up{host=~"(a|b)"}')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query resolves legacy string datasource uids via the datasource index', async () => {
+  // 旧格式大盘：panel.datasource 是纯字符串 uid（Grafana 8 及更早保存的大盘）。
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const apiCalls = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Legacy', version: 1,
+    templating: { list: [] },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'CPU',
+      datasource: 'legacy-uid-0001',
+      targets: [{ refId: 'A', expr: 'node_cpu_seconds_total{mode="idle"}' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    apiCalls.push(path)
+    if (path.includes('/api/datasources')) {
+      return jsonResponse([
+        { uid: 'legacy-uid-0001', type: 'prometheus', name: 'Prom Legacy', isDefault: false },
+        { uid: 'prom-default', type: 'prometheus', name: 'Prom Default', isDefault: true },
+      ])
+    }
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.ok(apiCalls.some((path) => path.includes('/api/datasources')), 'index must be fetched when a string ref appears')
+    assert.equal(queryBodies.length, 1)
+    // 字符串 uid 解析出 type，请求体携带完整 {type, uid}。
+    assert.deepEqual(queryBodies[0].queries[0].datasource, { type: 'prometheus', uid: 'legacy-uid-0001' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query resolves $datasource references, maps "default", and supports datasource variable override', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Alertmanager', version: 1,
+    templating: {
+      list: [
+        { name: 'datasource', type: 'datasource', current: { text: 'default', value: 'default' } },
+        { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+      ],
+    },
+    panels: [{
+      id: 4, type: 'stat', title: 'Instances',
+      datasource: { uid: '$datasource' },
+      targets: [{ refId: 'A', expr: 'count(alertmanager_build_info{instance=~"$instance"})' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) {
+      return jsonResponse([
+        { uid: 'prom-default', type: 'prometheus', name: 'Prom Default', isDefault: true },
+        { uid: 'prom-two', type: 'prometheus', name: 'Prom Two', isDefault: false },
+      ])
+    }
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+
+    // 保存态默认值 "default" 映射到 isDefault 数据源；$instance 单值数组裸渲染。
+    await tool.execute({ urlOrUid: 'abc123' }, execution())
+    assert.deepEqual(queryBodies[0].queries[0].datasource, { type: 'prometheus', uid: 'prom-default' })
+    assert.equal(queryBodies[0].queries[0].expr, 'count(alertmanager_build_info{instance=~"10.0.0.1:9093"})')
+
+    // datasource 型变量按 uid 字符串覆盖：整盘切换数据源。
+    queryBodies.length = 0
+    await tool.execute({ urlOrUid: 'abc123', variables: JSON.stringify({ datasource: 'prom-two' }) }, execution())
+    assert.deepEqual(queryBodies[0].queries[0].datasource, { type: 'prometheus', uid: 'prom-two' })
+
+    // datasource 变量引用无保存值 → 面板级 skip，整工具报错列出原因与面板标题。
+    const emptyDashboard = {
+      ...dashboard,
+      templating: {
+        list: [
+          { name: 'datasource', type: 'datasource', current: {} },
+          { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+        ],
+      },
+    }
+    globalThis.fetch = async (url, init) => {
+      const path = String(url)
+      if (path.includes('/api/datasources')) {
+        return jsonResponse([{ uid: 'prom-default', type: 'prometheus', name: 'Prom Default', isDefault: true }])
+      }
+      if (path.includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: emptyDashboard })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /yielded no executable query/)
+        assert.match(error.message, /panel id=4 "Instances"/)
+        assert.match(error.message, /Unresolved Grafana template variable "datasource"/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query passes unknown datasource uids through when the index is unavailable', async () => {
+  // GET /api/datasources 无权限（403）时索引为 null：字符串 uid 原样透传，
+  // 由 Grafana 自行解析裸 uid。
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Legacy', version: 1,
+    templating: { list: [] },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'CPU',
+      datasource: 'unknown-uid',
+      targets: [{ refId: 'A', expr: 'up' }],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) return jsonResponse({ message: 'access denied' }, 403)
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.deepEqual(queryBodies[0].queries[0].datasource, { uid: 'unknown-uid' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query throws when adhoc filters hit a passthrough datasource of unknown type', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Legacy', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'CPU',
+      datasource: 'unknown-uid',
+      targets: [{ refId: 'A', expr: 'up' }],
+    }],
+  }
+  globalThis.fetch = async (url) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) return jsonResponse({ message: 'access denied' }, 403)
+    if (path.includes('/api/ds/query')) return jsonResponse({ results: { A: { frames: [] } } })
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    // 索引不可用 + 生效 adhoc：无法安全翻译 → 显式报错（含数据源 uid）。
+    await assert.rejects(
+      toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution()),
+      /cannot be applied to datasource uid "unknown-uid"/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query renders bare multi-value variables as (a|b) inside Prometheus and Loki targets', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Multi', version: 1,
+    templating: {
+      list: [
+        { name: 'job', type: 'query', current: { value: ['node-exporter', 'other'] } },
+        { name: 'host', type: 'query', current: { value: ['10.0.0.1'] } },
+        { name: 'addr', type: 'query', current: { value: ['82.156.207.97:9100', '119.45.27.31:9100'] } },
+        { name: 'app', type: 'query', current: { value: ['api', 'web'] } },
+        { name: 'env', type: 'query', current: { value: ['prod', 'staging'] } },
+      ],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'Prom',
+        datasource: { type: 'prometheus', uid: 'prom' },
+        targets: [{ refId: 'A', expr: 'up{job=~"$job", host=~"$host", instance=~"$addr"}' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'Loki',
+        datasource: { type: 'loki', uid: 'loki' },
+        targets: [{ refId: 'A', expr: '{app=~"$app"} |= "error"' }],
+      },
+      {
+        id: 3, type: 'timeseries', title: 'ES',
+        datasource: { type: 'elasticsearch', uid: 'es' },
+        targets: [{ refId: 'A', query: 'env:($env)' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] }, C: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    const byDs = new Map(queryBodies[0].queries.map((q) => [q.datasource.uid, q]))
+    // 多值裸引用 → (a|b)，值保持原样（PromQL 双引号内 \. 是非法转义）；
+    // 单值数组保持裸值。
+    assert.equal(byDs.get('prom').expr, 'up{job=~"(node-exporter|other)", host=~"10.0.0.1", instance=~"(82.156.207.97:9100|119.45.27.31:9100)"}')
+    assert.equal(byDs.get('loki').expr, '{app=~"(api|web)"} |= "error"')
+    // ES target 不受 promql 模式影响：裸多值仍是全局默认逗号连接。
+    assert.equal(byDs.get('es').query, 'env:(prod,staging)')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('internals exports the stable debug surface across the lib/ split', () => {
