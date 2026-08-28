@@ -2130,6 +2130,87 @@ test('grafana_query resolves $datasource references, maps "default", and support
   }
 })
 
+test('grafana_query skips row-panel leftover targets and dedupes per-panel skip reasons', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Alertmanager', version: 1,
+    templating: {
+      list: [
+        { name: 'datasource', type: 'datasource', current: { text: 'default', value: 'default' } },
+        { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+      ],
+    },
+    panels: [
+      // row 面板：Grafana 保存残留的空 target（只有 datasource/refId，无 expr）。
+      // 原样发给 /api/ds/query 会让 Prometheus 报 400 "no expression found in input"。
+      {
+        id: 36, type: 'row', title: 'General info',
+        datasource: { type: 'prometheus', uid: 'prom-default' },
+        targets: [
+          { refId: 'A', datasource: { type: 'prometheus', uid: 'prom-default' } },
+          { refId: 'B', datasource: { type: 'prometheus', uid: 'prom-default' } },
+        ],
+      },
+      {
+        id: 4, type: 'stat', title: 'Instances',
+        datasource: { uid: '$datasource' },
+        targets: [{ refId: 'A', expr: 'count(alertmanager_build_info{instance=~"$instance"})' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) {
+      return jsonResponse([{ uid: 'prom-default', type: 'prometheus', name: 'Prom Default', isDefault: true }])
+    }
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_query')
+    const out = await tool.execute({ urlOrUid: 'abc123' }, execution())
+    // 空载荷 target 绝不发给数据源；$datasourse 引用面板的 expr 原样保留。
+    const sentExprs = queryBodies.flatMap((body) => body.queries.map((query) => query.expr))
+    assert.equal(sentExprs.length, 1)
+    assert.equal(sentExprs[0], 'count(alertmanager_build_info{instance=~"10.0.0.1:9093"})')
+    // row 的两条空 target 去重为一条 skip 说明，附 refId 列表。
+    assert.match(out, /panel id=36 "General info": skipped \(the target carries no query payload[^)]*\) \(targets A, B\)/)
+    assert.equal(out.split('carries no query payload').length - 1, 1)
+
+    // 同一面板多个 target 因同一原因（未解析变量）被跳过 → 报错只出现一次。
+    const unresolved = {
+      ...dashboard,
+      panels: [{
+        id: 9, type: 'timeseries', title: 'Unresolved',
+        datasource: { type: 'prometheus', uid: 'prom-default' },
+        targets: [
+          { refId: 'A', expr: 'up{job="$missing"}' },
+          { refId: 'B', expr: 'down{job="$missing"}' },
+          { refId: 'C', expr: 'other{job="$missing"}' },
+        ],
+      }],
+    }
+    globalThis.fetch = async () => jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: unresolved })
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /yielded no executable query/)
+        assert.equal(error.message.split('Unresolved Grafana template variable "missing"').length - 1, 1)
+        assert.match(error.message, /\(targets A, B, C\)/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('grafana_query passes unknown datasource uids through when the index is unavailable', async () => {
   // GET /api/datasources 无权限（403）时索引为 null：字符串 uid 原样透传，
   // 由 Grafana 自行解析裸 uid。

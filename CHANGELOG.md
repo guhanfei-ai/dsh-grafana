@@ -25,6 +25,8 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ### Fixed
 
+- `grafana_query`: row-panel leftover targets (a `{datasource, refId}` shape with no query text that Grafana saves on layout rows and never executes) are no longer sent to `/api/ds/query` — previously they reached Prometheus as empty-`expr` requests that failed with 400 `no expression found in input` and dragged the whole batch into the per-panel fallback. Such targets are now skipped up front with an explicit reason; dashboards like the Alertmanager template now run as a single clean batch.
+- `grafana_query`: skip reasons are deduplicated per panel — the same message from every target of a panel collapses into one entry listing the affected target refIds (previously a 12-target panel repeated the identical reason 12 times in the all-skipped error).
 - `grafana_query`: when every selected panel is skipped (unresolved variables, empty targets, unresolved datasources), the error now lists each skipped panel's id, title, and skip reason instead of a bare `The selected panel(s) yielded no executable query.`
 - `grafana_query`: applying adhoc filters to a passthrough (untyped) datasource now throws an explicit error instead of silently dropping the filters.
 - `grafana_query`: variable values containing `\` or `"` (e.g. produced by the `:regex` or `:lucene` formats) no longer break query JSON round-trips — replacement values injected into serialized target JSON are now JSON-escaped, fixing `JSON.parse` "Bad escaped character" failures that had silently applied to any such value even before format modifiers existed.
