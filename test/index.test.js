@@ -2336,6 +2336,195 @@ test('grafana_query renders bare multi-value variables as (a|b) inside Prometheu
   }
 })
 
+test('grafana_query adhoc prometheus: leading-colon recording rules receive matchers too', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Recording rules', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'prometheus', uid: 'prom' },
+        current: { value: [{ key: 'instance', operator: '=', value: 'web-1' }] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Rules',
+      datasource: { type: 'prometheus', uid: 'prom' },
+      targets: [
+        // kube-prometheus 风格的 :node_xxx: 录制规则，前导冒号不能让它逃过注入。
+        { refId: 'A', expr: ':node_memory_utilisation: * 100' },
+        // 聚合函数里包裹的前导冒号规则。
+        { refId: 'B', expr: 'sum(:node_memory_MemAvailable_bytes:sum)' },
+        // 前导冒号规则自带选择器时追加而非覆盖。
+        { refId: 'C', expr: ':node_load1{env="prod"}' },
+      ],
+    }],
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] }, C: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.equal(queryBodies.length, 1)
+    const queries = queryBodies[0].queries
+    const m = 'instance="web-1"'
+    assert.equal(queries.find((q) => q.refId === 'A').expr, `:node_memory_utilisation:{${m}} * 100`)
+    assert.equal(queries.find((q) => q.refId === 'B').expr, `sum(:node_memory_MemAvailable_bytes:sum{${m}})`)
+    assert.equal(queries.find((q) => q.refId === 'C').expr, `:node_load1{env="prod",${m}}`)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc: saved OR conditions throw instead of being silently rewritten to AND', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Or filters', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: { type: 'elasticsearch', uid: 'es1' },
+        current: { value: [
+          { key: 'host', operator: '=', value: 'a' },
+          { key: 'host', operator: '=', value: 'b', condition: 'OR' },
+        ] },
+      }],
+    },
+    panels: [{
+      id: 1, type: 'timeseries', title: 'ES',
+      targets: [{ refId: 'A', datasource: { type: 'elasticsearch', uid: 'es1' }, query: 'count(*)' }],
+    }],
+  }
+  globalThis.fetch = async () => jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      () => toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => error instanceof Error && /OR/.test(error.message) && /Filters/.test(error.message),
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc scoping: legacy datasource-name binding resolves through the index', async () => {
+  // 旧格式大盘的 adhoc variable.datasource 是数据源“名称”字符串而非 uid，
+  // 必须经索引解析到真实 uid 后再做绑定匹配，不能静默丢过滤。
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'LegacyBind', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: 'Prod ES',
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'Bound',
+        datasource: { type: 'elasticsearch', uid: 'es-prod' },
+        targets: [{ refId: 'A', query: 'count(*)' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'Other',
+        datasource: { type: 'elasticsearch', uid: 'es-other' },
+        targets: [{ refId: 'B', query: 'count(*)' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) {
+      return jsonResponse([
+        { uid: 'es-prod', type: 'elasticsearch', name: 'Prod ES', isDefault: false },
+        { uid: 'es-other', type: 'elasticsearch', name: 'Other ES', isDefault: false },
+      ])
+    }
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.equal(queryBodies.length, 1)
+    const queries = queryBodies[0].queries
+    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(queries.find((q) => q.refId === 'B').query, 'count(*)')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_query adhoc scoping: "default" pseudo uid binding maps to the default datasource', async () => {
+  const originalFetch = globalThis.fetch
+  const queryBodies = []
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'DefaultBind', version: 1,
+    templating: {
+      list: [{
+        name: 'Filters',
+        type: 'adhoc',
+        datasource: 'default',
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+      }],
+    },
+    panels: [
+      {
+        id: 1, type: 'timeseries', title: 'DefaultDs',
+        datasource: { type: 'elasticsearch', uid: 'es-main' },
+        targets: [{ refId: 'A', query: 'count(*)' }],
+      },
+      {
+        id: 2, type: 'timeseries', title: 'Secondary',
+        datasource: { type: 'elasticsearch', uid: 'es-2' },
+        targets: [{ refId: 'B', query: 'count(*)' }],
+      },
+    ],
+  }
+  globalThis.fetch = async (url, init) => {
+    const path = String(url)
+    if (path.includes('/api/datasources')) {
+      return jsonResponse([
+        { uid: 'es-main', type: 'elasticsearch', name: 'Main ES', isDefault: true },
+        { uid: 'es-2', type: 'elasticsearch', name: 'Second ES', isDefault: false },
+      ])
+    }
+    if (path.includes('/api/ds/query')) {
+      queryBodies.push(JSON.parse(init.body))
+      return jsonResponse({ results: { A: { frames: [] }, B: { frames: [] } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.equal(queryBodies.length, 1)
+    const queries = queryBodies[0].queries
+    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(queries.find((q) => q.refId === 'B').query, 'count(*)')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('internals exports the stable debug surface across the lib/ split', () => {
   // internals 是测试与调试依赖的稳定契约：lib/ 拆分后键集合不得增减或更名。
   assert.deepEqual(Object.keys(internals).sort(), [
