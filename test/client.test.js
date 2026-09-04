@@ -132,3 +132,79 @@ test('browser module routes the URL through settings and the token through crede
   assert.equal(after.baseConfigured, false)
   assert.equal(after.baseUrl, '')
 })
+
+function loadBrowserRuntime() {
+  let definition
+  const window = {
+    __ModuleLoader__: {
+      load(value) {
+        definition = value
+      },
+    },
+  }
+  vm.runInNewContext(readFileSync(new URL('../client.js', import.meta.url), 'utf8'), { URL, window })
+  return definition.factory((id) => {
+    if (id === 'react/jsx-runtime') return { jsx() {}, jsxs() {} }
+    if (id === 'react') return {}
+    throw new Error(`Unexpected browser dependency: ${id}`)
+  })
+}
+
+test('settingsNamespacesOf parses the array envelope (0.1.2-rc.1+) and the namespaces aggregate (≤0.1.1)', () => {
+  const { settingsNamespacesOf } = loadBrowserRuntime().internals
+  // 双代信封：0.1.2-rc.1 的 describe 直接返回描述符数组；≤0.1.1 聚合在
+  // result.value.namespaces。描述符条目字段 ns/value 两代同名。
+  const descriptors = [{ ns: 'grafana', value: { baseUrl: 'https://grafana.example.com' } }, { ns: 'locale', value: { preference: 'zh' } }]
+  assert.deepEqual(settingsNamespacesOf({ result: { value: descriptors } }), descriptors)
+  assert.deepEqual(settingsNamespacesOf({ result: { value: { namespaces: descriptors } } }), descriptors)
+  // 空值/畸形应答回退空数组（卡片降级路径，不抛错）。
+  // 断言形状而非 deepEqual([])：vm realm 造出的 [] 与本 realm 的 []
+  // 结构相等但原型不同源，deepStrictEqual 会误报 not reference-equal。
+  for (const bad of [{ result: {} }, null, { result: { value: { namespaces: 'broken' } } }]) {
+    const out = settingsNamespacesOf(bad)
+    assert.equal(Array.isArray(out), true)
+    assert.equal(out.length, 0)
+  }
+})
+
+test('describe and localePreference read the base URL back under the 0.1.2-rc.1 array envelope', async () => {
+  // 修复前 client 按 ≤0.1.1 的 {namespaces} 聚合形态解析，0.1.2-rc.1 的数组
+  // 应答拿到 undefined 后静默降级为「未配置」——此测试锁住新形态下的回显。
+  const runtime = loadBrowserRuntime()
+  let face
+  const credentials = {
+    async describe() {
+      return { result: { value: { credentials: { GRAFANA_TOKEN: { configured: true } } } } }
+    },
+  }
+  const settings = {
+    // 0.1.2-rc.1：describe 直接返回描述符数组，无 namespaces 聚合层。
+    async describe() {
+      return {
+        result: {
+          value: [
+            { ns: 'grafana', value: { baseUrl: 'https://grafana.example.com' } },
+            { ns: 'locale', value: { preference: 'zh' } },
+          ],
+        },
+      }
+    },
+  }
+  runtime.apply({
+    get: () => ({ api: { credentials, settings } }),
+    slots: {
+      inject: (_name, callback) => callback(),
+      register: (specification) => {
+        face = specification.inject().grafanaCard
+        return () => {}
+      },
+    },
+  })
+
+  assert.equal(JSON.stringify(await face.describe()), JSON.stringify({
+    tokenConfigured: true,
+    baseConfigured: true,
+    baseUrl: 'https://grafana.example.com',
+  }))
+  assert.equal(await face.localePreference(), 'zh')
+})

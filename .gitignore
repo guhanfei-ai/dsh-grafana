@@ -8,6 +8,8 @@ dist/
 .codebuddy
 -**/
 ._**/
+_*
+._*
 .workbuddy
 _logs/
 _plans/

@@ -247,8 +247,18 @@ window.__ModuleLoader__.load({
 			] });
 		}
 
-		function apply(ctx) {
-			const { api } = ctx.get("connection");
+	// settings describe 应答的双代信封解析：dsh ≤0.1.1 的远端把描述符聚合在
+	// result.value.namespaces[]；0.1.2-rc.1 起直接返回描述符数组（每项
+	// {ns, schema, value, …}，字段两代同名）。数组优先、namespaces 兜底。
+	function settingsNamespacesOf(res) {
+		const value = res?.result?.value;
+		if (Array.isArray(value)) return value;
+		const list = value?.namespaces;
+		return Array.isArray(list) ? list : [];
+	}
+
+	function apply(ctx) {
+		const { api } = ctx.get("connection");
 			const face = {
 				describe: async () => {
 					// token 走凭证库（只返回 configured）；URL 走 settings namespace（非 secret，返回明文）。
@@ -257,7 +267,7 @@ window.__ModuleLoader__.load({
 						api.settings?.describe ? api.settings.describe({}) : Promise.resolve(null),
 					]);
 					const creds = credRes?.result?.value?.credentials ?? {};
-					const grafanaNs = (setRes?.result?.value?.namespaces ?? []).find((n) => n?.ns === SETTINGS_NS);
+					const grafanaNs = settingsNamespacesOf(setRes).find((n) => n?.ns === SETTINGS_NS);
 					const baseUrl = typeof grafanaNs?.value?.baseUrl === "string" ? grafanaNs.value.baseUrl : "";
 					return {
 						tokenConfigured: creds[TOKEN_REF]?.configured ?? false,
@@ -277,7 +287,7 @@ window.__ModuleLoader__.load({
 				localePreference: async () => {
 					if (!api.settings?.describe) return "";
 					const res = await api.settings.describe({});
-					const namespaces = res?.result?.value?.namespaces ?? [];
+					const namespaces = settingsNamespacesOf(res);
 					const locale = namespaces.find((n) => n?.ns === "locale");
 					const pref = locale?.value?.preference;
 					return typeof pref === "string" ? pref : "";
@@ -294,6 +304,8 @@ window.__ModuleLoader__.load({
 
 		exports.apply = apply;
 		exports.inject = inject;
+		// 供测试驱动的双代信封纯函数（不参与运行时契约）。
+		exports.internals = Object.freeze({ settingsNamespacesOf });
 		return module.exports;
 	}
 });
