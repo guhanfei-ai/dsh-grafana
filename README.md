@@ -23,7 +23,7 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 | Component | Supported baseline |
 | --- | --- |
 | Node.js | 20.11 or newer |
-| DeepSeek Harness | `0.1.0-rc.6` |
+| DeepSeek Harness | `0.1.0-rc.6` through `0.1.2-rc.1` (verified: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`) |
 | Grafana | Legacy Dashboard HTTP API as documented for Grafana 10/11 |
 
 Grafana 12 introduced a new dashboard API. The legacy endpoints used by this plugin may remain available, but Grafana 12+ is not part of the certified matrix yet.

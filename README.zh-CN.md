@@ -23,7 +23,7 @@
 | 组件 | 已支持基线 |
 | --- | --- |
 | Node.js | 20.11 或更高版本 |
-| DeepSeek Harness | `0.1.0-rc.6` |
+| DeepSeek Harness | `0.1.0-rc.6` 至 `0.1.2-rc.1`（已验证：`0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1`） |
 | Grafana | Grafana 10/11 文档中的传统 Dashboard HTTP API |
 
 Grafana 12 引入了新 Dashboard API。旧接口可能仍然可用，但 Grafana 12+ 暂未进入本插件的正式兼容矩阵。

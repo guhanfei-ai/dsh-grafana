@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Release-specific notes 
 
 ## [Unreleased]
 
+### Fixed
+
+- Compatibility with DeepSeek Harness `0.1.2-rc.1`: the `@deepseek-ai/dsh-tools` peer range is now `^0.1.0-rc.6 || ^0.1.1-rc.0 || ^0.1.2-alpha.0`. Under node-semver's prerelease matching rules the previous `^0.1.0-rc.6` matched only `0.1.0-rc.6/7/8` — installing this plugin into a host carrying dsh-tools `0.1.1-rc.2` or `0.1.2-rc.1` was blocked (npm ERESOLVE / pnpm strict peer errors). The plugin's own dsh-tools usage (`defineTool` only) is byte-identical across those versions, and the host services it consumes (`tools`, `systemPrompt`, `credentials`, `settings`, the `tools/pre-execute` waterfall, and the `slots`/`connection` client seeds) all survive the 0.1.2 refactor; the `@deepseek-ai/dsh-client-runtime` client-inject entry is intentionally kept because hosts up to `0.1.1-rc.2` still need it, while on `0.1.2` hosts the loader skips absent graph rows without error.
+- `@deepseek-ai/schemastery` dependency relaxed from the exact `3.18.1` to `^3.18.1` so it dedupes onto the host's copy (dsh `0.1.2-rc.1` ships `3.18.2`; the two releases are code-identical apart from a cosmokit range bump). devDependencies now develop against `dsh-tools@0.1.2-rc.1`, and the full test suite passes against it.
+
 ### Added
 
 - `grafana_query` multi-value variable overrides: pass an array in the `variables` argument (e.g. `{"host":["www","m"]}`) and it expands according to the Grafana format modifier used in the query (`:csv`, `:raw`, `:pipe`, `:doublequote`, `:singlequote`, `:json`, `:sqlstring`, `:percent`, `:querystring`, `:regex`, `:lucene`). Unknown format modifiers throw an explicit error; the single-value default path is byte-for-byte unchanged.
