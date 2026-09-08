@@ -2,7 +2,17 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { apply, Config, internals, SETTINGS_NAMESPACE } from '../index.js'
-import { redactSecrets } from '../lib/util.js'
+import {
+  ALERT_TOOL_TIMEOUT_MS,
+  METRIC_REQUEST_TIMEOUT_MS,
+  METRIC_TOOL_TIMEOUT_MS,
+  QUERY_REQUEST_TIMEOUT_MS,
+  QUERY_TOOL_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS,
+  TOOL_TIMEOUT_MS,
+  TREND_TOOL_TIMEOUT_MS,
+} from '../lib/constants.js'
+import { abortableDelay, redactSecrets } from '../lib/util.js'
 
 function execution() {
   return { signal: new AbortController().signal }
@@ -114,6 +124,37 @@ test('redactSecrets leaves ordinary query text and short identifiers untouched',
   assert.equal(redactSecrets(''), '')
   assert.equal(redactSecrets(null), '')
   assert.equal(redactSecrets(undefined), '')
+})
+
+// 宿主可能以非 Error 值 abort（signal.reason 为字符串等）：abortableDelay 统一包成
+// Error，不让裸值穿透到只预期 Error 的调用方（runtime 的重试间隔走这条路径）。
+test('abortableDelay wraps non-Error abort reasons and passes Errors through', async () => {
+  // 已 abort 的 signal 且 reason 为字符串 → 包装成 Error（message 保留原值）。
+  await assert.rejects(abortableDelay(50, AbortSignal.abort('plain-string reason')), (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal(error.message, 'plain-string reason')
+    return true
+  })
+  // reason 为 undefined（无参 abort）→ 包装成兜底文案的 Error。
+  await assert.rejects(abortableDelay(50, AbortSignal.abort()), (error) => {
+    assert.ok(error instanceof Error)
+    return true
+  })
+  // Error 形态的 reason 原样抛出（保留 name 等诊断字段，不重复包装）。
+  const reason = new Error('kept-as-is')
+  await assert.rejects(abortableDelay(50, AbortSignal.abort(reason)), (error) => error === reason)
+  // 延迟中途被 abort：同样按 reason 形态处理。
+  const controller = new AbortController()
+  const pending = abortableDelay(60_000, controller.signal)
+  setTimeout(() => controller.abort('late-abort'), 10)
+  await assert.rejects(pending, (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal(error.message, 'late-abort')
+    return true
+  })
+  // 无 signal 或未 abort 的 signal：正常完成，不抛。
+  await abortableDelay(1)
+  await abortableDelay(1, new AbortController().signal)
 })
 
 test('apply registers the whole tool surface and a hard approval gate for writes', async () => {
@@ -895,7 +936,14 @@ test('grafana_get summary and grafana_search disclose truncation on a budget lin
   }
   globalThis.fetch = async (url) => {
     if (String(url).includes('/api/search')) {
-      return jsonResponse(Array.from({ length: 53 }, (_, index) => ({ uid: `d${index}`, title: `T${index}`, url: `/d/d${index}/t${index}` })))
+      // 按真实分页契约服务：单页响应不超过请求的 limit（Grafana 把 limit 当页大小），
+      // page=1 满 50 条、page=2 剩 3 条——总 53 条。
+      const u = new URL(String(url))
+      const limit = Number(u.searchParams.get('limit'))
+      const page = Number(u.searchParams.get('page') ?? '1')
+      const start = (page - 1) * limit
+      const count = Math.max(0, Math.min(53 - start, limit))
+      return jsonResponse(Array.from({ length: count }, (_, index) => ({ uid: `d${start + index}`, title: `T${start + index}`, url: `/d/d${start + index}/t${start + index}` })))
     }
     return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: bigDashboard })
   }
@@ -905,7 +953,7 @@ test('grafana_get summary and grafana_search disclose truncation on a budget lin
     const summary = await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'bigdash', summary: true }, execution())
     assert.match(summary, /…\d+ more line\(s\) not shown\./)
     assert.match(summary, /budget: 150 of 161 line\(s\) shown; 11 hidden \(raise limit to include them\)/)
-    // search：53 行结果截到 50，预算行披露丢弃的 3 行。
+    // search：第一页满 50 后探测第二页（剩 3 条），预算行披露丢弃的 3 行。
     const search = await toolByName(tools, 'grafana_search').execute({}, execution())
     const searchLines = search.split('\n')
     assert.equal(searchLines.length, 51)
@@ -913,6 +961,188 @@ test('grafana_get summary and grafana_search disclose truncation on a budget lin
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+// Grafana 的 /api/search 把 limit 当页大小：真实服务端会把单页响应截到 limit，
+// 本地永远看不到第 51 条。披露因此必须走分页探测，mock 必须按 limit/page 服务。
+test('grafana_search pages past a full first page to disclose its real cap', async () => {
+  const originalFetch = globalThis.fetch
+  // 按请求的 limit/page 服务一个给定总数的命中列表（单页永不超过 limit）。
+  const pagedSearch = (total) => async (url) => {
+    const u = new URL(String(url))
+    const limit = Number(u.searchParams.get('limit'))
+    const page = Number(u.searchParams.get('page') ?? '1')
+    const start = (page - 1) * limit
+    const count = Math.max(0, Math.min(total - start, limit))
+    return jsonResponse(Array.from({ length: count }, (_, index) => ({ uid: `d${start + index}`, title: `T${start + index}`, url: `/d/d${start + index}/t` })))
+  }
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_search')
+
+    // 不满页：单次请求，全部显示，无披露行。
+    let calls = []
+    globalThis.fetch = async (url) => { calls.push(String(url)); return pagedSearch(30)(url) }
+    const partial = await tool.execute({}, execution())
+    assert.equal(calls.length, 1)
+    assert.match(calls[0], /limit=50/)
+    assert.equal(partial.split('\n').length, 30)
+    assert.doesNotMatch(partial, /^budget: /m)
+
+    // 恰好一页（第二页为空）：两次请求，50 行全显示，无披露行——不能把满页
+    // 误报成「还有隐藏」。
+    calls = []
+    globalThis.fetch = async (url) => { calls.push(String(url)); return pagedSearch(50)(url) }
+    const exact = await tool.execute({}, execution())
+    assert.equal(calls.length, 2)
+    assert.match(calls[1], /page=2/)
+    assert.equal(exact.split('\n').length, 50)
+    assert.doesNotMatch(exact, /^budget: /m)
+
+    // 一页多 3 条：第二页部分，精确披露。
+    calls = []
+    globalThis.fetch = async (url) => { calls.push(String(url)); return pagedSearch(53)(url) }
+    const over = await tool.execute({}, execution())
+    assert.equal(calls.length, 2)
+    const overLines = over.split('\n')
+    assert.equal(overLines.length, 51)
+    assert.equal(overLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (raise limit to include them)')
+
+    // 两整页（120 条）：第二页也满页，披露为下界而非假装精确。
+    calls = []
+    globalThis.fetch = async (url) => { calls.push(String(url)); return pagedSearch(120)(url) }
+    const twoPages = await tool.execute({}, execution())
+    assert.equal(calls.length, 2)
+    const twoPagesLines = twoPages.split('\n')
+    assert.equal(twoPagesLines.length, 51)
+    assert.equal(twoPagesLines[50], 'budget: 50 of 100+ dashboard(s) shown; 50+ hidden (raise limit to include them)')
+
+    // 探测失败：第一页正常返回，第二页网络错误（GET 重试一次仍失败）——
+    // 主结果照常显示，披露行如实说「未能确认」，不猜「恰好一页」。
+    calls = []
+    globalThis.fetch = async (url) => {
+      calls.push(String(url))
+      const u = new URL(String(url))
+      if (u.searchParams.get('page') === '2') throw new TypeError('network down')
+      return pagedSearch(50)(url)
+    }
+    const unverified = await tool.execute({}, execution())
+    // 第一页 1 次 + 第二页含重试 2 次。
+    assert.equal(calls.filter((c) => c.includes('page=2')).length, 2)
+    const unverifiedLines = unverified.split('\n')
+    assert.equal(unverifiedLines.length, 51)
+    assert.equal(unverifiedLines[50], 'budget: 50 of 50+ dashboard(s) shown; more may be hidden — the follow-up page could not be fetched (raise limit to include them)')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 探测的降级只对「探测自身故障」成立：宿主取消或工具级超时（exec.signal 已 abort）
+// 必须原样传播——否则用户取消后仍收到一份看似完整的部分结果，违背信号语义。
+test('the page probe never swallows a host cancellation or tool timeout', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  const abortError = () => Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })
+  globalThis.fetch = async (url, init) => {
+    const u = new URL(String(url))
+    if (u.searchParams.get('page') === '2') {
+      // 第一页已成功返回；宿主此刻取消（用户取消或工具级超时）。
+      controller.abort()
+      return new Response(new ReadableStream({
+        start(streamController) {
+          // abort 可能发生在注册监听之前：先判当前状态，再接后续事件。
+          const fail = () => streamController.error(abortError())
+          if (init.signal.aborted) return fail()
+          init.signal.addEventListener('abort', fail, { once: true })
+        },
+      }), { status: 200 })
+    }
+    const u2 = new URL(String(url))
+    const limit = Number(u2.searchParams.get('limit'))
+    return jsonResponse(Array.from({ length: limit }, (_, index) => ({ uid: `d${index}`, title: `T${index}`, url: `/d/d${index}/t` })))
+  }
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      toolByName(tools, 'grafana_search').execute({}, { signal: controller.signal }),
+      (error) => {
+        // 取消/超时文案指向被中断的第二页，且不被降级成 budget 披露行。
+        assert.equal(error.message, 'Grafana API request timed out or was cancelled: GET /api/search?type=dash-db&limit=50&page=2')
+        assert.doesNotMatch(error.message, /budget:/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 服务端返回了头部但 body 流式停滞、随后宿主 abort：错误转换层必须把 body 读取期间
+// 的 abort 翻成与 fetch abort 相同的「带请求路径」文案，而不是让平台原生的
+// "This operation was aborted" 直接漏给模型。
+test('an abort while reading the response body reports the request path, not the platform abort text', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  globalThis.fetch = async (url, init) => {
+    // 头部已到、body 永不结束（停滞流的形状）；abort 传导给 reader 后 read()
+    // 以 AbortError 拒绝——这正是 readLimitedText 的异常路径。
+    const stream = new ReadableStream({
+      start(streamController) {
+        init.signal.addEventListener('abort', () => {
+          streamController.error(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }))
+        })
+      },
+    })
+    return new Response(stream, { status: 200 })
+  }
+  try {
+    const { tools } = createContext()
+    setTimeout(() => controller.abort(), 10)
+    await assert.rejects(
+      toolByName(tools, 'grafana_search').execute({}, { signal: controller.signal }),
+      (error) => {
+        assert.equal(error.message, 'Grafana API request timed out or was cancelled: GET /api/search?type=dash-db&limit=50&page=1')
+        assert.doesNotMatch(error.message, /This operation was aborted/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 工具级超时必须覆盖各工具定义的真实最坏请求链，并与单请求预算保持约束关系：
+// 超时预算一旦漂移（单请求放宽了但工具级没跟上），宿主的工具级 abort 会先于请求
+// 自身的超时文案出现，模型就会把根因归到错误的请求上。
+test('every tool timeout covers its worst-case request chain', () => {
+  const { tools } = createContext()
+  // 单次 GET（含一次网络错误/5xx 重试）的最坏耗时。
+  const worstGet = 2 * REQUEST_TIMEOUT_MS + 200
+  const expected = {
+    grafana_get: TOOL_TIMEOUT_MS,
+    grafana_push: TOOL_TIMEOUT_MS,
+    grafana_clone: TOOL_TIMEOUT_MS,
+    grafana_panel_query: QUERY_TOOL_TIMEOUT_MS,
+    grafana_datasources: TOOL_TIMEOUT_MS,
+    grafana_metric: METRIC_TOOL_TIMEOUT_MS,
+    grafana_trend: TREND_TOOL_TIMEOUT_MS,
+    grafana_alerts: ALERT_TOOL_TIMEOUT_MS,
+    grafana_search: TOOL_TIMEOUT_MS,
+    grafana_status: TOOL_TIMEOUT_MS,
+    grafana_sources: TOOL_TIMEOUT_MS,
+  }
+  for (const [name, timeout] of Object.entries(expected)) {
+    assert.equal(toolByName(tools, name).timeoutMs, timeout, `${name} must declare ${timeout}`)
+  }
+  // 双 GET 链（search 的满页探测、status 的健康+样例两跳、alerts 的两跳）须被 75s 覆盖。
+  assert.ok(TOOL_TIMEOUT_MS >= 2 * worstGet, 'TOOL_TIMEOUT_MS must cover two worst-case GETs')
+  assert.ok(ALERT_TOOL_TIMEOUT_MS >= 2 * worstGet, 'ALERT_TOOL_TIMEOUT_MS must cover two worst-case GETs')
+  // metric 链 = datasources GET（含重试）+ 查询 POST（无重试）。
+  assert.ok(METRIC_TOOL_TIMEOUT_MS >= worstGet + METRIC_REQUEST_TIMEOUT_MS, 'METRIC_TOOL_TIMEOUT_MS must cover the index GET plus the query POST')
+  // 逐面板降级无总预算上限：panel_query/trend 的工具级只需大于单请求预算，
+  // 超限部分由 runPanelQueries 的 abort 检查显式记为预算耗尽。
+  assert.ok(QUERY_TOOL_TIMEOUT_MS > QUERY_REQUEST_TIMEOUT_MS)
+  assert.ok(TREND_TOOL_TIMEOUT_MS > QUERY_REQUEST_TIMEOUT_MS)
 })
 
 test('snapshots record title, folderTitle, and folderUid with a folderUid fallback', async () => {

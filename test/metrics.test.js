@@ -26,6 +26,7 @@ import {
   formatDatasourceRows,
   renderSparkline,
   resolveTimeRangeMs,
+  summarizeFrames,
   summarizeMetricResult,
   summarizeTrendFrames,
 } from '../lib/query.js'
@@ -986,4 +987,46 @@ test('grafana_metric surfaces an in-band results error instead of reporting no d
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('grafana_metric redacts credential shapes echoed inside an in-band results error', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/datasources')) {
+      return jsonResponse([{ uid: 'prom-prod', type: 'prometheus', name: 'Prom Prod', isDefault: true, access: 'proxy' }])
+    }
+    // 带内错误把请求凭证回显回来（数据源代理把 Authorization 头打进诊断）：
+    // HTTP 200 路径不经过 translateApiFailure 的脱敏，必须在这里先脱敏再透传。
+    return jsonResponse({
+      results: { A: { error: 'proxy rejected Bearer glsa_AAAAAAAAAAAAAAAAAAAA for datasource glc_0123456789abcdefghij' } },
+    })
+  }
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      toolByName(tools, 'grafana_metric').execute({ datasource: 'prom-prod', expr: 'up' }, execution()),
+      (error) => {
+        assert.equal(error.message, 'the datasource rejected the query: proxy rejected [redacted] for datasource [redacted]')
+        assert.doesNotMatch(error.message, /glsa_|glc_|Bearer/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('summarizeFrames and summarizeTrendFrames redact credential shapes in in-band errors', () => {
+  // 面板管线对同形状带内错误的渲染路径：错误文本进入工具输出而非抛出，
+  // 同样必须先脱敏再单行化。
+  const error = 'upstream echoed Bearer glsa_AAAAAAAAAAAAAAAAAAAA in the error body'
+  const record = { panel: { id: 7, title: 'RPM' }, refId: 'A', originalRefId: 'A' }
+  assert.deepEqual(summarizeFrames([record], { A: { error } }), [
+    'panel id=7 "RPM":',
+    '  query A: failed: upstream echoed [redacted] in the error body',
+  ])
+  assert.deepEqual(
+    summarizeTrendFrames([record], { A: { error } }, { points: 24, range: 'now-1h..now' }),
+    ['panel id=7 "RPM": query A: failed: upstream echoed [redacted] in the error body'],
+  )
 })

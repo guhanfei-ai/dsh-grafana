@@ -410,6 +410,173 @@ test('setToken surfaces a rejected credential write', async () => {
   await assert.rejects(() => face.setToken('GRAFANA_TOKEN_x', 'tok'), /credential store is read-only/)
 })
 
+test('unsetToken surfaces a rejected credential clear', async () => {
+  const { face } = setup({ fail: { 'credentials.unset': 'credential store is read-only' } })
+  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_x'), /credential store is read-only/)
+})
+
+// 移除源站的远端编排（onRemove 的接线层）：列表先写、令牌后清；令牌清理失败必须
+// 如实返回待重试的 ref，且已生效的列表删除不回滚——UI 据此显示「源站已移除、令牌
+// 清理失败」与重试按钮，而不是把移除渲染成全然成功。
+test('removeSourceRemote writes the list first and reports a failed token clear without rolling back', async () => {
+  const internals = loadBrowserRuntime().internals
+  const source = { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' }
+
+  // 成功路径：恰一次 mutate 写列表，随后 unset 清令牌；两步都成功。
+  {
+    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu', creds: { GRAFANA_TOKEN_ideu: 'e' } })
+    const outcome = await internals.removeSourceRemote(face, {
+      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
+    })
+    assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+    assert.deepEqual(
+      calls.map(([m]) => m).filter((m) => m === 'settings.mutate' || m === 'credentials.unset'),
+      ['settings.mutate', 'credentials.unset'],
+    )
+    // 令牌确实被清了。
+    assert.equal((await face.describe()).sources.some((s) => s.id === 'id-eu'), false)
+  }
+
+  // 清理失败：列表写入已生效（不回滚），失败如实带回待重试的 ref 与原因。
+  {
+    const { face, calls } = setup({
+      sources: [source],
+      defaultSource: 'id-eu',
+      creds: { GRAFANA_TOKEN_ideu: 'e' },
+      fail: { 'credentials.unset': 'credential store is read-only' },
+    })
+    const outcome = await internals.removeSourceRemote(face, {
+      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
+    })
+    assert.equal(outcome.tokenCleaned, false)
+    assert.equal(outcome.tokenRef, 'GRAFANA_TOKEN_ideu')
+    assert.match(outcome.error, /credential store is read-only/)
+    // 源站删除没有被回滚：存储里已无该源站（描述里 tokenConfigured 也随 describe 消失）。
+    const described = await face.describe()
+    assert.equal(described.sources.some((s) => s.id === 'id-eu'), false)
+    // 清理确实尝试过（GET 重试链之外恰一次 unset）。
+    assert.equal(calls.filter(([m]) => m === 'credentials.unset').length, 1)
+  }
+
+  // 令牌本就未配置：不碰凭证库。
+  {
+    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu' })
+    const outcome = await internals.removeSourceRemote(face, {
+      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: false,
+    })
+    assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+    assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
+  }
+
+  // 列表写入本身被拒：整体失败向外抛（沿用 persist 的错误路径），不进入令牌清理。
+  {
+    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu', fail: { 'settings.mutate': 'revision conflict' } })
+    await assert.rejects(
+      () => internals.removeSourceRemote(face, {
+        nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
+      }),
+      /revision conflict/,
+    )
+    assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
+  }
+})
+
+test('the removed-token captions exist in both locales', () => {
+  const { STRINGS } = loadBrowserRuntime().internals
+  for (const lang of ['zh', 'en']) {
+    for (const key of ['removedTokenPending', 'retryTokenCleanup']) {
+      assert.equal(typeof STRINGS[lang][key], 'string', `${lang}.${key} must exist`)
+      assert.ok(STRINGS[lang][key].length > 0)
+    }
+  }
+  assert.notEqual(STRINGS.zh.removedTokenPending, STRINGS.en.removedTokenPending)
+  assert.notEqual(STRINGS.zh.retryTokenCleanup, STRINGS.en.retryTokenCleanup)
+  // 多条待清理项并存时用户要能分辨是哪一台源站：文案带源站名占位符。
+  for (const lang of ['zh', 'en']) assert.ok(STRINGS[lang].removedTokenPending.includes('{name}'))
+})
+
+// 连续移除两个源站且令牌都清理失败：两条提示必须各自保留（单对象状态会让第二条
+// 覆盖第一条，先失败的那条孤儿令牌就再没有重试入口），且各自重试互不影响。
+test('token cleanup failures accumulate per ref and clear independently', () => {
+  const { mergeTokenCleanup, dropTokenCleanup } = loadBrowserRuntime().internals
+  // 跨 realm 对象一律用 JSON.stringify 比较（vm 沙箱造出的数组原型链与本 realm 不同源）。
+  let list = mergeTokenCleanup([], { ref: 'GRAFANA_TOKEN_ida', name: 'a', error: 'store read-only' })
+  list = mergeTokenCleanup(list, { ref: 'GRAFANA_TOKEN_idb', name: 'b', error: 'store offline' })
+  assert.equal(JSON.stringify(list.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_ida', 'GRAFANA_TOKEN_idb']))
+  // 重试 a 成功只移除 a，b 的重试入口与原样保留。
+  const afterA = dropTokenCleanup(list, 'GRAFANA_TOKEN_ida')
+  assert.equal(JSON.stringify(afterA.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_idb']))
+  assert.equal(afterA[0].name, 'b')
+  assert.equal(afterA[0].error, 'store offline')
+  // 同一 ref 重试仍失败：只更新原因，不拆成两条（也不丢名称）。
+  const retried = mergeTokenCleanup(afterA, { ref: 'GRAFANA_TOKEN_idb', error: 'still read-only' })
+  assert.equal(retried.length, 1)
+  assert.equal(retried[0].error, 'still read-only')
+  assert.equal(retried[0].name, 'b')
+  // 全部清理成功后清空。
+  assert.equal(JSON.stringify(dropTokenCleanup(retried, 'GRAFANA_TOKEN_idb')), '[]')
+  // 空/畸形入参不炸。
+  assert.equal(JSON.stringify(dropTokenCleanup(null, 'x')), '[]')
+  assert.equal(JSON.stringify(mergeTokenCleanup(null, { ref: 'r' })), JSON.stringify([{ ref: 'r' }]))
+})
+
+// 删除写入成功后必须立即按已知结果推进本地：远端已生效，回读失败时界面不能继续
+// 显示已被删除的源站卡片（否则用户会基于过期卡片继续操作）。
+test('the local state advances on a successful removal write without waiting for the reread', () => {
+  const { localStateAfterRemoval } = loadBrowserRuntime().internals
+  const sources = [
+    { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod', tokenDraft: '' },
+    { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu', tokenDraft: '' },
+    // 从未落库的新卡片草稿：不该被别的源站移除冲掉。
+    { id: 'new', name: '', baseUrl: '', tokenRef: 'GRAFANA_TOKEN_new', tokenDraft: 'tok' },
+  ]
+  // 删除的正是默认源站：默认改指另一个已存源站，存储基线换成刚写入的列表。
+  const next = localStateAfterRemoval({
+    sources,
+    removedId: 'id-prod',
+    nextSources: [{ id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' }],
+    nextDefault: 'id-eu',
+  })
+  assert.equal(JSON.stringify(next.sources.map((s) => s.id)), JSON.stringify(['id-eu', 'new']))
+  assert.equal(next.sources[1].tokenDraft, 'tok')
+  assert.equal(JSON.stringify(next.stored.map((s) => s.id)), JSON.stringify(['id-eu']))
+  assert.equal(next.defaultSource, 'id-eu')
+  // 删掉最后一个已存源站：默认置空（不得继续指向已删除的 id）。
+  const cleared = localStateAfterRemoval({ sources, removedId: 'id-eu', nextSources: [], nextDefault: '' })
+  assert.equal(JSON.stringify(cleared.sources.map((s) => s.id)), JSON.stringify(['id-prod', 'new']))
+  assert.equal(JSON.stringify(cleared.stored), '[]')
+  assert.equal(cleared.defaultSource, '')
+})
+
+test('two consecutive failed removals yield distinct pending token refs', async () => {
+  const internals = loadBrowserRuntime().internals
+  const sources = [
+    { id: 'id-a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_ida' },
+    { id: 'id-b', name: 'b', baseUrl: 'https://b.example.com', tokenRef: 'GRAFANA_TOKEN_idb' },
+  ]
+  const { face } = setup({
+    sources,
+    defaultSource: 'id-a',
+    creds: { GRAFANA_TOKEN_ida: 'a', GRAFANA_TOKEN_idb: 'b' },
+    fail: { 'credentials.unset': 'credential store is read-only' },
+  })
+  // 先移除 a，再移除 b：两次清理都失败，但各自带回自己的 ref 与源站名。
+  const first = await internals.removeSourceRemote(face, {
+    nextSources: [sources[1]], nextDefault: 'id-b', tokenRef: 'GRAFANA_TOKEN_ida', tokenConfigured: true,
+  })
+  const second = await internals.removeSourceRemote(face, {
+    nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_idb', tokenConfigured: true,
+  })
+  assert.equal(first.tokenCleaned, false)
+  assert.equal(second.tokenCleaned, false)
+  let pending = []
+  pending = internals.mergeTokenCleanup(pending, { ref: first.tokenRef, name: 'a', error: first.error })
+  pending = internals.mergeTokenCleanup(pending, { ref: second.tokenRef, name: 'b', error: second.error })
+  // 两条并存（不是后者覆盖前者），才可能各自重试。
+  assert.equal(JSON.stringify(pending.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_ida', 'GRAFANA_TOKEN_idb']))
+  assert.equal(JSON.stringify(pending.map((entry) => entry.name)), JSON.stringify(['a', 'b']))
+})
+
 test('the card dictionary carries the host-too-old notice in both locales', () => {
   const { STRINGS } = loadBrowserRuntime().internals
   for (const lang of ['zh', 'en']) {

@@ -123,6 +123,8 @@ window.__ModuleLoader__.load({
 				saved: "已保存。新会话将使用更新后的配置。",
 				invalidUrl: "Grafana URL 必须是不含凭证、查询参数或片段的绝对 HTTP(S) 地址。",
 				confirmRemoveSource: "确定要移除该源站吗？其已存储的令牌也会一并清除。",
+				removedTokenPending: "源站“{name}”已移除，但其令牌清理失败（源站列表已更新，可点击重试补清）：",
+				retryTokenCleanup: "重试清除令牌",
 				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。"
 			},
 			en: {
@@ -157,6 +159,8 @@ window.__ModuleLoader__.load({
 				saved: "Saved. New conversations will use the updated configuration.",
 				invalidUrl: "Grafana URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
 				confirmRemoveSource: "Remove this source? Its stored token will also be cleared.",
+				removedTokenPending: "The source “{name}” was removed, but clearing its stored token failed (the source list is already updated; retry to finish the cleanup):",
+				retryTokenCleanup: "Retry token cleanup",
 				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page."
 			}
 		};
@@ -254,6 +258,52 @@ window.__ModuleLoader__.load({
 			return Boolean(draft) && storedById.has(draft.id);
 		}
 
+		// 「移除源站」的远端编排（接线层可单测）：源站列表先写、令牌后清。令牌清理
+		// 失败不回滚源站删除——新源站 id 是全新 UUID，不会复用该 ref，残留的只是一条
+		// 无引用的孤儿凭证——但必须如实报告失败并保留待重试的 ref，绝不谎报成功。
+		// remotes 即 face（只用 writeSources / unsetToken）；plan = { nextSources,
+		// nextDefault, tokenRef, tokenConfigured }。返回 { tokenCleaned: true } 或
+		// { tokenCleaned: false, tokenRef, error }（error 已收敛为字符串消息；HOST_UNSUPPORTED
+		// 等本地化翻译由组件层完成）。
+		async function removeSourceRemote(remotes, plan) {
+			await remotes.writeSources(plan.nextSources, plan.nextDefault);
+			if (!plan.tokenConfigured) return { tokenCleaned: true };
+			try {
+				await remotes.unsetToken(plan.tokenRef);
+			} catch (error) {
+				return { tokenCleaned: false, tokenRef: plan.tokenRef, error: String(error && error.message ? error.message : error) };
+			}
+			return { tokenCleaned: true };
+		}
+
+		// 待清理令牌按 ref 累积：连续移除两个源站且令牌都清理失败时，两条提示必须各自
+		// 保留——单对象状态会让第二个覆盖第一个，先失败的那条孤儿令牌就再没有重试入口。
+		// 同一 ref 再次失败只更新原因，不拆成两条。
+		function mergeTokenCleanup(list, entry) {
+			const rows = Array.isArray(list) ? list : [];
+			const index = rows.findIndex((row) => row.ref === entry.ref);
+			if (index === -1) return [...rows, entry];
+			const next = rows.slice();
+			next[index] = { ...rows[index], ...entry };
+			return next;
+		}
+
+		// 重试成功只移除自身那一条：其余待清理项的重试入口不受影响。
+		function dropTokenCleanup(list, ref) {
+			return (Array.isArray(list) ? list : []).filter((row) => row.ref !== ref);
+		}
+
+		// 源站删除写入成功后的本地权威推进：远端已生效，界面不得继续依赖回读——
+		// 回读失败时若仍按旧状态渲染，用户会看到实际上已被删除的源站卡片并基于它
+		// 继续操作。nextSources / nextDefault 就是刚写进存储的值，本地照此推进。
+		function localStateAfterRemoval({ sources, removedId, nextSources, nextDefault }) {
+			return {
+				sources: (Array.isArray(sources) ? sources : []).filter((s) => s.id !== removedId),
+				stored: nextSources,
+				defaultSource: nextDefault
+			};
+		}
+
 		function GrafanaCard(props) {
 			const face = props.grafanaCard;
 			// sources 每项：{ id, name, baseUrl, tokenRef, tokenConfigured, tokenDraft, tokenFocus }（草稿）。
@@ -268,6 +318,10 @@ window.__ModuleLoader__.load({
 			const [saving, setSaving] = react.useState(false);
 			const [saved, setSaved] = react.useState(false);
 			const [error, setError] = react.useState("");
+			// 移除源站后令牌清理失败的待重试列表：每项 { ref, name, error }，按 ref 累积
+			// （连续移除多个源站且都失败时，每条都得有自己的重试入口）。源站列表已删，
+			// 这里只补凭证库那一刀；某条重试成功才移除该条提示。
+			const [tokenCleanups, setTokenCleanups] = react.useState([]);
 			const [lang, setLang] = react.useState(detectLanguage);
 			// 展开状态是卡片本地的阅读手势，Host 与设置页都不参与（同官方 PluginCard）。
 			const [open, setOpen] = react.useState(false);
@@ -393,20 +447,57 @@ window.__ModuleLoader__.load({
 				const nextDefault = defaultSource === id ? "" : resolveDefault(nextSources, defaultSource);
 				setSaving(true); setSaved(false); setError("");
 				try {
-					await face.writeSources(nextSources, nextDefault);
-					// 令牌清理失败不回滚移除：源站已删，残留的只是凭证库里一条无引用的
-					// 孤儿条目（下次 id 是全新 UUID，不会复用该 ref），不值得让用户重试整个移除。
-					if (target.tokenConfigured) {
-						try { await face.unsetToken(target.tokenRef); } catch { /* 孤儿凭证，无害 */ }
+					const outcome = await removeSourceRemote(face, {
+						nextSources,
+						nextDefault,
+						tokenRef: target.tokenRef || tokenRefForId(target.id),
+						tokenConfigured: Boolean(target.tokenConfigured),
+					});
+					// 写入已生效：先按已知结果推进本地权威展示（不等回读），否则回读
+					// 失败时界面会留着实际上已删除的源站卡片。
+					setSources((prev) => localStateAfterRemoval({ sources: prev, removedId: id, nextSources, nextDefault }).sources);
+					setStored(nextSources);
+					setDefaultSource(nextDefault);
+					// 再记录清理失败（保留重试入口）：即使回读失败，提示也不会丢。
+					if (!outcome.tokenCleaned) {
+						const error = outcome.error === HOST_UNSUPPORTED ? T.hostTooOld : outcome.error;
+						setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref: outcome.tokenRef, name: target.name, error }));
 					}
 					await reread();
-					setSaved(true);
+					if (outcome.tokenCleaned) setSaved(true);
 				} catch (e) {
 					const message = String(e && e.message ? e.message : e);
 					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
 				} finally {
 					setSaving(false);
 				}
+			}
+
+			// 重试清除某一条孤儿令牌：只补这一条 ref 的那一刀。成功只移除自身提示，
+			// 并再同步一次（此前的回读可能失败过，本地不得停留在过期状态）；失败就地
+			// 更新该条的原因，其余待清理项的重试入口原样保留。
+			async function retryTokenCleanup(ref) {
+				if (!ref) return;
+				setSaving(true); setSaved(false);
+				try {
+					await face.unsetToken(ref);
+				} catch (e) {
+					const message = String(e && e.message ? e.message : e);
+					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: message === HOST_UNSUPPORTED ? T.hostTooOld : message }));
+					setSaving(false);
+					return;
+				}
+				setTokenCleanups((prev) => dropTokenCleanup(prev, ref));
+				setError("");
+				setSaved(true);
+				try {
+					await reread();
+				} catch (e) {
+					// 清理已成功，但重同步失败的同步错误仍须显示（不能假装一致）。
+					const message = String(e && e.message ? e.message : e);
+					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
+				}
+				setSaving(false);
 			}
 
 			// 设为默认即写：只改 defaultSource，sources 数组以存储值原样回写（不动草稿）。
@@ -523,7 +614,13 @@ window.__ModuleLoader__.load({
 						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported || !anyDirty, onClick: onSaveAll, children: saving ? T.saving : T.saveAllSources }),
 						saved ? h("p", { style: S.msg, children: T.saved }) : null,
 						error ? h("p", { style: S.err, children: error }) : null
-					] })
+					] }),
+					// 令牌清理待重试：每条一个独立的提示与重试按钮（按 ref 累积，互不覆盖），
+					// 独立于通用 error 展示，提示保留到各自重试成功为止。
+					...tokenCleanups.map((entry) => hs("div", { key: entry.ref, style: S.footer, children: [
+						h("p", { style: S.err, children: `${T.removedTokenPending.replace("{name}", String(entry.name || entry.ref))} ${entry.error}` }),
+						h("button", { type: "button", style: S.button, disabled: saving, onClick: () => retryTokenCleanup(entry.ref), children: T.retryTokenCleanup })
+					] }))
 				] }) : null
 			] });
 		}
@@ -649,7 +746,7 @@ window.__ModuleLoader__.load({
 		// 供测试驱动的纯函数、应答解析与卡片文案（不参与运行时契约）。
 		// STRINGS 入列是为了让“宿主过旧”提示的双语存在性可被断言：卡片的 render 路径
 		// 本仓库没有 DOM 测试台，文案键缺失只能在这一层拦住。
-		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault });
+		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault, removeSourceRemote, mergeTokenCleanup, dropTokenCleanup, localStateAfterRemoval });
 		return module.exports;
 	}
 });
