@@ -24,10 +24,12 @@
 | 组件 | 已支持基线 |
 | --- | --- |
 | Node.js | 20.11 或更高版本 |
-| DeepSeek Harness | `0.1.0-rc.6` 至 `0.1.2-rc.1`（已验证：`0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1`） |
+| DeepSeek Harness | `0.1.0-rc.6` 至 `0.1.3` 预发布（已验证：`0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1`、`0.1.3-alpha.2`） |
 | Grafana | Grafana 10/11 文档中的传统 Dashboard HTTP API |
 
 Grafana 12 引入了新 Dashboard API。旧接口可能仍然可用，但 Grafana 12+ 暂未进入本插件的正式兼容矩阵。
+
+本插件无构建步骤：纯 ESM JavaScript，安装即可加载，无需编译或打包。
 
 ## 安装
 
@@ -94,9 +96,52 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 - `dashboards:read`
 - `dashboards:write`
 - 目标文件夹的 `folders:read`
-- `grafana_query` 需要 `datasources:query` 以及对所查数据源的访问权限
+- `grafana_panel_query` 需要 `datasources:query` 以及对所查数据源的访问权限
 
 不支持细粒度 RBAC 时才使用 Editor 角色，避免使用 Admin token。
+
+各工具所需的具体权限：
+
+| 工具 | Grafana 权限 |
+| --- | --- |
+| `grafana_get` | `dashboards:read` |
+| `grafana_push` | `dashboards:read` + `dashboards:write` |
+| `grafana_clone` | `dashboards:read` + `dashboards:write` |
+| `grafana_panel_query` | `dashboards:read` + `datasources:query` |
+| `grafana_datasources` | `datasources:read` |
+| `grafana_metric` | `datasources:read` + `datasources:query` |
+| `grafana_trend` | `dashboards:read` + `datasources:query` |
+| `grafana_alerts` | `alert.instances:read`；`definitions: true` 另需 `alert.provisioning:read` |
+| `grafana_search` | `dashboards:read` |
+| `grafana_status` | `dashboards:read`（见下注） |
+| `grafana_sources` | 无（只读本机插件配置） |
+
+以读为主的配置可用 Viewer 基础角色叠加 Grafana 固定的只读 Alerting 角色；只有跑 `grafana_push` / `grafana_clone` 的令牌才需要追加 `dashboards:write`（或 Editor 基础角色）。关于 `grafana_status`：`/api/health` 无需鉴权，故该工具改为调用 `GET /api/search` 验证凭证，并从 `/api/health` 的 `database` 字段读取实例健康状态（该接口没有 `status` 字段）。
+
+## 能力覆盖
+
+与单一用途的 Grafana 桥接插件相比，本插件的差异点：
+
+- **多具名源站**（至多 50 个）：每个工具都接受可选的 `source` 参数，写入审批会标明目标实例，一个插件即可服务一整套 Grafana。
+- **凭证不落入配置文档**：令牌以只写方式存进 DSH 凭证库，经特权回环 RPC 访问，绝不会被回读、展示或同步。
+- **浏览器设置卡片**：源站的增删改与校验都在原生设置界面完成，无需手工编辑配置文件。
+
+工具面覆盖从读到写的完整闭环：
+
+| 能力 | 工具 |
+| --- | --- |
+| 读大盘（完整 JSON 或结构化摘要） | `grafana_get` |
+| 改大盘 | `grafana_push` |
+| 写 / 新建 | `grafana_push`、`grafana_clone` |
+| 克隆大盘 | `grafana_clone` |
+| 搜索大盘 | `grafana_search` |
+| 面板实时值 | `grafana_panel_query` |
+| 大盘序列趋势 | `grafana_trend` |
+| 裸查询（PromQL / LogQL） | `grafana_metric` |
+| 数据源发现 | `grafana_datasources` |
+| 活跃告警与规则定义 | `grafana_alerts` |
+| 源站与凭证健康 | `grafana_status`、`grafana_sources` |
+| 多源站 | 所有工具经 `source` 参数 |
 
 ## 工具
 
@@ -107,12 +152,16 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_get` | 获取完整大盘，并保存一个短期可信的版本和目录快照。传 `summary: true` 时改为返回结构化摘要（面板、查询、阈值、变量），不记录写快照，适合超大盘。 |
 | `grafana_push` | 在审批、身份校验、版本校验和目录保持后写回最近读取的大盘。 |
 | `grafana_clone` | 把大盘复制为全新大盘（全新 UID、版本 1），默认留在源文件夹，并返回新大盘完整地址。同样需要审批，继续写入前必须先调用 `grafana_get`。 |
-| `grafana_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
+| `grafana_panel_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_panel_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
+| `grafana_datasources` | 列出源站上已配置的数据源（uid、插件类型、显示名、是否默认、访问模式）。可按精确插件类型或大小写不敏感的名称子串过滤；最多返回 40 行，丢弃的行在末尾预算行中披露。调用 `grafana_metric` 前先用它确认要查询的 uid 或名称。只读。 |
+| `grafana_metric` | 无需大盘，直接对 Prometheus 或 Loki 数据源执行一条裸文本查询（PromQL 如 `up` 或 `rate(http_requests_total[5m])`，或 LogQL 流选择器），数据源按 uid 或精确显示名寻址。`mode: "instant"`（默认）在区间末端求值一次；`mode: "range"` 对序列采样并给出每条序列的统计、上升/下降/持平判定与火花线（对 Loki 的 range 查询返回的是日志行而非数值采样点，故这类序列只报行数与末行；Loki 的 instant 模式只接受 metric 查询，日志流选择器需用 range）。其它插件类型与服务端表达式会被拒绝并指向 `grafana_panel_query`。只读，不记录写快照。 |
+| `grafana_trend` | 一次调用回答大盘的「在涨还是在跌」：把每个可见查询目标以较粗的区间查询重跑，每条序列给出桶数、首/末/最小/最大/均值、方向判定与火花线。表格型结果报告行数与统计并标 `trend=n/a`，不伪造方向。与 `grafana_panel_query` 共用同一套面板管线（变量、adhoc 过滤、旧格式数据源引用、逐面板降级）。时间范围最长 90 天。只读，不记录写快照。 |
+| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。只读；告警文本是不可信数据。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
-| `grafana_health` | 检查 Grafana 连通性与 Service Account 凭证。 |
+| `grafana_status` | 检查 Grafana 连通性与 Service Account 凭证。 |
 | `grafana_sources` | 列出已配置的 Grafana 源站：每个源站的名称、只读 UID、URL、令牌是否已配，以及哪一台是默认源站。只读，绝不返回令牌值。在向其它工具传 `source` 之前，可用它发现合法的源站名称。 |
 
-### 模板变量覆盖（`grafana_query`）
+### 模板变量覆盖（`grafana_panel_query`）
 
 `variables` 参数是一个以变量名为键的 JSON 对象。大盘中所有可覆盖变量（`query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型）均可覆盖；不支持的类型显式报错。
 
@@ -125,34 +174,34 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 多值——传数组，展开方式遵循查询里使用的 Grafana 格式修饰符，为多选变量编写的大盘无需改动即可工作：
 
 ```json
-{ "host": ["www.ttpai.cn", "m.ttpai.cn"] }
+{ "host": ["www.example.com", "m.example.com"] }
 ```
 
-**Prometheus / Loki target** 里无修饰符的裸多值引用（`$host`）渲染为 `(www.ttpai.cn|m.ttpai.cn)`——即 `=~` label matcher 里可用的交替形式，与 Grafana 自身渲染一致。值不做正则转义（Grafana 也不转义；双引号 PromQL 字符串里把 `.` 转义成 `\.` 是语法错误）。需要精确匹配时使用显式 `${host:regex}` 修饰符。
+**Prometheus / Loki target** 里无修饰符的裸多值引用（`$host`）渲染为 `(www.example.com|m.example.com)`——即 `=~` label matcher 里可用的交替形式，与 Grafana 自身渲染一致。值不做正则转义（Grafana 也不转义；双引号 PromQL 字符串里把 `.` 转义成 `\.` 是语法错误）。需要精确匹配时使用显式 `${host:regex}` 修饰符。
 
 | 查询占位符 | 展开结果 |
 | --- | --- |
-| `$host` / `${host}` | `www.ttpai.cn,m.ttpai.cn`（CSV，Grafana 默认） |
-| `${host:csv}` | `www.ttpai.cn,m.ttpai.cn` |
-| `${host:doublequote}` | `"www.ttpai.cn","m.ttpai.cn"` |
-| `${host:singlequote}` | `'www.ttpai.cn','m.ttpai.cn'` |
-| `${host:json}` | `["www.ttpai.cn","m.ttpai.cn"]` |
-| `${host:raw}` | `www.ttpai.cn,m.ttpai.cn` |
-| `${host:pipe}` | `www.ttpai.cn\|m.ttpai.cn` |
-| `${host:percent}` | 逐值 URL 编码后逗号连接（`www.ttpai.cn,m.ttpai.cn`；`["a b"]` → `a%20b`） |
-| `${host:querystring}` | `host=www.ttpai.cn&host=m.ttpai.cn`（以变量名为键） |
-| `${host:regex}` | `www\.ttpai\.cn\|m\.ttpai\.cn`（逐值正则转义后以 `\|` 连接） |
+| `$host` / `${host}` | `www.example.com,m.example.com`（CSV，Grafana 默认） |
+| `${host:csv}` | `www.example.com,m.example.com` |
+| `${host:doublequote}` | `"www.example.com","m.example.com"` |
+| `${host:singlequote}` | `'www.example.com','m.example.com'` |
+| `${host:json}` | `["www.example.com","m.example.com"]` |
+| `${host:raw}` | `www.example.com,m.example.com` |
+| `${host:pipe}` | `www.example.com\|m.example.com` |
+| `${host:percent}` | 逐值 URL 编码后逗号连接（`www.example.com,m.example.com`；`["a b"]` → `a%20b`） |
+| `${host:querystring}` | `host=www.example.com&host=m.example.com`（以变量名为键） |
+| `${host:regex}` | `www\.example\.com\|m\.example\.com`（逐值正则转义后以 `\|` 连接） |
 | `${host:lucene}` | 逐值 Lucene 转义后以空格连接 |
-| `${host:sqlstring}` | `'www.ttpai.cn','m.ttpai.cn'`（值内单引号翻倍） |
+| `${host:sqlstring}` | `'www.example.com','m.example.com'`（值内单引号翻倍） |
 
-无修饰符的单值变量展开为裸值（与 `String(value)` 逐字节一致）；修饰符对单值同样生效（`${host:json}` → `"www.ttpai.cn"`，`${host:pipe}` → `www.ttpai.cn`）。未知格式修饰符显式报错。内建变量（`$__interval`、`$__rate_interval`、`${__from:date}` 等）始终原样透传。
+无修饰符的单值变量展开为裸值（与 `String(value)` 逐字节一致）；修饰符对单值同样生效（`${host:json}` → `"www.example.com"`，`${host:pipe}` → `www.example.com`）。未知格式修饰符显式报错。内建变量（`$__interval`、`$__rate_interval`、`${__from:date}` 等）始终原样透传。
 
 adhoc 过滤覆盖——整体替换大盘保存的 adhoc filters（`[]` 表示清空）：
 
 ```json
 {
   "adhoc": [
-    { "key": "host.keyword", "operator": "=", "value": "www.ttpai.cn" },
+    { "key": "host.keyword", "operator": "=", "value": "www.example.com" },
     { "key": "status", "operator": "!=", "value": "404" }
   ]
 }
@@ -162,10 +211,10 @@ adhoc 过滤覆盖——整体替换大盘保存的 adhoc filters（`[]` 表示�
 
 | 数据源类型 | 翻译方式 | 支持的运算符 |
 | --- | --- | --- |
-| Elasticsearch | Lucene 条件拼进各 target 的查询串（`host.keyword:"www.ttpai.cn"`；面板自带查询串非空时括号包裹后以 `AND` 连接） | `=` `!=` 恒可；`>` `<` 仅数字；`=~` `!~` 映射为 Lucene 正则 `field:/pattern/`（模式内的 `/` 会转义；空模式报错） |
-| Prometheus | label matcher 注入每个 vector selector（`host="www.ttpai.cn"`；裸 metric 名补上 `{...}`） | `=` `!=` `=~` `!~`；`>` `<` 报错 |
-| Loki | matcher 注入 stream selector（`{app="api", host="www.ttpai.cn"}`）；pipeline 阶段不动 | `=` `!=` `=~` `!~`；`>` `<` 报错 |
-| SQL（MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse） | `rawSql` 中的 `${__adhoc}` / `$__adhoc` 占位符替换为 WHERE 风格条件（`host = 'www.ttpai.cn'`；值做单引号转义） | `=` `!=` `>` `<`（数字）、`=~` `!~`（映射为 `LIKE`/`NOT LIKE`） |
+| Elasticsearch | Lucene 条件拼进各 target 的查询串（`host.keyword:"www.example.com"`；面板自带查询串非空时括号包裹后以 `AND` 连接） | `=` `!=` 恒可；`>` `<` 仅数字；`=~` `!~` 映射为 Lucene 正则 `field:/pattern/`（模式内的 `/` 会转义；空模式报错） |
+| Prometheus | label matcher 注入每个 vector selector（`host="www.example.com"`；裸 metric 名补上 `{...}`） | `=` `!=` `=~` `!~`；`>` `<` 报错 |
+| Loki | matcher 注入 stream selector（`{app="api", host="www.example.com"}`）；pipeline 阶段不动 | `=` `!=` `=~` `!~`；`>` `<` 报错 |
+| SQL（MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse） | `rawSql` 中的 `${__adhoc}` / `$__adhoc` 占位符替换为 WHERE 风格条件（`host = 'www.example.com'`；值做单引号转义） | `=` `!=` `>` `<`（数字）、`=~` `!~`（映射为 `LIKE`/`NOT LIKE`） |
 | 其它类型 | 显式报错并列出支持类型 | — |
 
 datasource 型变量——用数据源 uid 字符串覆盖：
@@ -176,9 +225,9 @@ datasource 型变量——用数据源 uid 字符串覆盖：
 
 datasource 引用了该变量的面板（`{"type":"prometheus","uid":"$datasource"}`）会改查指定的 uid。传入非字符串值（数字、数组）会显式报错。
 
-### 旧格式 datasource 引用（`grafana_query`）
+### 旧格式 datasource 引用（`grafana_panel_query`）
 
-旧版大盘的 datasource 引用形状无法直接用于 `/api/ds/query`，`grafana_query` 会透明解析：
+旧版大盘的 datasource 引用形状无法直接用于 `/api/ds/query`，`grafana_panel_query` 会透明解析：
 
 | 面板 datasource 形状 | 解析方式 |
 | --- | --- |

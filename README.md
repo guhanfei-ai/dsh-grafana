@@ -24,10 +24,12 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 | Component | Supported baseline |
 | --- | --- |
 | Node.js | 20.11 or newer |
-| DeepSeek Harness | `0.1.0-rc.6` through `0.1.2-rc.1` (verified: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`) |
+| DeepSeek Harness | `0.1.0-rc.6` through `0.1.3` prereleases (verified: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.3-alpha.2`) |
 | Grafana | Legacy Dashboard HTTP API as documented for Grafana 10/11 |
 
 Grafana 12 introduced a new dashboard API. The legacy endpoints used by this plugin may remain available, but Grafana 12+ is not part of the certified matrix yet.
+
+There is no build step: the plugin is plain ESM JavaScript, so installing it is enough — nothing to compile or bundle before it loads.
 
 ## Installation
 
@@ -94,9 +96,52 @@ Prefer least-privilege RBAC with only the required dashboard and folder scopes:
 - `dashboards:read`
 - `dashboards:write`
 - `folders:read` for the folders being edited
-- `datasources:query` plus access to the datasources queried by `grafana_query`
+- `datasources:query` plus access to the datasources queried by `grafana_panel_query`
 
 When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Avoid Admin tokens.
+
+The exact scope each tool needs:
+
+| Tool | Grafana permission |
+| --- | --- |
+| `grafana_get` | `dashboards:read` |
+| `grafana_push` | `dashboards:read` + `dashboards:write` |
+| `grafana_clone` | `dashboards:read` + `dashboards:write` |
+| `grafana_panel_query` | `dashboards:read` + `datasources:query` |
+| `grafana_datasources` | `datasources:read` |
+| `grafana_metric` | `datasources:read` + `datasources:query` |
+| `grafana_trend` | `dashboards:read` + `datasources:query` |
+| `grafana_alerts` | `alert.instances:read`; `definitions: true` also needs `alert.provisioning:read` |
+| `grafana_search` | `dashboards:read` |
+| `grafana_status` | `dashboards:read` (see note) |
+| `grafana_sources` | none (reads local plugin configuration only) |
+
+A read-mostly setup is the Viewer basic role plus Grafana's fixed read-only Alerting role; add `dashboards:write` (or the Editor basic role) only for the token that runs `grafana_push` / `grafana_clone`. Note on `grafana_status`: `/api/health` needs no authentication, so the tool confirms the credential by calling `GET /api/search` and reading the instance health from the `database` field of `/api/health` (there is no `status` field).
+
+## Coverage
+
+What sets this plugin apart from a single-purpose Grafana bridge:
+
+- **Multiple named sources** (up to 50): every tool takes an optional `source` argument and write approvals name the target instance, so one plugin serves a whole fleet of Grafanas.
+- **Credentials never touch the settings document**: tokens live write-only in the DSH credential store and are reached through a privileged loopback RPC, so they are never read back, displayed, or synced.
+- **A browser settings card**: sources are added, edited, and validated from a native settings UI — no hand-editing of config files.
+
+The tool surface covers the full read-to-write loop:
+
+| Capability | Tool |
+| --- | --- |
+| Read a dashboard (full JSON or structural summary) | `grafana_get` |
+| Edit a dashboard | `grafana_push` |
+| Write / create | `grafana_push`, `grafana_clone` |
+| Clone a dashboard | `grafana_clone` |
+| Search dashboards | `grafana_search` |
+| Live panel values | `grafana_panel_query` |
+| Trend of a dashboard's series | `grafana_trend` |
+| Ad-hoc bare query (PromQL / LogQL) | `grafana_metric` |
+| Datasource discovery | `grafana_datasources` |
+| Active alerts & rule definitions | `grafana_alerts` |
+| Source & credential health | `grafana_status`, `grafana_sources` |
+| Multiple sources | every tool via `source` |
 
 ## Tools
 
@@ -107,12 +152,16 @@ Every tool accepts an optional `source` argument (a configured source name) to p
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. With `summary: true` it returns a compact structural overview (panels, queries, thresholds, variables) instead of the full JSON and records no write snapshot — preferred for large dashboards. |
 | `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
 | `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
-| `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
+| `grafana_panel_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_panel_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
+| `grafana_datasources` | Lists the datasources provisioned on a source (uid, plugin type, display name, whether it is the default, access mode). Filter by exact plugin type or a case-insensitive name substring; at most 40 rows, with any dropped rows disclosed on a final budget line. Call it before `grafana_metric` to learn which uid or name to query. Read-only. |
+| `grafana_metric` | Runs one bare-text query (PromQL such as `up` or `rate(http_requests_total[5m])`, or a LogQL stream selector) directly against a Prometheus or Loki datasource, addressed by uid or exact display name — no dashboard needed. `mode: "instant"` (default) evaluates once at the range end; `mode: "range"` samples the series and reports per-series stats, a rising/falling/flat verdict, and a sparkline (a range query against loki returns log lines rather than numeric samples, so those series report a line count and the last line instead; on loki, instant mode accepts metric queries only — use range for log-stream selectors). Other plugin types and server-side expressions are rejected with a pointer to `grafana_panel_query`. Read-only; records no write snapshot. |
+| `grafana_trend` | Answers "is it going up or down?" for a dashboard's panels in one call: every visible query target is re-run as a coarse range query and each series is reported with bucket count, first/last/min/max/avg, a direction verdict, and a sparkline. Table-shaped results report rows and stats with `trend=n/a` rather than a fabricated direction. Uses the same panel pipeline as `grafana_panel_query` (variables, adhoc filters, legacy datasource references, per-panel fallback). The range may span at most 90 days. Read-only; records no write snapshot. |
+| `grafana_alerts` | Lists the alerts currently firing on a source from the built-in Alertmanager (default `state=firing`; `"suppressed"` for silenced/inhibited, `"all"` for both). Filter by folder, a case-insensitive substring across labels and annotations, or a dashboard URL/uid. `definitions: true` appends the provisioned alert rule definitions in a second request (its own permission, its own failure isolation). Read-only; alert text is untrusted data. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
-| `grafana_health` | Checks connectivity and service-account validity. |
+| `grafana_status` | Checks connectivity and service-account validity. |
 | `grafana_sources` | Lists the configured Grafana sources: each name, its read-only UID, base URL, whether its token is configured, and which one is the default. Read-only; never returns token values. Use it to discover valid source names before passing `source` to other tools. |
 
-### Template variable overrides (`grafana_query`)
+### Template variable overrides (`grafana_panel_query`)
 
 The `variables` argument is a JSON object keyed by variable name. Every overrideable variable in the dashboard (`query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` types) can be overridden; unsupported types throw an explicit error.
 
@@ -125,34 +174,34 @@ Single value — replaces the variable everywhere it appears (`$env`, `${env}`):
 Multi-value — pass an array. The expansion follows the Grafana format modifier used in the query itself, so dashboards written for multi-select variables keep working:
 
 ```json
-{ "host": ["www.ttpai.cn", "m.ttpai.cn"] }
+{ "host": ["www.example.com", "m.example.com"] }
 ```
 
-For **Prometheus and Loki targets** a bare multi-value reference (`$host` with no modifier) renders as `(www.ttpai.cn|m.ttpai.cn)` — the alternation form that works inside `=~` label matchers, matching Grafana's own rendering. Values are not regex-escaped (Grafana does not escape them either; escaping a `.` as `\.` inside a double-quoted PromQL string is a syntax error). Use the explicit `${host:regex}` modifier when you need exact matching.
+For **Prometheus and Loki targets** a bare multi-value reference (`$host` with no modifier) renders as `(www.example.com|m.example.com)` — the alternation form that works inside `=~` label matchers, matching Grafana's own rendering. Values are not regex-escaped (Grafana does not escape them either; escaping a `.` as `\.` inside a double-quoted PromQL string is a syntax error). Use the explicit `${host:regex}` modifier when you need exact matching.
 
 | Query placeholder | Expands to |
 | --- | --- |
-| `$host` / `${host}` | `www.ttpai.cn,m.ttpai.cn` (CSV, Grafana default) |
-| `${host:csv}` | `www.ttpai.cn,m.ttpai.cn` |
-| `${host:doublequote}` | `"www.ttpai.cn","m.ttpai.cn"` |
-| `${host:singlequote}` | `'www.ttpai.cn','m.ttpai.cn'` |
-| `${host:json}` | `["www.ttpai.cn","m.ttpai.cn"]` |
-| `${host:raw}` | `www.ttpai.cn,m.ttpai.cn` |
-| `${host:pipe}` | `www.ttpai.cn\|m.ttpai.cn` |
-| `${host:percent}` | each value URL-encoded, comma-joined (`www.ttpai.cn,m.ttpai.cn`; `["a b"]` → `a%20b`) |
-| `${host:querystring}` | `host=www.ttpai.cn&host=m.ttpai.cn` (keyed by the variable name) |
-| `${host:regex}` | `www\.ttpai\.cn\|m\.ttpai\.cn` (each value regex-escaped, joined with `\|`) |
+| `$host` / `${host}` | `www.example.com,m.example.com` (CSV, Grafana default) |
+| `${host:csv}` | `www.example.com,m.example.com` |
+| `${host:doublequote}` | `"www.example.com","m.example.com"` |
+| `${host:singlequote}` | `'www.example.com','m.example.com'` |
+| `${host:json}` | `["www.example.com","m.example.com"]` |
+| `${host:raw}` | `www.example.com,m.example.com` |
+| `${host:pipe}` | `www.example.com\|m.example.com` |
+| `${host:percent}` | each value URL-encoded, comma-joined (`www.example.com,m.example.com`; `["a b"]` → `a%20b`) |
+| `${host:querystring}` | `host=www.example.com&host=m.example.com` (keyed by the variable name) |
+| `${host:regex}` | `www\.example\.com\|m\.example\.com` (each value regex-escaped, joined with `\|`) |
 | `${host:lucene}` | each value Lucene-escaped, space-joined |
-| `${host:sqlstring}` | `'www.ttpai.cn','m.ttpai.cn'` (single quotes doubled inside values) |
+| `${host:sqlstring}` | `'www.example.com','m.example.com'` (single quotes doubled inside values) |
 
-A single-value variable without a modifier expands to the bare value (byte-for-byte `String(value)`); modifiers apply to single values too (`${host:json}` → `"www.ttpai.cn"`, `${host:pipe}` → `www.ttpai.cn`). Unknown format modifiers throw an error. Built-in variables (`$__interval`, `$__rate_interval`, `${__from:date}`, …) always pass through untouched.
+A single-value variable without a modifier expands to the bare value (byte-for-byte `String(value)`); modifiers apply to single values too (`${host:json}` → `"www.example.com"`, `${host:pipe}` → `www.example.com`). Unknown format modifiers throw an error. Built-in variables (`$__interval`, `$__rate_interval`, `${__from:date}`, …) always pass through untouched.
 
 Adhoc filter override — replace the dashboard's saved adhoc filters entirely (`[]` clears them):
 
 ```json
 {
   "adhoc": [
-    { "key": "host.keyword", "operator": "=", "value": "www.ttpai.cn" },
+    { "key": "host.keyword", "operator": "=", "value": "www.example.com" },
     { "key": "status", "operator": "!=", "value": "404" }
   ]
 }
@@ -162,10 +211,10 @@ An unbound adhoc entry applies to every datasource; add `"datasourceUid": "<uid>
 
 | Datasource type | Translation | Supported operators |
 | --- | --- | --- |
-| Elasticsearch | Lucene clause merged into each target's query string (`host.keyword:"www.ttpai.cn"`; a non-empty panel query is wrapped in parentheses and combined with `AND`) | `=` `!=` always; `>` `<` numeric only; `=~` `!~` as Lucene regex `field:/pattern/` (`/` inside the pattern is escaped; an empty pattern throws) |
-| Prometheus | Label matchers injected into every vector selector (`host="www.ttpai.cn"`; bare metric names get `{...}` added) | `=` `!=` `=~` `!~`; `>` `<` throw |
-| Loki | Matchers injected into the stream selector (`{app="api", host="www.ttpai.cn"}`); pipeline stages are left untouched | `=` `!=` `=~` `!~`; `>` `<` throw |
-| SQL (MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse) | `${__adhoc}` / `$__adhoc` placeholder in `rawSql` replaced with a `WHERE`-style clause (`host = 'www.ttpai.cn'`; values single-quote-escaped) | `=` `!=` `>` `<` (numeric) `=~` `!~` (mapped to `LIKE`/`NOT LIKE`) |
+| Elasticsearch | Lucene clause merged into each target's query string (`host.keyword:"www.example.com"`; a non-empty panel query is wrapped in parentheses and combined with `AND`) | `=` `!=` always; `>` `<` numeric only; `=~` `!~` as Lucene regex `field:/pattern/` (`/` inside the pattern is escaped; an empty pattern throws) |
+| Prometheus | Label matchers injected into every vector selector (`host="www.example.com"`; bare metric names get `{...}` added) | `=` `!=` `=~` `!~`; `>` `<` throw |
+| Loki | Matchers injected into the stream selector (`{app="api", host="www.example.com"}`); pipeline stages are left untouched | `=` `!=` `=~` `!~`; `>` `<` throw |
+| SQL (MySQL/Postgres/MSSQL/MariaDB/SQLite/ClickHouse) | `${__adhoc}` / `$__adhoc` placeholder in `rawSql` replaced with a `WHERE`-style clause (`host = 'www.example.com'`; values single-quote-escaped) | `=` `!=` `>` `<` (numeric) `=~` `!~` (mapped to `LIKE`/`NOT LIKE`) |
 | Anything else | Explicit error listing the supported types | — |
 
 Datasource-type variables — override with a datasource uid string:
@@ -176,13 +225,13 @@ Datasource-type variables — override with a datasource uid string:
 
 Panels whose datasource references the variable (`{"type":"prometheus","uid":"$datasource"}`) are re-pointed at the given uid. A non-string value (number, array) throws an explicit error.
 
-### Legacy datasource references (`grafana_query`)
+### Legacy datasource references (`grafana_panel_query`)
 
-Older dashboards reference datasources in shapes that `/api/ds/query` cannot use directly. `grafana_query` resolves them transparently:
+Older dashboards reference datasources in shapes that `/api/ds/query` cannot use directly. `grafana_panel_query` resolves them transparently:
 
 | Panel datasource shape | Resolution |
 | --- | --- |
-| Plain string uid (`"9CWBz0bik"`-style, Grafana 8 and earlier) | Looked up via `GET /api/datasources`; the resolved `{type, uid}` is sent with each query |
+| Plain string uid (`"fixture-dash-0002"`-style, Grafana 8 and earlier) | Looked up via `GET /api/datasources`; the resolved `{type, uid}` is sent with each query |
 | `{"uid":"$datasource"}` / `{"type":"prometheus","uid":"$datasource"}` (datasource-type template variable) | The variable's saved `current` value is interpolated into the uid |
 | Saved value `"default"` | Mapped to the server's default datasource (`"default"` is a reserved pseudo-uid that `/api/ds/query` rejects) |
 | Index unavailable (403) or uid unknown | The raw `{uid}` is passed through so Grafana itself reports the problem; if active adhoc filters cannot be translated for an untyped datasource, an explicit error is thrown instead |

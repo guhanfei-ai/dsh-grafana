@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { apply, Config, internals, SETTINGS_NAMESPACE } from '../index.js'
+import { redactSecrets } from '../lib/util.js'
 
 function execution() {
   return { signal: new AbortController().signal }
@@ -87,15 +88,48 @@ test('API error details expose only bounded status and message fields', () => {
   assert.equal(detail, 'version-mismatch: changed elsewhere')
 })
 
-test('apply registers seven tools and a hard approval gate for writes', async () => {
+test('redactSecrets strips credentials out of upstream error text', () => {
+  // Bearer 整段（含其后的令牌）一次压掉，不把令牌留在文案里。
+  assert.equal(
+    redactSecrets('Authorization: Bearer glsa_abcdefghijklmnopqrstuvwxyz0123456789'),
+    'Authorization: [redacted]',
+  )
+  assert.equal(redactSecrets('token glc_abc123DEF_-x has expired'), 'token [redacted] has expired')
+  assert.equal(redactSecrets('bad signature 3q2+7wAAAAAAAAAAAAAAAAAAAAAAAA== here'), 'bad signature [redacted] here')
+  // 多处凭证全部命中。
+  assert.equal(
+    redactSecrets('glsa_AAAAAAAAAAAAAAAAAAAA and glsa_BBBBBBBBBBBBBBBBBBBB'),
+    '[redacted] and [redacted]',
+  )
+})
+
+test('redactSecrets leaves ordinary query text and short identifiers untouched', () => {
+  const promql = 'sum(rate(http_requests_total{job="api",instance="192.0.2.233:9093"}[5m])) by (instance)'
+  assert.equal(redactSecrets(promql), promql)
+  const logql = 'sum by (level) (count_over_time({app="web"} | json | level="error" [1h]))'
+  assert.equal(redactSecrets(logql), logql)
+  // 大盘 uid（≤ 40 字符但通常远短于 20）与短标识符不得被当成密钥。
+  assert.equal(redactSecrets('dashboard fixture-dash-0001 panel 7'), 'dashboard fixture-dash-0001 panel 7')
+  assert.equal(redactSecrets('no expression found in input'), 'no expression found in input')
+  assert.equal(redactSecrets(''), '')
+  assert.equal(redactSecrets(null), '')
+  assert.equal(redactSecrets(undefined), '')
+})
+
+test('apply registers the whole tool surface and a hard approval gate for writes', async () => {
   const { listeners, sections, tools } = createContext()
+  // 注册顺序即模型看到的工具面：数组本身就是绊线，多一个少一个都会在此处失败。
   assert.deepEqual(tools.map((tool) => tool.name), [
     'grafana_get',
     'grafana_push',
     'grafana_clone',
-    'grafana_query',
+    'grafana_panel_query',
+    'grafana_datasources',
+    'grafana_metric',
+    'grafana_trend',
+    'grafana_alerts',
     'grafana_search',
-    'grafana_health',
+    'grafana_status',
     'grafana_sources',
   ])
   assert.equal(sections.length, 1)
@@ -540,7 +574,88 @@ test('summarizeFrames produces bounded, sanitized panel data summaries', () => {
   assert.match(capped[capped.length - 1], /more line\(s\) not shown/)
 })
 
-test('grafana_query batches panel queries and never records a write snapshot', async () => {
+test('summarizeFrames counts what it drops into the budget without changing its own lines', () => {
+  const panel = { id: 9, title: 'Many' }
+  const frame = { schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[1]] } }
+  const records = [{ panel, refId: 'A', originalRefId: 'A' }]
+  const results = { A: { frames: Array.from({ length: 25 }, () => frame) } }
+
+  // series 维度：报出截断前总量与已显示量，而不只是「还有 15 条没显示」。
+  const seriesBudget = internals.createBudget()
+  const withBudget = internals.summarizeFrames(records, results, seriesBudget)
+  assert.equal(seriesBudget.note(), 'budget: 10 of 25 series shown; 15 hidden (raise limit to include them)')
+  // 逐查询省略行已删除：截断披露统一收敛到末尾预算行，不再散落重复提示。
+  assert.doesNotMatch(withBudget.join('\n'), /more series not shown/)
+  // 省略 budget 时输出与传入一个空 budget 逐字一致，存量断言不得因此漂移。
+  assert.deepEqual(withBudget, internals.summarizeFrames(records, results))
+
+  // 行维度：40 面板头 + 40 序列行 = 80 行，超 60 行上限后由预算行报总量；series
+  // 维度按行截断后的实际可见数重算（60 行里 30 行是面板头，series 只可见 30 条）。
+  const many = Array.from({ length: 40 }, (_, index) => ({ panel: { id: index + 1, title: `P${index + 1}` }, refId: `A${index}`, originalRefId: 'A' }))
+  const manyResults = Object.fromEntries(many.map((record) => [record.refId, { frames: [frame] }]))
+  const lineBudget = internals.createBudget()
+  const capped = internals.summarizeFrames(many, manyResults, lineBudget)
+  assert.equal(capped.length, 61)
+  assert.equal(lineBudget.note(), 'budget: 30 of 40 series shown; 10 hidden — 60 of 80 line(s) shown; 20 hidden (raise limit to include them)')
+
+  // 没有任何截断时不记预算，也就不会产生披露行。
+  const idle = internals.createBudget()
+  internals.summarizeFrames(records, { A: { frames: [frame] } }, idle)
+  assert.equal(idle.note(), null)
+})
+
+test('summarizeFrames recomputes the series budget after the global line cap', () => {
+  // 组合场景：每查询超过 MAX_FRAMES_PER_QUERY（10），同时总行数超过
+  // MAX_QUERY_SUMMARY_LINES（60）。series 的 shown 必须按行截断后的实际可见数
+  // 报——被行上限吃掉的 series 行不能算「已显示」，否则预算行会高估可见量。
+  const frame = { schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[1]] } }
+  const records = Array.from({ length: 7 }, (_, index) => ({ panel: { id: index + 1, title: `P${index + 1}` }, refId: `A${index}`, originalRefId: 'A' }))
+  const results = Object.fromEntries(records.map((record) => [record.refId, { frames: Array.from({ length: 25 }, () => frame) }]))
+  const budget = internals.createBudget()
+  const capped = internals.summarizeFrames(records, results, budget)
+  assert.equal(capped.length, 61)
+  assert.match(capped[60], /…17 more line\(s\) not shown\./)
+  // 7 面板头 + 70 条 series 行 = 77 行；截断内 6 个面板头，可见 series = 60 - 6 = 54。
+  // series 总量 175 = 7 × 25；hidden = 105（每查询上限）+ 16（行上限吃掉的可见外 series 行）。
+  assert.equal(budget.note(), 'budget: 54 of 175 series shown; 121 hidden — 60 of 77 line(s) shown; 17 hidden (raise limit to include them)')
+})
+
+test('grafana_panel_query discloses truncation on the last line, and stays silent without it', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 3,
+    panels: [{ id: 1, type: 'timeseries', title: 'CPU', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'up' }] }],
+  }
+  const frame = { schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[1]] } }
+  let frameCount = 25
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/api/ds/query')) {
+      return jsonResponse({ results: { A: { frames: Array.from({ length: frameCount }, () => frame) } } })
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_panel_query')
+    const cut = await tool.execute({ urlOrUid: 'abc123' }, execution())
+    const lines = cut.split('\n')
+    // 披露行是输出的最后一行（不会被行数上限自己吃掉）。
+    assert.equal(lines[lines.length - 1], 'budget: 10 of 25 series shown; 15 hidden (raise limit to include them)')
+    // 逐查询省略行已删除：单一预算行是唯一的截断披露层。
+    assert.doesNotMatch(cut, /more series not shown/)
+
+    // 没截断时不得多出一行空披露。
+    frameCount = 2
+    const whole = await tool.execute({ urlOrUid: 'abc123' }, execution())
+    assert.doesNotMatch(whole, /^budget: /m)
+    assert.doesNotMatch(whole, /not shown/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_panel_query batches panel queries and never records a write snapshot', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -567,7 +682,7 @@ test('grafana_query batches panel queries and never records a write snapshot', a
 
   try {
     const { listeners, tools } = createContext()
-    const output = await toolByName(tools, 'grafana_query').execute({
+    const output = await toolByName(tools, 'grafana_panel_query').execute({
       urlOrUid: 'https://grafana.example.com/d/abc123/overview?from=now-2h&to=now',
     }, execution())
 
@@ -588,14 +703,14 @@ test('grafana_query batches panel queries and never records a write snapshot', a
     assert.match(output, /query A: no data/)
 
     // 面板视图 URL 只查单面板；时间缺省 now-1h..now。
-    const single = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=1' }, execution())
+    const single = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=1' }, execution())
     assert.equal(queryBodies.length, 2)
     assert.equal(queryBodies[1].queries.length, 1)
     assert.equal(queryBodies[1].from, 'now-1h')
     assert.match(single, /panel id=1/)
     assert.doesNotMatch(single, /panel id=3/)
     await assert.rejects(
-      toolByName(tools, 'grafana_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=99' }, execution()),
+      toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?viewPanel=99' }, execution()),
       /Panel id=99 was not found/,
     )
 
@@ -619,20 +734,20 @@ test('summarizeFrames keeps real bucket names for table frames and reports per-p
     A: {
       frames: [{
         schema: { fields: [{ name: 'ip', type: 'string' }, { name: 'Value', type: 'number' }] },
-        data: { values: [['139.9.128.14', '8.8.8.8', '9.9.9.9'], [342000, 11560, 11950]] },
+        data: { values: [['192.0.2.14', '198.51.100.8', '203.0.113.9'], [342000, 11560, 11950]] },
       }],
     },
   }
   const text = internals.summarizeFrames(records, results).join('\n')
   // terms 表格帧的桶名是排行榜类面板的核心数据，必须原样展示，不能退化成 "?"。
-  assert.match(text, /139\.9\.128\.14=/)
-  assert.match(text, /9\.9\.9\.9=/)
+  assert.match(text, /192\.0\.2\.14=/)
+  assert.match(text, /203\.0\.113\.9=/)
   assert.doesNotMatch(text, /\?=/)
   // 降级逐面板重试后仍失败的面板：逐条记录，不隐藏。
   assert.match(text, /query B: failed: request timed out/)
 })
 
-test('grafana_query passes server-side expressions through and skips unresolvable panels', async () => {
+test('grafana_panel_query passes server-side expressions through and skips unresolvable panels', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -657,7 +772,7 @@ test('grafana_query passes server-side expressions through and skips unresolvabl
   }
   try {
     const { tools } = createContext()
-    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    const output = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // Expression 里的 $A 是 refId 引用，由服务端表达式引擎解析，原样透传。
     assert.equal(queryBodies.length, 1)
@@ -674,7 +789,7 @@ test('grafana_query passes server-side expressions through and skips unresolvabl
   }
 })
 
-test('grafana_query falls back to per-panel queries when the batch request fails', async () => {
+test('grafana_panel_query falls back to per-panel queries when the batch request fails', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   let queryCalls = 0
@@ -702,7 +817,7 @@ test('grafana_query falls back to per-panel queries when the batch request fails
   }
   try {
     const { tools } = createContext()
-    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    const output = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // 1 次批量失败 + 2 次逐面板降级。
     assert.equal(queryBodies.length, 3)
@@ -982,7 +1097,7 @@ test('grafana_clone honors an explicit title and folder, and requires grafana_ge
   }
 })
 
-test('grafana_health reports the database field from the real /api/health shape', async () => {
+test('grafana_status reports the database field from the real /api/health shape', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (url) => {
     if (String(url).endsWith('/api/health')) {
@@ -994,7 +1109,7 @@ test('grafana_health reports the database field from the real /api/health shape'
 
   try {
     const { tools } = createContext()
-    const output = await toolByName(tools, 'grafana_health').execute({}, execution())
+    const output = await toolByName(tools, 'grafana_status').execute({}, execution())
     assert.equal(output, 'health=ok; credential=valid; sampleDashboards=2')
   } finally {
     globalThis.fetch = originalFetch
@@ -1076,7 +1191,7 @@ test('apply registers a grafana settings namespace and resolves config through i
     return jsonResponse({ database: 'ok' })
   }
   try {
-    await toolByName(tools, 'grafana_health').execute({}, execution())
+    await toolByName(tools, 'grafana_status').execute({}, execution())
   } catch {
     // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
   } finally {
@@ -1107,7 +1222,7 @@ test('apply migrates a legacy credential-stored URL into the settings namespace 
     return jsonResponse({ database: 'ok' })
   }
   try {
-    await toolByName(tools, 'grafana_health').execute({}, execution())
+    await toolByName(tools, 'grafana_status').execute({}, execution())
   } catch {
     // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
   } finally {
@@ -1131,7 +1246,7 @@ test('resolveBaseUrl prefers settings.baseUrl over the credential value', async 
     return jsonResponse({ database: 'ok' })
   }
   try {
-    await toolByName(tools, 'grafana_health').execute({}, execution())
+    await toolByName(tools, 'grafana_status').execute({}, execution())
   } catch {
     // 凭证缺失时第二次请求会失败；第一次请求的 URL 已足以证明动态解析生效。
   } finally {
@@ -1142,7 +1257,7 @@ test('resolveBaseUrl prefers settings.baseUrl over the credential value', async 
   assert.equal(creds.GRAFANA_BASE_URL, 'https://grafana.from-credential.example.com')
 })
 
-test('grafana_query adhoc default state: saved adhoc filters expand into the ES target Lucene query', async () => {
+test('grafana_panel_query adhoc default state: saved adhoc filters expand into the ES target Lucene query', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1153,7 +1268,7 @@ test('grafana_query adhoc default state: saved adhoc filters expand into the ES 
         type: 'adhoc',
         datasource: { type: 'elasticsearch', uid: 'c336bd55-e7bd-4e79-8fdc-16293e6575f0' },
         // Grafana 10 的 adhoc 保存态存在 filters 字段（无 current）。
-        filters: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }],
+        filters: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }],
       }],
     },
     panels: [{
@@ -1172,12 +1287,12 @@ test('grafana_query adhoc default state: saved adhoc filters expand into the ES 
 
   try {
     const { tools } = createContext()
-    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    const output = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     assert.equal(queryBodies.length, 1)
     const body = queryBodies[0]
     // adhoc 条件拼进 target 的 lucene 查询串（原串非空时括号包裹再 AND）。
-    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.example.com"')
     // 请求体不得再出现请求级 adhocFilters（Grafana 10.x 的 /api/ds/query 不消费该字段）。
     assert.ok(!('adhocFilters' in body), 'request must not carry top-level adhocFilters')
     // scopedVars 包含 adhoc 变量。
@@ -1191,7 +1306,7 @@ test('grafana_query adhoc default state: saved adhoc filters expand into the ES 
   }
 })
 
-test('grafana_query adhoc override: passed filters fully replace saved adhoc filters', async () => {
+test('grafana_panel_query adhoc override: passed filters fully replace saved adhoc filters', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1220,22 +1335,22 @@ test('grafana_query adhoc override: passed filters fully replace saved adhoc fil
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({
+    await toolByName(tools, 'grafana_panel_query').execute({
       urlOrUid: 'abc123',
-      variables: JSON.stringify({ Filters: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] }),
+      variables: JSON.stringify({ Filters: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] }),
     }, execution())
 
     assert.equal(queryBodies.length, 1)
     const body = queryBodies[0]
     // 整体替换：lucene 串只含传入条件，不含保存态。
-    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(body.queries[0].query, '(count(*)) AND host.keyword:"www.example.com"')
     assert.ok(!('adhocFilters' in body), 'request must not carry top-level adhocFilters')
   } finally {
     globalThis.fetch = originalFetch
   }
 })
 
-test('grafana_query adhoc multi-operator: = != and numeric > < are expanded into the Lucene query', async () => {
+test('grafana_panel_query adhoc multi-operator: = != and numeric > < are expanded into the Lucene query', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1271,7 +1386,7 @@ test('grafana_query adhoc multi-operator: = != and numeric > < are expanded into
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     const body = queryBodies[0]
     assert.equal(
@@ -1284,7 +1399,7 @@ test('grafana_query adhoc multi-operator: = != and numeric > < are expanded into
   }
 })
 
-test('grafana_query adhoc regex operators map to Lucene regex; non-numeric ranges and bad fields throw', async () => {
+test('grafana_panel_query adhoc regex operators map to Lucene regex; non-numeric ranges and bad fields throw', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const makeDashboard = (filters) => ({
@@ -1313,19 +1428,19 @@ test('grafana_query adhoc regex operators map to Lucene regex; non-numeric range
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
 
     // =~ / !~ → Lucene 正则 field:/pattern/；值内 / 转义为 \/。
     await tool.execute({
       urlOrUid: 'abc123',
       variables: JSON.stringify({ Filters: [
         { key: 'path', operator: '=~', value: '/api/v[12]/.*' },
-        { key: 'host.keyword', operator: '!~', value: 'www.ttpai.cn|m.ttpai.cn' },
+        { key: 'host.keyword', operator: '!~', value: 'www.example.com|m.example.com' },
       ] }),
     }, execution())
     assert.equal(
       queryBodies[0].queries[0].query,
-      '(count(*)) AND path:/\\/api\\/v[12]\\/.*/ AND NOT host.keyword:/www.ttpai.cn|m.ttpai.cn/',
+      '(count(*)) AND path:/\\/api\\/v[12]\\/.*/ AND NOT host.keyword:/www.example.com|m.example.com/',
     )
 
     // 空正则 → 显式报错，禁止生成 field://。
@@ -1360,7 +1475,7 @@ test('grafana_query adhoc regex operators map to Lucene regex; non-numeric range
   }
 })
 
-test('grafana_query adhoc priority: query/custom override and [] clears adhoc', async () => {
+test('grafana_panel_query adhoc priority: query/custom override and [] clears adhoc', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1393,7 +1508,7 @@ test('grafana_query adhoc priority: query/custom override and [] clears adhoc', 
   try {
     const { tools } = createContext()
     // query 变量 override 生效 + adhoc 清空。
-    await toolByName(tools, 'grafana_query').execute({
+    await toolByName(tools, 'grafana_panel_query').execute({
       urlOrUid: 'abc123',
       variables: JSON.stringify({ env: 'prod', Filters: [] }),
     }, execution())
@@ -1413,7 +1528,7 @@ test('grafana_query adhoc priority: query/custom override and [] clears adhoc', 
   }
 })
 
-test('grafana_query adhoc explicit errors: unsupported type, unknown variable, invalid filter, non-ES panel', async () => {
+test('grafana_panel_query adhoc explicit errors: unsupported type, unknown variable, invalid filter, non-ES panel', async () => {
   const originalFetch = globalThis.fetch
   const makeDashboard = (extraVars = [], extraPanels = []) => ({
     id: 7, uid: 'abc123', title: 'Overview', version: 1,
@@ -1443,7 +1558,7 @@ test('grafana_query adhoc explicit errors: unsupported type, unknown variable, i
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
 
     // override 指向 datasource 类型变量但值不是 uid 字符串 → rejects。
     await assert.rejects(
@@ -1503,7 +1618,7 @@ test('grafana_query adhoc explicit errors: unsupported type, unknown variable, i
   }
 })
 
-test('grafana_query adhoc scoping: bound uid expands per target and expression panels stay in one batch request', async () => {
+test('grafana_panel_query adhoc scoping: bound uid expands per target and expression panels stay in one batch request', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1513,7 +1628,7 @@ test('grafana_query adhoc scoping: bound uid expands per target and expression p
         name: 'Filters',
         type: 'adhoc',
         datasource: { type: 'elasticsearch', uid: 'es1' },
-        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -1543,7 +1658,7 @@ test('grafana_query adhoc scoping: bound uid expands per target and expression p
 
   try {
     const { tools } = createContext()
-    const output = await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    const output = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // 单次批量请求：含 __expr__ 面板时表达式引用天然正常（回归：不再按数据源分组拆分）。
     assert.equal(queryBodies.length, 1, 'should send a single batch request')
@@ -1553,7 +1668,7 @@ test('grafana_query adhoc scoping: bound uid expands per target and expression p
     // es1 target（面板 8 的 A）：adhoc 变量绑定 es1 → 拼进 lucene 串。
     const es1Query = queryBodies[0].queries.find((query) => query.refId === 'A')
     assert.ok(es1Query, 'should have es1 query')
-    assert.equal(es1Query.query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(es1Query.query, '(count(*)) AND host.keyword:"www.example.com"')
 
     // 表达式 target（面板 8 的 B）：原样透传，不拼 adhoc。
     const exprQuery = queryBodies[0].queries.find((query) => query.refId === 'B')
@@ -1573,7 +1688,7 @@ test('grafana_query adhoc scoping: bound uid expands per target and expression p
   }
 })
 
-test('grafana_query adhoc scoping: unbound adhoc expands into all non-expr targets in one batch request', async () => {
+test('grafana_panel_query adhoc scoping: unbound adhoc expands into all non-expr targets in one batch request', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1583,7 +1698,7 @@ test('grafana_query adhoc scoping: unbound adhoc expands into all non-expr targe
         name: 'Filters',
         type: 'adhoc',
         // 未绑定 uid（无 datasource 字段）→ 通配所有非 __expr__ 数据源。
-        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -1609,13 +1724,13 @@ test('grafana_query adhoc scoping: unbound adhoc expands into all non-expr targe
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // 仍是单次批量请求；两个 ES target 的 lucene 串都拼上条件（未绑定 → 通配）。
     assert.equal(queryBodies.length, 1, 'should send a single batch request')
     assert.equal(queryBodies[0].queries.length, 2)
     for (const query of queryBodies[0].queries) {
-      assert.match(query.query, /AND host\.keyword:"www\.ttpai\.cn"$/)
+      assert.match(query.query, /AND host\.keyword:"www\.example\.com"$/)
     }
     assert.ok(!('adhocFilters' in queryBodies[0]), 'request must not carry top-level adhocFilters')
   } finally {
@@ -1623,7 +1738,7 @@ test('grafana_query adhoc scoping: unbound adhoc expands into all non-expr targe
   }
 })
 
-test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Lucene clause', async () => {
+test('grafana_panel_query adhoc fallback: per-panel degradation keeps the expanded Lucene clause', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   let queryCalls = 0
@@ -1634,7 +1749,7 @@ test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Luc
         name: 'Filters',
         type: 'adhoc',
         datasource: { type: 'elasticsearch', uid: 'es' },
-        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -1657,7 +1772,7 @@ test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Luc
   }
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // 1 次批量失败 + 2 次逐面板降级；降级请求体同样不含请求级 adhocFilters，
     // 且每个 target 的 lucene 串都带着展开后的 adhoc 条件。
@@ -1665,7 +1780,7 @@ test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Luc
     for (const body of queryBodies) {
       assert.ok(!('adhocFilters' in body), 'no request-level adhocFilters on any path')
       for (const query of body.queries) {
-        assert.match(query.query, /AND host\.keyword:"www\.ttpai\.cn"$/)
+        assert.match(query.query, /AND host\.keyword:"www\.example\.com"$/)
       }
     }
     assert.equal(queryBodies[1].queries.length, 1)
@@ -1675,7 +1790,7 @@ test('grafana_query adhoc fallback: per-panel degradation keeps the expanded Luc
   }
 })
 
-test('grafana_query adhoc prometheus: label matchers injected into every vector selector', async () => {
+test('grafana_panel_query adhoc prometheus: label matchers injected into every vector selector', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1685,7 +1800,7 @@ test('grafana_query adhoc prometheus: label matchers injected into every vector 
         name: 'Filters',
         type: 'adhoc',
         datasource: { type: 'prometheus', uid: 'prom' },
-        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [{
@@ -1713,11 +1828,11 @@ test('grafana_query adhoc prometheus: label matchers injected into every vector 
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     assert.equal(queryBodies.length, 1)
     const queries = queryBodies[0].queries
-    const m = 'host="www.ttpai.cn"'
+    const m = 'host="www.example.com"'
     assert.equal(queries.find((query) => query.refId === 'A').expr, `up{${m}}`)
     assert.equal(
       queries.find((query) => query.refId === 'B').expr,
@@ -1738,7 +1853,7 @@ test('grafana_query adhoc prometheus: label matchers injected into every vector 
   }
 })
 
-test('grafana_query adhoc prometheus: regex operators map to matchers, numeric range throws', async () => {
+test('grafana_panel_query adhoc prometheus: regex operators map to matchers, numeric range throws', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const makeDashboard = (filters) => ({
@@ -1762,7 +1877,7 @@ test('grafana_query adhoc prometheus: regex operators map to matchers, numeric r
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
 
     // =~ / !~ 在 PromQL 里原生支持 → 直接映射为正则 matcher。
     await tool.execute({
@@ -1784,7 +1899,7 @@ test('grafana_query adhoc prometheus: regex operators map to matchers, numeric r
   }
 })
 
-test('grafana_query adhoc loki: matchers injected into stream selectors only', async () => {
+test('grafana_panel_query adhoc loki: matchers injected into stream selectors only', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1794,7 +1909,7 @@ test('grafana_query adhoc loki: matchers injected into stream selectors only', a
         name: 'Filters',
         type: 'adhoc',
         datasource: { type: 'loki', uid: 'loki' },
-        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }, { key: 'level', operator: '!=', value: 'debug' }] },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.example.com' }, { key: 'level', operator: '!=', value: 'debug' }] },
       }],
     },
     panels: [{
@@ -1817,10 +1932,10 @@ test('grafana_query adhoc loki: matchers injected into stream selectors only', a
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     assert.equal(queryBodies.length, 1)
-    const matchers = 'host="www.ttpai.cn",level!="debug"'
+    const matchers = 'host="www.example.com",level!="debug"'
     assert.equal(
       queryBodies[0].queries.find((query) => query.refId === 'A').expr,
       `{app="api",${matchers}} |= "error" | json | line_format "{{.level}}"`,
@@ -1834,7 +1949,7 @@ test('grafana_query adhoc loki: matchers injected into stream selectors only', a
   }
 })
 
-test('grafana_query adhoc sql: conditions replace the ${__adhoc} placeholder in rawSql', async () => {
+test('grafana_panel_query adhoc sql: conditions replace the ${__adhoc} placeholder in rawSql', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1844,7 +1959,7 @@ test('grafana_query adhoc sql: conditions replace the ${__adhoc} placeholder in 
         name: 'Filters',
         type: 'adhoc',
         // 未绑定 → 通配所有数据源（含 MySQL 面板）。
-        current: { value: [{ key: 'host', operator: '=', value: "www.ttpai'cn" }] },
+        current: { value: [{ key: 'host', operator: '=', value: "www.exam'ple.com" }] },
       }],
     },
     panels: [
@@ -1870,17 +1985,17 @@ test('grafana_query adhoc sql: conditions replace the ${__adhoc} placeholder in 
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
 
     // = 映射为带转义的字符串字面量；${__adhoc} 与 $__adhoc 两种占位符都替换。
     await tool.execute({
       urlOrUid: 'abc123',
-      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=', value: "www.ttpai'cn" }] }),
+      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=', value: "www.exam'ple.com" }] }),
     }, execution())
     const body = queryBodies[0]
     // 值内单引号翻倍转义，防注入。
-    assert.equal(body.queries.find((query) => query.refId === 'A').rawSql, "SELECT * FROM logs WHERE host = 'www.ttpai''cn' AND level > 1")
-    assert.equal(body.queries.find((query) => query.refId === 'B').rawSql, "SELECT count(*) FROM t WHERE host = 'www.ttpai''cn'")
+    assert.equal(body.queries.find((query) => query.refId === 'A').rawSql, "SELECT * FROM logs WHERE host = 'www.exam''ple.com' AND level > 1")
+    assert.equal(body.queries.find((query) => query.refId === 'B').rawSql, "SELECT count(*) FROM t WHERE host = 'www.exam''ple.com'")
 
     // != → <>；=~ → LIKE；> 数字 → 裸数字比较。
     queryBodies.length = 0
@@ -1918,7 +2033,7 @@ test('grafana_query adhoc sql: conditions replace the ${__adhoc} placeholder in 
   }
 })
 
-test('grafana_query adhoc mixed datasources stay in one batch request with per-type translation', async () => {
+test('grafana_panel_query adhoc mixed datasources stay in one batch request with per-type translation', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -1928,7 +2043,7 @@ test('grafana_query adhoc mixed datasources stay in one batch request with per-t
         name: 'Filters',
         type: 'adhoc',
         // 未绑定 → 通配所有非 __expr__ 数据源。
-        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -1963,16 +2078,16 @@ test('grafana_query adhoc mixed datasources stay in one batch request with per-t
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
 
     // 单次批量请求：混合数据源（含表达式面板）不拆分。
     assert.equal(queryBodies.length, 1)
     assert.equal(queryBodies[0].queries.length, 4)
     const byRef = Object.fromEntries(queryBodies[0].queries.map((query) => [query.refId, query]))
     // 各类型各自翻译。
-    assert.equal(byRef.A.query, '(count(*)) AND host:"www.ttpai.cn"')
-    assert.equal(byRef.B.expr, 'up{host="www.ttpai.cn"}')
-    assert.equal(byRef.C.rawSql, "SELECT 1 FROM t WHERE host = 'www.ttpai.cn'")
+    assert.equal(byRef.A.query, '(count(*)) AND host:"www.example.com"')
+    assert.equal(byRef.B.expr, 'up{host="www.example.com"}')
+    assert.equal(byRef.C.rawSql, "SELECT 1 FROM t WHERE host = 'www.example.com'")
     // 表达式 target 原样透传。
     assert.equal(byRef.D.expression, '$A * 2')
     assert.ok(!('adhocFilters' in queryBodies[0]))
@@ -1981,7 +2096,7 @@ test('grafana_query adhoc mixed datasources stay in one batch request with per-t
   }
 })
 
-test('grafana_query multi-value variables expand with format modifiers in queries', async () => {
+test('grafana_panel_query multi-value variables expand with format modifiers in queries', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2006,15 +2121,15 @@ test('grafana_query multi-value variables expand with format modifiers in querie
   try {
     const { tools } = createContext()
     // 多值 override + regex 格式修饰符：Grafana 语义是逐值转义正则特殊字符再以 | 连接。
-    await toolByName(tools, 'grafana_query').execute({
+    await toolByName(tools, 'grafana_panel_query').execute({
       urlOrUid: 'abc123',
-      variables: JSON.stringify({ hosts: ['www.ttpai.cn', 'm.ttpai.cn'] }),
+      variables: JSON.stringify({ hosts: ['www.example.com', 'm.example.com'] }),
     }, execution())
-    assert.equal(queryBodies[0].queries[0].expr, 'up{host=~"(www\\.ttpai\\.cn|m\\.ttpai\\.cn)"}')
+    assert.equal(queryBodies[0].queries[0].expr, 'up{host=~"(www\\.example\\.com|m\\.example\\.com)"}')
 
     // csv 等格式修饰符的展开在 target JSON 插值阶段统一生效。
     queryBodies.length = 0
-    await toolByName(tools, 'grafana_query').execute({
+    await toolByName(tools, 'grafana_panel_query').execute({
       urlOrUid: 'abc123',
       variables: JSON.stringify({ hosts: ['a', 'b'] }),
     }, execution())
@@ -2024,7 +2139,7 @@ test('grafana_query multi-value variables expand with format modifiers in querie
   }
 })
 
-test('grafana_query resolves legacy string datasource uids via the datasource index', async () => {
+test('grafana_panel_query resolves legacy string datasource uids via the datasource index', async () => {
   // 旧格式大盘：panel.datasource 是纯字符串 uid（Grafana 8 及更早保存的大盘）。
   const originalFetch = globalThis.fetch
   const queryBodies = []
@@ -2056,7 +2171,7 @@ test('grafana_query resolves legacy string datasource uids via the datasource in
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     assert.ok(apiCalls.some((path) => path.includes('/api/datasources')), 'index must be fetched when a string ref appears')
     assert.equal(queryBodies.length, 1)
     // 字符串 uid 解析出 type，请求体携带完整 {type, uid}。
@@ -2066,7 +2181,7 @@ test('grafana_query resolves legacy string datasource uids via the datasource in
   }
 })
 
-test('grafana_query resolves $datasource references, maps "default", and supports datasource variable override', async () => {
+test('grafana_panel_query resolves $datasource references, maps "default", and supports datasource variable override', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2100,7 +2215,7 @@ test('grafana_query resolves $datasource references, maps "default", and support
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
 
     // 保存态默认值 "default" 映射到 isDefault 数据源；$instance 单值数组裸渲染。
     await tool.execute({ urlOrUid: 'abc123' }, execution())
@@ -2144,7 +2259,7 @@ test('grafana_query resolves $datasource references, maps "default", and support
   }
 })
 
-test('grafana_query skips row-panel leftover targets and dedupes per-panel skip reasons', async () => {
+test('grafana_panel_query skips row-panel leftover targets and dedupes per-panel skip reasons', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2187,7 +2302,7 @@ test('grafana_query skips row-panel leftover targets and dedupes per-panel skip 
 
   try {
     const { tools } = createContext()
-    const tool = toolByName(tools, 'grafana_query')
+    const tool = toolByName(tools, 'grafana_panel_query')
     const out = await tool.execute({ urlOrUid: 'abc123' }, execution())
     // 空载荷 target 绝不发给数据源；$datasourse 引用面板的 expr 原样保留。
     const sentExprs = queryBodies.flatMap((body) => body.queries.map((query) => query.expr))
@@ -2225,7 +2340,7 @@ test('grafana_query skips row-panel leftover targets and dedupes per-panel skip 
   }
 })
 
-test('grafana_query passes unknown datasource uids through when the index is unavailable', async () => {
+test('grafana_panel_query passes unknown datasource uids through when the index is unavailable', async () => {
   // GET /api/datasources 无权限（403）时索引为 null：字符串 uid 原样透传，
   // 由 Grafana 自行解析裸 uid。
   const originalFetch = globalThis.fetch
@@ -2251,14 +2366,14 @@ test('grafana_query passes unknown datasource uids through when the index is una
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     assert.deepEqual(queryBodies[0].queries[0].datasource, { uid: 'unknown-uid' })
   } finally {
     globalThis.fetch = originalFetch
   }
 })
 
-test('grafana_query throws when adhoc filters hit a passthrough datasource of unknown type', async () => {
+test('grafana_panel_query throws when adhoc filters hit a passthrough datasource of unknown type', async () => {
   const originalFetch = globalThis.fetch
   const dashboard = {
     id: 7, uid: 'abc123', title: 'Legacy', version: 1,
@@ -2266,7 +2381,7 @@ test('grafana_query throws when adhoc filters hit a passthrough datasource of un
       list: [{
         name: 'Filters',
         type: 'adhoc',
-        current: { value: [{ key: 'host', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [{
@@ -2286,7 +2401,7 @@ test('grafana_query throws when adhoc filters hit a passthrough datasource of un
     const { tools } = createContext()
     // 索引不可用 + 生效 adhoc：无法安全翻译 → 显式报错（含数据源 uid）。
     await assert.rejects(
-      toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution()),
+      toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution()),
       /cannot be applied to datasource uid "unknown-uid"/,
     )
   } finally {
@@ -2294,7 +2409,7 @@ test('grafana_query throws when adhoc filters hit a passthrough datasource of un
   }
 })
 
-test('grafana_query renders bare multi-value variables as (a|b) inside Prometheus and Loki targets', async () => {
+test('grafana_panel_query renders bare multi-value variables as (a|b) inside Prometheus and Loki targets', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2337,7 +2452,7 @@ test('grafana_query renders bare multi-value variables as (a|b) inside Prometheu
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     const byDs = new Map(queryBodies[0].queries.map((q) => [q.datasource.uid, q]))
     // 多值裸引用 → (a|b)，值保持原样（PromQL 双引号内 \. 是非法转义）；
     // 单值数组保持裸值。
@@ -2350,7 +2465,7 @@ test('grafana_query renders bare multi-value variables as (a|b) inside Prometheu
   }
 })
 
-test('grafana_query adhoc prometheus: leading-colon recording rules receive matchers too', async () => {
+test('grafana_panel_query adhoc prometheus: leading-colon recording rules receive matchers too', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2386,7 +2501,7 @@ test('grafana_query adhoc prometheus: leading-colon recording rules receive matc
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     assert.equal(queryBodies.length, 1)
     const queries = queryBodies[0].queries
     const m = 'instance="web-1"'
@@ -2398,7 +2513,7 @@ test('grafana_query adhoc prometheus: leading-colon recording rules receive matc
   }
 })
 
-test('grafana_query adhoc: saved OR conditions throw instead of being silently rewritten to AND', async () => {
+test('grafana_panel_query adhoc: saved OR conditions throw instead of being silently rewritten to AND', async () => {
   const originalFetch = globalThis.fetch
   const dashboard = {
     id: 7, uid: 'abc123', title: 'Or filters', version: 1,
@@ -2423,7 +2538,7 @@ test('grafana_query adhoc: saved OR conditions throw instead of being silently r
   try {
     const { tools } = createContext()
     await assert.rejects(
-      () => toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution()),
+      () => toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution()),
       (error) => error instanceof Error && /OR/.test(error.message) && /Filters/.test(error.message),
     )
   } finally {
@@ -2431,7 +2546,7 @@ test('grafana_query adhoc: saved OR conditions throw instead of being silently r
   }
 })
 
-test('grafana_query adhoc scoping: legacy datasource-name binding resolves through the index', async () => {
+test('grafana_panel_query adhoc scoping: legacy datasource-name binding resolves through the index', async () => {
   // 旧格式大盘的 adhoc variable.datasource 是数据源“名称”字符串而非 uid，
   // 必须经索引解析到真实 uid 后再做绑定匹配，不能静默丢过滤。
   const originalFetch = globalThis.fetch
@@ -2443,7 +2558,7 @@ test('grafana_query adhoc scoping: legacy datasource-name binding resolves throu
         name: 'Filters',
         type: 'adhoc',
         datasource: 'Prod ES',
-        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -2476,17 +2591,17 @@ test('grafana_query adhoc scoping: legacy datasource-name binding resolves throu
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     assert.equal(queryBodies.length, 1)
     const queries = queryBodies[0].queries
-    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.example.com"')
     assert.equal(queries.find((q) => q.refId === 'B').query, 'count(*)')
   } finally {
     globalThis.fetch = originalFetch
   }
 })
 
-test('grafana_query adhoc scoping: "default" pseudo uid binding maps to the default datasource', async () => {
+test('grafana_panel_query adhoc scoping: "default" pseudo uid binding maps to the default datasource', async () => {
   const originalFetch = globalThis.fetch
   const queryBodies = []
   const dashboard = {
@@ -2496,7 +2611,7 @@ test('grafana_query adhoc scoping: "default" pseudo uid binding maps to the defa
         name: 'Filters',
         type: 'adhoc',
         datasource: 'default',
-        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.ttpai.cn' }] },
+        current: { value: [{ key: 'host.keyword', operator: '=', value: 'www.example.com' }] },
       }],
     },
     panels: [
@@ -2529,10 +2644,10 @@ test('grafana_query adhoc scoping: "default" pseudo uid binding maps to the defa
 
   try {
     const { tools } = createContext()
-    await toolByName(tools, 'grafana_query').execute({ urlOrUid: 'abc123' }, execution())
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
     assert.equal(queryBodies.length, 1)
     const queries = queryBodies[0].queries
-    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.ttpai.cn"')
+    assert.equal(queries.find((q) => q.refId === 'A').query, '(count(*)) AND host.keyword:"www.example.com"')
     assert.equal(queries.find((q) => q.refId === 'B').query, 'count(*)')
   } finally {
     globalThis.fetch = originalFetch
@@ -2540,11 +2655,13 @@ test('grafana_query adhoc scoping: "default" pseudo uid binding maps to the defa
 })
 
 test('internals exports the stable debug surface across the lib/ split', () => {
-  // internals 是测试与调试依赖的稳定契约：lib/ 拆分后键集合不得增减或更名。
+  // internals 是测试与调试依赖的稳定契约：lib/ 拆分后既有键不得更名或移除；
+  // 新增的横切基建（预算计数、凭证脱敏、失败翻译）按同一规则只追加。
   assert.deepEqual(Object.keys(internals).sort(), [
     'approvalReason',
     'approvalUid',
     'cloneApprovalReason',
+    'createBudget',
     'dashboardSummary',
     'diffDashboards',
     'interpolateVariables',
@@ -2552,8 +2669,10 @@ test('internals exports the stable debug surface across the lib/ split', () => {
     'parseDashboardUrl',
     'parseUid',
     'readLimitedText',
+    'redactSecrets',
     'safeApiErrorDetail',
     'summarizeFrames',
+    'translateApiFailure',
   ])
   for (const key of Object.keys(internals)) {
     assert.equal(typeof internals[key], 'function', `internals.${key} must stay a function`)
@@ -2595,22 +2714,22 @@ test('tools resolve the source argument by name or id, fall back to the default,
 
     // 按名称选源：health 第一跳 URL 证明命中 eu。
     calls.length = 0
-    await toolByName(tools, 'grafana_health').execute({ source: 'eu' }, execution())
+    await toolByName(tools, 'grafana_status').execute({ source: 'eu' }, execution())
     assert.equal(calls[0], 'https://eu.example.com/api/health')
 
     // 按 id 选源同样命中 eu（名称优先、id 兜底）。
     calls.length = 0
-    await toolByName(tools, 'grafana_health').execute({ source: 'id-eu' }, execution())
+    await toolByName(tools, 'grafana_status').execute({ source: 'id-eu' }, execution())
     assert.equal(calls[0], 'https://eu.example.com/api/health')
 
     // 省略 source：用默认源站 prod。
     calls.length = 0
-    await toolByName(tools, 'grafana_health').execute({}, execution())
+    await toolByName(tools, 'grafana_status').execute({}, execution())
     assert.equal(calls[0], 'https://prod.example.com/api/health')
 
     // 未知源站：抛错并提示用 grafana_sources 查看。
     await assert.rejects(
-      toolByName(tools, 'grafana_health').execute({ source: 'nope' }, execution()),
+      toolByName(tools, 'grafana_status').execute({ source: 'nope' }, execution()),
       /Unknown Grafana source "nope"/,
     )
   } finally {
@@ -2628,7 +2747,7 @@ test('resolveSource throws when several sources exist with no default and none i
     defaultSource: '',
   })
   await assert.rejects(
-    toolByName(tools, 'grafana_health').execute({}, execution()),
+    toolByName(tools, 'grafana_status').execute({}, execution()),
     /Multiple Grafana sources are configured/,
   )
 })
