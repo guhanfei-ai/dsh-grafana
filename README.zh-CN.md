@@ -73,7 +73,7 @@ Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件�
 
 ## 配置
 
-在 DSH Web 中打开 **设置 → 插件 → Grafana dashboard editor**。
+在 DSH Web 中打开 **设置 → 插件 → Grafana 助手**。
 
 > 提示：设置页按 Host 端注册的 settings 命名空间派发插件卡片（`grafana`）。命名空间列表只在设置文档变更或连接重置时刷新，因此升级插件后如果卡片没有出现，刷新页面（或重连 Web UI）即可。
 

@@ -92,8 +92,8 @@ window.__ModuleLoader__.load({
 
 		const STRINGS = {
 			zh: {
-				title: "Grafana 仪表盘编辑器",
-				desc: "配置一个或多个具名 Grafana 源站，通过对话安全地获取并更新仪表盘。令牌仅保存在本地，永远不会被显示。",
+				title: "Grafana 助手",
+				desc: "让DSH连接多个Grafana源站；人类讲需求，AI去干活；省掉一堆繁琐手工操作（仪表盘绘制、数据查询、结论整合）等工作。",
 				sourcesHeading: "Grafana 源站",
 				sourcesEmpty: "尚未配置源站。点击“新增源站”添加一个。",
 				addSource: "新增源站",
@@ -128,8 +128,8 @@ window.__ModuleLoader__.load({
 				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。"
 			},
 			en: {
-				title: "Grafana dashboard editor",
-				desc: "Configure one or more named Grafana sources, then fetch and safely update dashboards through conversation. The token is stored locally and never displayed.",
+				title: "Grafana assistant",
+				desc: "Connect DSH to multiple Grafana sources; you describe the need and the AI does the work, cutting out tedious manual chores (drawing dashboards, querying data, consolidating conclusions) and more.",
 				sourcesHeading: "Grafana sources",
 				sourcesEmpty: "No sources yet. Click “Add source” to create one.",
 				addSource: "Add source",

@@ -73,7 +73,7 @@ The old names stay registered as error-only stubs: calling `grafana_query` or `g
 
 ## Configuration
 
-In DSH Web, open **Settings → Plugins → Grafana dashboard editor**.
+In DSH Web, open **Settings → Plugins → Grafana assistant**.
 
 > Note: the settings page dispatches plugin cards by the settings namespace registered on the Host (`grafana`). The served-namespace list is re-read only on settings-document commits or connection resets, so if the card does not appear right after upgrading the plugin, refresh the page (or reconnect the Web UI).
 
