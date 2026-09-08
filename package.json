@@ -1,6 +1,6 @@
 {
   "name": "dsh-grafana",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "Conversational Grafana operations for DeepSeek Harness: inspect live observability data and make safe, reviewable dashboard changes",
   "type": "module",
   "main": "index.js",
