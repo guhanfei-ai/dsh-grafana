@@ -83,9 +83,11 @@ test('normalizeBaseUrl allows HTTP out of the box and can enforce HTTPS only', (
 })
 
 test('readLimitedText rejects oversized responses', async () => {
+  // 超限是硬顶（响应须整体解析，无法按条目截断）：文案必须告诉用户下一步
+  // 该做什么，而不是只报一个字节数。
   await assert.rejects(
     internals.readLimitedText(new Response('12345'), 4),
-    /exceeds the 4-byte limit/,
+    /exceeds the 4-byte limit\. Narrow the request \(filters, aggregation, a shorter range\) or ask for a smaller shape\./,
   )
 })
 
@@ -881,6 +883,153 @@ test('grafana_panel_query falls back to per-panel queries when the batch request
     assert.match(output, /panel id=1 "One":/)
     assert.match(output, /panel id=2 "Two":/)
     assert.match(output, /last=7/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// datasource 型模板变量的已存值指向不存在的数据源时，坏 uid 被原样透传给
+// /api/ds/query，Grafana 弹回 404/502——此前只透传上游文本，用户无从得知
+// 根因是「变量已存值失效，传 variables 覆盖即可救活」（真机实测场景）。
+test('grafana_panel_query explains a stale datasource-variable value on 404/502', async () => {
+  const originalFetch = globalThis.fetch
+  const dsIndex = [{ uid: 'prom-prod', type: 'prometheus', name: 'Prom', isDefault: true, access: 'proxy', url: 'https://prom.example.com' }]
+  const dashboard = {
+    id: 9, uid: 'abc123', title: 'Stale DS', version: 1,
+    templating: { list: [{ name: 'datasource', type: 'datasource', current: { value: 'gone-uid' } }] },
+    panels: [
+      { id: 1, type: 'timeseries', title: 'CPU', targets: [{ refId: 'A', datasource: { uid: '$datasource' }, expr: 'up' }] },
+    ],
+  }
+  const stubQuery = (status) => async (url) => {
+    if (String(url).endsWith('/api/datasources')) return jsonResponse(dsIndex)
+    if (String(url).includes('/api/ds/query')) return jsonResponse({ message: 'Data source not found' }, status)
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_panel_query')
+
+    // 404：上游文本 + 实际解析出的 uid + 变量名 + 覆盖办法（实测验证过有效）。
+    globalThis.fetch = stubQuery(404)
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /^Grafana API 404 POST \/api\/ds\/query: Data source not found/)
+        assert.match(error.message, /datasource uid "gone-uid" came from template variable "datasource"/)
+        assert.match(error.message, /saved value is stale or points at a broken datasource/)
+        assert.match(error.message, /pass variables=\{"datasource":"<valid uid>"\}/)
+        assert.match(error.message, /grafana_datasources lists the uids and their URLs/)
+        return true
+      },
+    )
+
+    // 实弹复测场景（修复前未生效）：变量的已存值命中索引——指向列表里仍存在、
+    // 但 /api/ds/query 一查即 404 的坏源（如 URL 为空的源）。解析不是 passthrough，
+    // 溯源同样必须触发：出路仍是传 variables 换一个好源。
+    const brokenInListDashboard = {
+      ...dashboard,
+      templating: { list: [{ name: 'datasource', type: 'datasource', current: { value: 'broken-in-list' } }] },
+    }
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith('/api/datasources')) return jsonResponse([...dsIndex, { uid: 'broken-in-list', type: 'prometheus', name: 'Broken', access: 'proxy', url: '' }])
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ message: 'Data source not found' }, 404)
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: brokenInListDashboard })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /Grafana API 404 POST \/api\/ds\/query: Data source not found/)
+        assert.match(error.message, /datasource uid "broken-in-list" came from template variable "datasource"/)
+        assert.match(error.message, /pass variables=\{"datasource":"<valid uid>"\}/)
+        return true
+      },
+    )
+
+    // 502 同样触发回溯提示（坏源/网关故障时上游常以 502 表达）。
+    globalThis.fetch = stubQuery(502)
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      /datasource uid "gone-uid" came from template variable "datasource"/,
+    )
+
+    // 400 是查询语法错，与数据源引用无关：不附加提示。
+    globalThis.fetch = stubQuery(400)
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /^Grafana API 400 POST \/api\/ds\/query/)
+        assert.doesNotMatch(error.message, /came from template variable/)
+        return true
+      },
+    )
+
+    // 直存 uid（非变量引用）查无此源：提示换成「面板保存的数据源已不存在」。
+    const staleUidDashboard = {
+      ...dashboard,
+      templating: { list: [] },
+      panels: [{ id: 1, type: 'timeseries', title: 'CPU', targets: [{ refId: 'A', datasource: { uid: 'gone-uid' }, expr: 'up' }] }],
+    }
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith('/api/datasources')) return jsonResponse(dsIndex)
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ message: 'Data source not found' }, 404)
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: staleUidDashboard })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      /datasource uid "gone-uid" was saved in the dashboard and does not exist on this source; edit the panel's datasource or override the variable/,
+    )
+
+    // 对照：直存 uid（非变量引用）命中索引时，404 与变量无关，不附加提示
+    // （变量引用则无论命中与否都溯源——换源是出路；直存命中索引的 404 无从
+    // 给出更可行动的指引，保持无噪音）。
+    const directHealthyDashboard = {
+      ...dashboard,
+      templating: { list: [] },
+      panels: [{ id: 1, type: 'timeseries', title: 'CPU', targets: [{ refId: 'A', datasource: { type: 'prometheus', uid: 'prom-prod' }, expr: 'up' }] }],
+    }
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith('/api/datasources')) return jsonResponse(dsIndex)
+      if (String(url).includes('/api/ds/query')) return jsonResponse({ message: 'Data source not found' }, 404)
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: directHealthyDashboard })
+    }
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /Grafana API 404 POST \/api\/ds\/query/)
+        assert.doesNotMatch(error.message, /came from template variable|does not exist on this source/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 多面板批量 404 → 逐面板降级仍 404：每个 failed 行都带回溯提示（同一变量
+// 数据源的面板整盘如此，提示逐行可见而不是只藏在降级说明里）。
+test('grafana_panel_query keeps the stale-variable hint on per-panel fallback failures', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = {
+    id: 9, uid: 'abc123', title: 'Stale DS', version: 1,
+    templating: { list: [{ name: 'datasource', type: 'datasource', current: { value: 'gone-uid' } }] },
+    panels: [
+      { id: 1, type: 'stat', title: 'One', targets: [{ refId: 'A', datasource: { uid: '$datasource' }, expr: 'one' }] },
+      { id: 2, type: 'stat', title: 'Two', targets: [{ refId: 'B', datasource: { uid: '$datasource' }, expr: 'two' }] },
+    ],
+  }
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/datasources')) return jsonResponse([{ uid: 'prom-prod', type: 'prometheus', name: 'Prom', isDefault: true, access: 'proxy', url: 'https://prom.example.com' }])
+    if (String(url).includes('/api/ds/query')) return jsonResponse({ message: 'Data source not found' }, 404)
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard })
+  }
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
+    assert.match(output, /fell back to per-panel queries\./)
+    const hint = ' — datasource uid "gone-uid" came from template variable "datasource"; if that saved value is stale or points at a broken datasource, pass variables={"datasource":"<valid uid>"} (grafana_datasources lists the uids and their URLs)'
+    assert.match(output, new RegExp(`query A: failed: Grafana API 404 POST /api/ds/query: Data source not found${hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+    assert.match(output, new RegExp(`query B: failed: Grafana API 404 POST /api/ds/query: Data source not found${hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   } finally {
     globalThis.fetch = originalFetch
   }

@@ -9,6 +9,7 @@ import {
   MAX_METRIC_EXPR_CHARS,
   MAX_METRIC_SERIES,
   MAX_METRIC_SERIES_LIMIT,
+  MAX_RESPONSE_BYTES,
   MAX_TOTAL_TREND_POINTS,
   METRIC_DEFAULT_POINTS,
   METRIC_MAX_POINTS,
@@ -118,9 +119,10 @@ async function assertNoWriteSnapshot(listeners) {
 // ── 纯函数：过滤与渲染 ─────────────────────────────────────────────────────
 
 const DS_LIST = [
-  { uid: 'prom-prod', type: 'prometheus', name: 'Prometheus Prod', isDefault: true, access: 'proxy' },
-  { uid: 'loki-1', type: 'loki', name: 'Loki Logs', access: 'proxy' },
-  { uid: 'mysql-1', type: 'mysql', name: 'Billing DB', access: 'proxy' },
+  { uid: 'prom-prod', type: 'prometheus', name: 'Prometheus Prod', isDefault: true, access: 'proxy', url: 'https://prom.example.com' },
+  { uid: 'loki-1', type: 'loki', name: 'Loki Logs', access: 'proxy', url: 'https://loki.example.com' },
+  // 空 url：配置坏的数据源（一查即 502 empty url），列表里必须看得出来。
+  { uid: 'mysql-1', type: 'mysql', name: 'Billing DB', access: 'proxy', url: '' },
   { uid: '   ', type: 'prometheus', name: 'No UID' },
   null,
 ]
@@ -145,14 +147,17 @@ test('filterDatasources matches type exactly and name case-insensitively', () =>
 
 test('formatDatasourceRows renders one sanitized row per datasource', () => {
   assert.deepEqual(formatDatasourceRows([DS_LIST[0]]), [
-    'uid="prom-prod" type=prometheus name="Prometheus Prod" default=yes access=proxy',
+    'uid="prom-prod" type=prometheus name="Prometheus Prod" default=yes access=proxy url="https://prom.example.com"',
   ])
-  // 缺字段落 "?"，非默认落 no。
-  assert.deepEqual(formatDatasourceRows([{ uid: 'x' }]), ['uid="x" type=? name="" default=no access=?'])
-  // 名称里的换行被压平：数据源名由维护者填写，属不可信输入，不得伪造输出行。
-  const rows = formatDatasourceRows([{ uid: 'y', type: 'loki', name: 'a\nFORGED', access: 'proxy' }])
+  // 缺字段落 "?"，非默认落 no；url 空/缺失显式渲染 "(empty)"——坏源在查询前可见。
+  assert.deepEqual(formatDatasourceRows([{ uid: 'x' }]), ['uid="x" type=? name="" default=no access=? url="(empty)"'])
+  assert.deepEqual(formatDatasourceRows([DS_LIST[2]]), [
+    'uid="mysql-1" type=mysql name="Billing DB" default=no access=proxy url="(empty)"',
+  ])
+  // 名称与 url 里的换行被压平：数据源名/URL 由维护者填写，属不可信输入，不得伪造输出行。
+  const rows = formatDatasourceRows([{ uid: 'y', type: 'loki', name: 'a\nFORGED', access: 'proxy', url: 'https://x.example.com\nFORGED' }])
   assert.equal(rows.length, 1)
-  assert.equal(rows[0], 'uid="y" type=loki name="a FORGED" default=no access=proxy')
+  assert.equal(rows[0], 'uid="y" type=loki name="a FORGED" default=no access=proxy url="https://x.example.com FORGED"')
   assert.doesNotMatch(rows.join('\n'), /^FORGED/m)
   assert.deepEqual(formatDatasourceRows(null), [])
 })
@@ -466,8 +471,10 @@ test('grafana_datasources lists datasources with bounded, sanitized rows', async
 
     const lines = out.split('\n')
     assert.equal(lines.length, 3)
-    assert.equal(lines[0], 'uid="prom-prod" type=prometheus name="Prometheus Prod" default=yes access=proxy')
-    assert.equal(lines[1], 'uid="loki-1" type=loki name="Loki Logs" default=no access=proxy')
+    assert.equal(lines[0], 'uid="prom-prod" type=prometheus name="Prometheus Prod" default=yes access=proxy url="https://prom.example.com"')
+    assert.equal(lines[1], 'uid="loki-1" type=loki name="Loki Logs" default=no access=proxy url="https://loki.example.com"')
+    // 空 url 的源显示 "(empty)"：配置坏的数据源在查询前就看得出来。
+    assert.equal(lines[2], 'uid="mysql-1" type=mysql name="Billing DB" default=no access=proxy url="(empty)"')
 
     assert.equal(await tool.execute({ type: 'prometheus' }, execution()), lines[0])
     assert.match(await tool.execute({ nameContains: 'LOGS' }, execution()), /^uid="loki-1" /)
@@ -888,6 +895,39 @@ test('grafana_trend keeps variable overrides, adhoc filters, and maxPanels worki
   }
 })
 
+// 趋势工具与 grafana_panel_query 共用 runPanelQueries：datasource 型模板变量
+// 已存值失效（索引查无此源 → 透传 → 404）时，单查询直发的错误同样带回溯提示。
+test('grafana_trend shares the stale-datasource-variable hint through the panel pipeline', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/api/dashboards/uid/')) {
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: {
+        id: 7, uid: 'abc123', title: 'Stale', version: 1,
+        templating: { list: [{ name: 'datasource', type: 'datasource', current: { value: 'gone-uid' } }] },
+        panels: [{ id: 1, type: 'timeseries', title: 'Load', targets: [{ refId: 'A', datasource: { uid: '$datasource' }, expr: 'up' }] }],
+      } })
+    }
+    if (String(url).endsWith('/api/datasources')) {
+      return jsonResponse([{ uid: 'prom-prod', type: 'prometheus', name: 'Prom', isDefault: true, access: 'proxy', url: 'https://prom.example.com' }])
+    }
+    return jsonResponse({ message: 'Data source not found' }, 404)
+  }
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, execution()),
+      (error) => {
+        assert.match(error.message, /Grafana API 404 POST \/api\/ds\/query: Data source not found/)
+        assert.match(error.message, /datasource uid "gone-uid" came from template variable "datasource"/)
+        assert.match(error.message, /pass variables=\{"datasource":"<valid uid>"\}/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('grafana_trend drops whole series past the total point budget and says so', async () => {
   const originalFetch = globalThis.fetch
   const bodies = []
@@ -964,6 +1004,32 @@ test('grafana_trend stops the per-panel fallback when the tool time budget is ex
     assert.match(out, /panel id=1 "CPU": query A: failed: tool time budget exhausted before this panel could be retried/)
     assert.match(out, /panel id=2 "Ratio": query A: failed: tool time budget exhausted before this panel could be retried/)
     assert.doesNotMatch(out, /This operation was aborted/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_metric turns the response-size hard limit into an actionable error', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/datasources')) return jsonResponse(METRIC_DS)
+    // 高基数查询（如对大环境裸查 up）的真实形状：响应体超过 2MB 上限。
+    return new Response('x'.repeat(MAX_RESPONSE_BYTES + 1), { status: 200 })
+  }
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      toolByName(tools, 'grafana_metric').execute({ datasource: 'prom-prod', expr: 'up' }, execution()),
+      (error) => {
+        // 上限本身 + 通用建议（来自 readLimitedText）+ 裸查询场景的聚合建议。
+        assert.match(error.message, /Grafana response exceeds the \d+-byte limit\. Narrow the request/)
+        assert.match(error.message, /cut the series count with aggregation/)
+        assert.match(error.message, /count\(up\)/)
+        // 不把 range 模式指成出路：它只降每序列点数，不降序列数。
+        assert.match(error.message, /range mode downsamples points per series but does not reduce the series count/)
+        return true
+      },
+    )
   } finally {
     globalThis.fetch = originalFetch
   }
