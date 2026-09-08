@@ -394,7 +394,11 @@ window.__ModuleLoader__.load({
 				setSaving(true); setSaved(false); setError("");
 				try {
 					await face.writeSources(nextSources, nextDefault);
-					if (target.tokenConfigured) await face.unsetToken(target.tokenRef);
+					// 令牌清理失败不回滚移除：源站已删，残留的只是凭证库里一条无引用的
+					// 孤儿条目（下次 id 是全新 UUID，不会复用该 ref），不值得让用户重试整个移除。
+					if (target.tokenConfigured) {
+						try { await face.unsetToken(target.tokenRef); } catch { /* 孤儿凭证，无害 */ }
+					}
 					await reread();
 					setSaved(true);
 				} catch (e) {
@@ -593,27 +597,28 @@ window.__ModuleLoader__.load({
 				if (!credentials?.unset) throw new Error(HOST_UNSUPPORTED);
 				unwrap(await credentials.unset(ref), "credentials.unset");
 			},
-			// 写入整个 sources 数组 + defaultSource。两步：先 mutate unset ['sources']
-			// 清掉旧数组（避免 update 对数组按下标深合并留下陈旧项），再 update 写新值。
-			// 两者均为位置参数：mutate(ns, ops, expectedRevision?) / update(ns, patch, revision?)，
-			// 第三参留空表示不做乐观并发校验。op 形状 { op:"unset", path:string[] } 与
-			// dsh-api-remotes 的 settings_mutate_parameter_1 schema 逐字一致。
+			// 写入整个 sources 数组 + defaultSource。单次 mutate 双 set op：set 对目标路径
+			// 整体赋值（数组整体替换，不做按下标合并），两个 op 在宿主写队列的单个事务里
+			// 一起应用、一起持久化——此前「先 mutate unset 再 update」两步写在第二步失败时，
+			// sources 已被清空而新值未落地，存量用户的全部源站配置会当场丢失。
+			// 位置参数：mutate(ns, ops, expectedRevision?)。网关按声明参数表严格校验 arity
+			// （dsh-api-gateway prepareInvocation：values.length !== descriptor.parameters.length
+			// 即抛 `client api: <endpoint> expected N argument(s), got M`，0.1.2-rc.1 真机实测），
+			// 第三参类型上是 union([undefined, number()]) 但 arity 上不可省，故显式传 void 0
+			// 表示不做乐观并发校验（官方 agent-preset 包同此写法）。
 			writeSources: async (sources, defaultSource) => {
 				const settings = settingsApi();
-				if (!settings?.mutate || !settings?.update) throw new Error(HOST_UNSUPPORTED);
+				if (!settings?.mutate) throw new Error(HOST_UNSUPPORTED);
 				const normalized = sources.map((s) => ({
 					id: s.id,
 					name: s.name,
 					baseUrl: s.baseUrl,
 					tokenRef: s.tokenRef || tokenRefForId(s.id)
 				}));
-				// 网关按声明参数表严格校验 arity（dsh-api-gateway prepareInvocation：
-				// values.length !== descriptor.parameters.length 即抛
-				// `client api: <endpoint> expected N argument(s), got M`，0.1.2-rc.1 真机实测）。
-				// 第三参 expectedRevision 类型上是 union([undefined, number()])，但 arity 上不可省，
-				// 故显式传 void 0 表示不做乐观并发校验（官方 agent-preset 包同此写法）。
-				unwrap(await settings.mutate(SETTINGS_NS, [{ op: "unset", path: ["sources"] }], void 0), "settings.mutate");
-				unwrap(await settings.update(SETTINGS_NS, { sources: normalized, defaultSource }, void 0), "settings.update");
+				unwrap(await settings.mutate(SETTINGS_NS, [
+					{ op: "set", path: ["sources"], value: normalized },
+					{ op: "set", path: ["defaultSource"], value: defaultSource },
+				], void 0), "settings.mutate");
 			},
 			// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
 			// 语言只是外观，失败不值得报错打断卡片，故这里吸掉异常退回浏览器语言。

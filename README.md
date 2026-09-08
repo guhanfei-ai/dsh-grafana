@@ -56,6 +56,21 @@ Restart the selected DSH profile after installation.
 
 On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform; `deploy.sh` requires Git Bash, WSL, macOS, or Linux.
 
+## Upgrading to 0.12.0
+
+**Two tools were renamed.** `grafana_query` is now `grafana_panel_query`, and `grafana_health` is now `grafana_status`. Parameters, outputs, timeouts, and approval behavior are unchanged.
+
+| Before | After |
+| --- | --- |
+| `grafana_query` | `grafana_panel_query` |
+| `grafana_health` | `grafana_status` |
+
+The old names stay registered as error-only stubs: calling `grafana_query` or `grafana_health` fails immediately with a message naming the new tool, so an ongoing conversation recovers in one step. Custom prompts and saved workflows that reference the old names should still be updated, and per-agent tool allowlists need the new names.
+
+**The browser settings card requires DSH 0.1.2 or newer.** On older hosts (0.1.0–0.1.1) the card shows an explicit "host too old" notice instead of the source list — that is a version gate, not lost configuration. All host-side tools keep working on those hosts, and the plugin still installs on `0.1.0-rc.6` and newer.
+
+**Configuration migrates automatically.** A single-source configuration from earlier versions is materialized into a named `default` source on startup (same base URL, same stored token). No manual step is required, and the migration never overwrites a configuration you saved while it was running.
+
 ## Configuration
 
 In DSH Web, open **Settings → Plugins → Grafana dashboard editor**.
@@ -156,7 +171,7 @@ Every tool accepts an optional `source` argument (a configured source name) to p
 | `grafana_datasources` | Lists the datasources provisioned on a source (uid, plugin type, display name, whether it is the default, access mode). Filter by exact plugin type or a case-insensitive name substring; at most 40 rows, with any dropped rows disclosed on a final budget line. Call it before `grafana_metric` to learn which uid or name to query. Read-only. |
 | `grafana_metric` | Runs one bare-text query (PromQL such as `up` or `rate(http_requests_total[5m])`, or a LogQL stream selector) directly against a Prometheus or Loki datasource, addressed by uid or exact display name — no dashboard needed. `mode: "instant"` (default) evaluates once at the range end; `mode: "range"` samples the series and reports per-series stats, a rising/falling/flat verdict, and a sparkline (a range query against loki returns log lines rather than numeric samples, so those series report a line count and the last line instead; on loki, instant mode accepts metric queries only — use range for log-stream selectors). Other plugin types and server-side expressions are rejected with a pointer to `grafana_panel_query`. Read-only; records no write snapshot. |
 | `grafana_trend` | Answers "is it going up or down?" for a dashboard's panels in one call: every visible query target is re-run as a coarse range query and each series is reported with bucket count, first/last/min/max/avg, a direction verdict, and a sparkline. Table-shaped results report rows and stats with `trend=n/a` rather than a fabricated direction. Uses the same panel pipeline as `grafana_panel_query` (variables, adhoc filters, legacy datasource references, per-panel fallback). The range may span at most 90 days. Read-only; records no write snapshot. |
-| `grafana_alerts` | Lists the alerts currently firing on a source from the built-in Alertmanager (default `state=firing`; `"suppressed"` for silenced/inhibited, `"all"` for both). Filter by folder, a case-insensitive substring across labels and annotations, or a dashboard URL/uid. `definitions: true` appends the provisioned alert rule definitions in a second request (its own permission, its own failure isolation). Read-only; alert text is untrusted data. |
+| `grafana_alerts` | Lists the alerts currently firing on a source from the built-in Alertmanager (default `state=firing`; `"suppressed"` for silenced/inhibited, `"all"` for both). Filter by folder, a case-insensitive substring across labels and annotations, or a dashboard URL/uid. Active alerts are capped at the `limit` argument (default 30, max 100) and rule definitions at 100 rows; anything dropped is disclosed on a final budget line. `definitions: true` appends the provisioned alert rule definitions in a second request (its own permission, its own failure isolation). Read-only; alert text is untrusted data. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_status` | Checks connectivity and service-account validity. |
 | `grafana_sources` | Lists the configured Grafana sources: each name, its read-only UID, base URL, whether its token is configured, and which one is the default. Read-only; never returns token values. Use it to discover valid source names before passing `source` to other tools. |

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The pre-0.12.0 tool names stay registered as error-only stubs: calling `grafana_query` or `grafana_health` fails immediately with a message naming the new tool (`grafana_panel_query` / `grafana_status`), so an existing conversation recovers in one step instead of hitting an unregistered-tool error that does not point anywhere. The stubs issue no requests, never enter the approval gate, and record no write snapshot. Per-agent tool allowlists and saved workflows should still be updated to the new names.
+
+### Fixed
+
+- Sources are saved in one atomic settings transaction. The client previously wrote them in two steps — `mutate(unset ['sources'])` followed by `update(...)` — so a failure of the second step left the sources array cleared with the new value never written, losing every configured source at once. Both fields are now sent as two `set` ops inside a single `mutate` call, which the host applies and persists as one unit: a rejected write leaves the stored list untouched. Verified against the host-side `@deepseek-ai/dsh-settings` implementation (op arrays apply in one write-queue transaction; `set` replaces a path value wholesale, arrays included).
+- The startup legacy migration now refuses to overwrite a configuration that was saved while the migration was in flight. It reads the settings namespace together with its revision and carries that revision into the write, so a concurrent user save — which advances the revision — makes the host reject the migration with a conflict instead of materializing a default source over the just-saved list. When the revision is unavailable (older hosts), the write degrades to the previous unconditional behavior.
+- Timeout budgets were aligned with each tool's worst-case request chain. A single `api()` GET can cost `2 × REQUEST_TIMEOUT_MS + retry delay ≈ 30.2s` (one retry on network errors and 502/503/504), but the tool-level timeouts only budgeted one round: `grafana_status` (two sequential GETs, worst 60.4s) ran with 35s, and `grafana_metric` (datasources GET + query POST, worst 60.2s) and `grafana_alerts` (two sequential GETs) ran with 45s — the host's tool abort fired first, so the model saw `timed out or was cancelled: POST /api/ds/query` and blamed the wrong request. `TOOL_TIMEOUT_MS` / `METRIC_TOOL_TIMEOUT_MS` / `ALERT_TOOL_TIMEOUT_MS` are now 75s, covering the worst chains with headroom (`grafana_push`/`grafana_clone` at worst 45.2s are covered by the same raise). `grafana_panel_query` keeps its 90s and `grafana_trend` its 120s tool budget: the trend fallback chain has no inherent cap (up to 50 panels), which the next entry addresses.
+- The per-panel fallback in `grafana_panel_query` and `grafana_trend` now stops cleanly when the tool time budget is exhausted. Previously the host aborted `exec.signal` at the timeout while the fallback kept issuing one request per panel — every one failed instantly with `timed out or was cancelled`, producing a wall of misleading `failed:` rows that read like "every datasource is down". Panels not retried after the abort are now marked `failed: tool time budget exhausted before this panel could be retried`, distinguishing the tool's own deadline from datasource faults.
+- An abort while reading a response body (server returned headers, then the body stream stalled past the timeout) no longer escapes the error translation layer: it used to surface as the platform's bare `This operation was aborted`, and now reports the same `Grafana API request timed out or was cancelled: <METHOD> <path>` as a fetch abort. A non-`Error` abort reason from the host no longer propagates raw out of the retry delay, either.
+- `grafana_metric` no longer swallows an in-band query error. `/api/ds/query` can answer HTTP 200 with `results.<refId>.error` (datasource disabled, query refused); the tool used to render that as `series=0`, which reads as "no data". The error is now thrown with its upstream reason (sanitized, bounded), matching the panel pipeline's handling of the same shape.
+- Truncation disclosure now covers the two remaining silent caps: `grafana_search` reports dropped rows past its 50-row cap on a final `budget:` line, and `grafana_get`'s `summary: true` mode does the same for lines past its 150-line cap, both matching the budget-line convention every other truncating tool already follows.
+
 ## [0.12.0]
 
 ### Added
@@ -24,7 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   | `grafana_query` | `grafana_panel_query` |
   | `grafana_health` | `grafana_status` |
 
-  Nothing else changed: parameters, outputs, timeouts, limits, approval behavior, and read/write semantics are identical, and the only edited error text is the tool name inside the adhoc-related messages. Per-agent tool allowlists, saved workflows, and any prompt or script that calls the old names must be updated. The matching internal exports were renamed too (`defineGrafanaQueryTool` → `defineGrafanaPanelQueryTool`, `defineGrafanaHealthTool` → `defineGrafanaStatusTool`); the frozen `internals` surface is unchanged.
+  Nothing else changed: parameters, outputs, timeouts, limits, approval behavior, and read/write semantics are identical, and the only edited error text is the tool name inside the adhoc-related messages. The matching internal exports were renamed too (`defineGrafanaQueryTool` → `defineGrafanaPanelQueryTool`, `defineGrafanaHealthTool` → `defineGrafanaStatusTool`); the frozen `internals` surface is unchanged. Per-agent tool allowlists, saved workflows, and any prompt or script that calls the old names must be updated.
 
 ### Fixed
 

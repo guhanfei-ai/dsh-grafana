@@ -942,3 +942,48 @@ test('grafana_trend falls back to per-panel queries when the batch fails', async
     globalThis.fetch = originalFetch
   }
 })
+
+test('grafana_trend stops the per-panel fallback when the tool time budget is exhausted', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/dashboards/uid/')) return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: TREND_DASHBOARD })
+    // 模拟工具级超时：批量请求到来时宿主 abort 了 exec.signal，请求本身随之失败。
+    controller.abort()
+    const aborted = new Error('This operation was aborted')
+    aborted.name = 'AbortError'
+    throw aborted
+  }
+  try {
+    const { tools } = createContext()
+    const out = await toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, { signal: controller.signal })
+    // 降级仍被触发（批量失败的降级说明在场），但逐面板重试不再发出——
+    // 未重试的面板显式记为预算耗尽，与「数据源故障」的 failed 行区分开。
+    assert.match(out, /fell back to per-panel queries\./)
+    assert.match(out, /panel id=1 "CPU": query A: failed: tool time budget exhausted before this panel could be retried/)
+    assert.match(out, /panel id=2 "Ratio": query A: failed: tool time budget exhausted before this panel could be retried/)
+    assert.doesNotMatch(out, /This operation was aborted/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_metric surfaces an in-band results error instead of reporting no data', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/datasources')) {
+      return jsonResponse([{ uid: 'prom-prod', type: 'prometheus', name: 'Prom Prod', isDefault: true, access: 'proxy' }])
+    }
+    // HTTP 200 但带内错误：静默当空结果会让模型误读为「无数据」。
+    return jsonResponse({ results: { A: { error: 'datasource is disabled' } } })
+  }
+  try {
+    const { tools } = createContext()
+    await assert.rejects(
+      toolByName(tools, 'grafana_metric').execute({ datasource: 'prom-prod', expr: 'up' }, execution()),
+      /the datasource rejected the query: datasource is disabled/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})

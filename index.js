@@ -12,8 +12,8 @@ import { dashboardSummary, interpolateVariables, parseDashboardUrl, summarizeFra
 import { createRuntime } from './lib/runtime.js'
 import { defineGrafanaAlertsTool } from './lib/tools/alerts.js'
 import { defineGrafanaCloneTool, defineGrafanaGetTool, defineGrafanaPushTool } from './lib/tools/dashboard.js'
-import { defineGrafanaPanelQueryTool } from './lib/tools/query.js'
-import { defineGrafanaSearchTool, defineGrafanaSourcesTool, defineGrafanaStatusTool } from './lib/tools/misc.js'
+import { defineGrafanaPanelQueryTool, defineGrafanaQueryAliasTool } from './lib/tools/query.js'
+import { defineGrafanaHealthAliasTool, defineGrafanaSearchTool, defineGrafanaSourcesTool, defineGrafanaStatusTool } from './lib/tools/misc.js'
 import { defineGrafanaDatasourcesTool, defineGrafanaMetricTool, defineGrafanaTrendTool } from './lib/tools/metrics.js'
 import { generateSourceId, normalizeBaseUrl, normalizeSourceName, parseUid, readLimitedText, redactSecrets, safeApiErrorDetail, validateCredentialRef } from './lib/util.js'
 
@@ -123,17 +123,27 @@ export function apply(ctx, config = {}) {
         // 多源站迁移：sources 为空且存在可迁移的 legacy 配置（settings.baseUrl 或
         // GRAFANA_TOKEN 凭证）时，物化出一个默认源站，让既有单源配置在设置卡片里
         // 可见可编辑。令牌沿用 GRAFANA_TOKEN（不搬运明文密钥）；生成只读 UID 作稳定主键。
-        const current = scope.get()
-        const hasSources = Array.isArray(current.sources) && current.sources.length > 0
+        // describe 同时取 value 与 revision：tokenPresent 的 await 间隔里用户若在设置
+        // 卡片保存了自己的源站（revision 前进），带 expectedRevision 的写入会被宿主
+        // 以 SettingsConflictError 拒绝——外层 catch 吞掉并放弃本次迁移，用户刚写的
+        // 配置得以保留，而不是被物化的默认源站覆盖。revision 不可得（旧宿主）时
+        // 退化为无条件写，与既有行为一致。
+        const descriptor = sctx.settings.describe?.().find?.((entry) => entry?.ns === SETTINGS_NAMESPACE) ?? null
+        const current = descriptor?.value ?? scope.get()
+        const hasSources = Array.isArray(current?.sources) && current.sources.length > 0
         if (!hasSources) {
           const tokenPresent = Boolean((await sctx.credentials.resolve(TOKEN_REF))?.value)
           const legacyUrl = current.baseUrl || stored?.value || ''
           if (legacyUrl || tokenPresent) {
             const id = generateSourceId()
-            await scope.update({
-              sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: TOKEN_REF }],
-              defaultSource: id,
-            })
+            await sctx.settings.update(
+              SETTINGS_NAMESPACE,
+              {
+                sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: TOKEN_REF }],
+                defaultSource: id,
+              },
+              Number.isInteger(descriptor?.revision) ? descriptor.revision : undefined,
+            )
           }
         }
       } catch { /* 迁移失败不阻断插件加载，下次仍可重试。 */ }
@@ -193,6 +203,9 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineGrafanaSearchTool(rt))
   ctx.tools.register(defineGrafanaStatusTool(rt))
   ctx.tools.register(defineGrafanaSourcesTool(rt))
+  // 0.12.0 改名的旧名转发 stub：只报错并指向新名，让存量会话一跳自愈。
+  ctx.tools.register(defineGrafanaQueryAliasTool())
+  ctx.tools.register(defineGrafanaHealthAliasTool())
 }
 
 export const internals = Object.freeze({

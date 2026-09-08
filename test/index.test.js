@@ -119,6 +119,7 @@ test('redactSecrets leaves ordinary query text and short identifiers untouched',
 test('apply registers the whole tool surface and a hard approval gate for writes', async () => {
   const { listeners, sections, tools } = createContext()
   // 注册顺序即模型看到的工具面：数组本身就是绊线，多一个少一个都会在此处失败。
+  // 末尾两个是 0.12.0 改名后的旧名转发 stub（只报错指路，见下方专项测试）。
   assert.deepEqual(tools.map((tool) => tool.name), [
     'grafana_get',
     'grafana_push',
@@ -131,8 +132,19 @@ test('apply registers the whole tool surface and a hard approval gate for writes
     'grafana_search',
     'grafana_status',
     'grafana_sources',
+    'grafana_query',
+    'grafana_health',
   ])
   assert.equal(sections.length, 1)
+
+  // 旧名 stub：一跳自愈——报错必须指名新工具，且不产生任何副作用。
+  const queryAlias = toolByName(tools, 'grafana_query')
+  const healthAlias = toolByName(tools, 'grafana_health')
+  await assert.rejects(queryAlias.execute({}, execution()), /grafana_panel_query/)
+  await assert.rejects(healthAlias.execute({}, execution()), /grafana_status/)
+  // stub 的 description 也指名新工具，模型在工具列表里就能看到出路。
+  assert.match(queryAlias.description, /grafana_panel_query/)
+  assert.match(healthAlias.description, /grafana_status/)
 
   const gate = listeners.get('tools/pre-execute')
   assert.equal(typeof gate, 'function')
@@ -874,6 +886,35 @@ test('grafana_get summary mode returns a compact overview without recording a wr
   }
 })
 
+test('grafana_get summary and grafana_search disclose truncation on a budget line', async () => {
+  const originalFetch = globalThis.fetch
+  // 160 个无查询面板：摘要行数必然超过 MAX_SUMMARY_LINES(150)。
+  const bigDashboard = {
+    id: 9, uid: 'bigdash', title: 'Big', version: 1,
+    panels: Array.from({ length: 160 }, (_, index) => ({ id: index + 1, type: 'timeseries', title: `P${index + 1}` })),
+  }
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/api/search')) {
+      return jsonResponse(Array.from({ length: 53 }, (_, index) => ({ uid: `d${index}`, title: `T${index}`, url: `/d/d${index}/t${index}` })))
+    }
+    return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: bigDashboard })
+  }
+  try {
+    const { tools } = createContext()
+    // summary 模式：行截断计入预算行（首行 + 160 面板行 = 161 行，可见 150）。
+    const summary = await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'bigdash', summary: true }, execution())
+    assert.match(summary, /…\d+ more line\(s\) not shown\./)
+    assert.match(summary, /budget: 150 of 161 line\(s\) shown; 11 hidden \(raise limit to include them\)/)
+    // search：53 行结果截到 50，预算行披露丢弃的 3 行。
+    const search = await toolByName(tools, 'grafana_search').execute({}, execution())
+    const searchLines = search.split('\n')
+    assert.equal(searchLines.length, 51)
+    assert.equal(searchLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (raise limit to include them)')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('snapshots record title, folderTitle, and folderUid with a folderUid fallback', async () => {
   const originalFetch = globalThis.fetch
   const dashboard = { id: 7, uid: 'abc123', title: 'Overview', version: 3, panels: [] }
@@ -1119,10 +1160,43 @@ test('grafana_status reports the database field from the real /api/health shape'
 function createSettingsContext(userSection = {}, credentialState = {}) {
   const tools = []
   let section = { ...userSection }
+  // 与宿主 dsh-settings 一致的乐观并发语义：每次落地写前进 revision，
+  // update 带过期 expectedRevision 时以冲突拒绝。
+  let revision = 0
   const registrations = []
   const listeners = new Map()
   // 可变的凭证状态：resolve 返回 { value }，unset 清空对应 ref。
   const creds = { ...credentialState }
+  const settingsService = {
+    register(ns, schema, options = {}) {
+      const scope = {
+        get: () => schema({ ...options.base, ...section }),
+        async update(patch) { await settingsService.update(ns, patch) },
+        async mutate(ops) {
+          for (const op of ops ?? []) {
+            if (op.op === 'unset' && op.path?.[0] === 'baseUrl') {
+              const { baseUrl, ...rest } = section
+              section = rest
+            }
+          }
+        },
+      }
+      options.validate?.(scope.get())
+      registrations.push({ ns, options, scope, creds })
+      return scope
+    },
+    describe() {
+      // 单 namespace mock：与宿主 Settings.describe 同形（ns/revision/value）。
+      return registrations.map(({ ns, scope }) => ({ ns, revision, value: scope.get() }))
+    },
+    async update(ns, patch, expectedRevision) {
+      if (expectedRevision !== undefined && expectedRevision !== revision) {
+        throw new Error(`settings namespace "${ns}" changed since it was read (expected revision ${expectedRevision}, now ${String(revision)})`)
+      }
+      revision += 1
+      section = { ...section, ...patch }
+    },
+  }
   const ctx = {
     credentials: {
       async resolve(ref) { return creds[ref] ? { value: creds[ref] } : undefined },
@@ -1133,25 +1207,7 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
       callback({
         ...ctx,
         effect(setup) { setup() },
-        settings: {
-          register(ns, schema, options = {}) {
-            const scope = {
-              get: () => schema({ ...options.base, ...section }),
-              async update(patch) { section = { ...section, ...patch } },
-              async mutate(ops) {
-                for (const op of ops ?? []) {
-                  if (op.op === 'unset' && op.path?.[0] === 'baseUrl') {
-                    const { baseUrl, ...rest } = section
-                    section = rest
-                  }
-                }
-              },
-            }
-            options.validate?.(scope.get())
-            registrations.push({ ns, options, scope, creds })
-            return scope
-          },
-        },
+        settings: settingsService,
       })
     },
     on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
@@ -2189,7 +2245,7 @@ test('grafana_panel_query resolves $datasource references, maps "default", and s
     templating: {
       list: [
         { name: 'datasource', type: 'datasource', current: { text: 'default', value: 'default' } },
-        { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+        { name: 'instance', type: 'query', current: { value: ['192.0.2.1:9093'] } },
       ],
     },
     panels: [{
@@ -2220,7 +2276,7 @@ test('grafana_panel_query resolves $datasource references, maps "default", and s
     // 保存态默认值 "default" 映射到 isDefault 数据源；$instance 单值数组裸渲染。
     await tool.execute({ urlOrUid: 'abc123' }, execution())
     assert.deepEqual(queryBodies[0].queries[0].datasource, { type: 'prometheus', uid: 'prom-default' })
-    assert.equal(queryBodies[0].queries[0].expr, 'count(alertmanager_build_info{instance=~"10.0.0.1:9093"})')
+    assert.equal(queryBodies[0].queries[0].expr, 'count(alertmanager_build_info{instance=~"192.0.2.1:9093"})')
 
     // datasource 型变量按 uid 字符串覆盖：整盘切换数据源。
     queryBodies.length = 0
@@ -2233,7 +2289,7 @@ test('grafana_panel_query resolves $datasource references, maps "default", and s
       templating: {
         list: [
           { name: 'datasource', type: 'datasource', current: {} },
-          { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+          { name: 'instance', type: 'query', current: { value: ['192.0.2.1:9093'] } },
         ],
       },
     }
@@ -2267,7 +2323,7 @@ test('grafana_panel_query skips row-panel leftover targets and dedupes per-panel
     templating: {
       list: [
         { name: 'datasource', type: 'datasource', current: { text: 'default', value: 'default' } },
-        { name: 'instance', type: 'query', current: { value: ['10.0.0.1:9093'] } },
+        { name: 'instance', type: 'query', current: { value: ['192.0.2.1:9093'] } },
       ],
     },
     panels: [
@@ -2307,7 +2363,7 @@ test('grafana_panel_query skips row-panel leftover targets and dedupes per-panel
     // 空载荷 target 绝不发给数据源；$datasourse 引用面板的 expr 原样保留。
     const sentExprs = queryBodies.flatMap((body) => body.queries.map((query) => query.expr))
     assert.equal(sentExprs.length, 1)
-    assert.equal(sentExprs[0], 'count(alertmanager_build_info{instance=~"10.0.0.1:9093"})')
+    assert.equal(sentExprs[0], 'count(alertmanager_build_info{instance=~"192.0.2.1:9093"})')
     // row 的两条空 target 去重为一条 skip 说明，附 refId 列表。
     assert.match(out, /panel id=36 "General info": skipped \(the target carries no query payload[^)]*\) \(targets A, B\)/)
     assert.equal(out.split('carries no query payload').length - 1, 1)
@@ -2417,8 +2473,8 @@ test('grafana_panel_query renders bare multi-value variables as (a|b) inside Pro
     templating: {
       list: [
         { name: 'job', type: 'query', current: { value: ['node-exporter', 'other'] } },
-        { name: 'host', type: 'query', current: { value: ['10.0.0.1'] } },
-        { name: 'addr', type: 'query', current: { value: ['82.156.207.97:9100', '119.45.27.31:9100'] } },
+        { name: 'host', type: 'query', current: { value: ['192.0.2.1'] } },
+        { name: 'addr', type: 'query', current: { value: ['198.51.100.97:9100', '203.0.113.31:9100'] } },
         { name: 'app', type: 'query', current: { value: ['api', 'web'] } },
         { name: 'env', type: 'query', current: { value: ['prod', 'staging'] } },
       ],
@@ -2456,7 +2512,7 @@ test('grafana_panel_query renders bare multi-value variables as (a|b) inside Pro
     const byDs = new Map(queryBodies[0].queries.map((q) => [q.datasource.uid, q]))
     // 多值裸引用 → (a|b)，值保持原样（PromQL 双引号内 \. 是非法转义）；
     // 单值数组保持裸值。
-    assert.equal(byDs.get('prom').expr, 'up{job=~"(node-exporter|other)", host=~"10.0.0.1", instance=~"(82.156.207.97:9100|119.45.27.31:9100)"}')
+    assert.equal(byDs.get('prom').expr, 'up{job=~"(node-exporter|other)", host=~"192.0.2.1", instance=~"(198.51.100.97:9100|203.0.113.31:9100)"}')
     assert.equal(byDs.get('loki').expr, '{app=~"(api|web)"} |= "error"')
     // ES target 不受 promql 模式影响：裸多值仍是全局默认逗号连接。
     assert.equal(byDs.get('es').query, 'env:(prod,staging)')
@@ -2826,4 +2882,75 @@ test('apply migrates legacy single-source config into a materialized default sou
   assert.equal(src.tokenRef, 'GRAFANA_TOKEN')
   assert.ok(src.id, 'a read-only UID is generated for the migrated source')
   assert.equal(cfg.defaultSource, src.id)
+})
+
+test('startup migration yields to a concurrent user save instead of overwriting it', async () => {
+  // 竞态场景：迁移 IIFE 判断「sources 为空」之后、写入落地之前（tokenPresent 的
+  // await 间隔），用户在设置卡片保存了自己的源站。迁移写带着读取时的 revision，
+  // 必须被宿主以冲突拒绝并放弃——用户刚写的配置得以保留，而不是被物化的默认源站覆盖。
+  const tools = []
+  const listeners = new Map()
+  let section = {}
+  let revision = 0
+  let releaseToken
+  // 把 GRAFANA_TOKEN 的解析挂起：迁移 IIFE 停在 tokenPresent 判断与写入之间，
+  // 此刻测试模拟用户保存（revision 前进），再放行。
+  const tokenGate = new Promise((resolve) => { releaseToken = resolve })
+  const creds = { GRAFANA_TOKEN: 'legacy-token' }
+  let scope = null
+  const settingsService = {
+    register(ns, schema, options = {}) {
+      scope = {
+        get: () => schema({ ...options.base, ...section }),
+        async update(patch) { await settingsService.update(ns, patch) },
+        async mutate() {},
+      }
+      options.validate?.(scope.get())
+      return scope
+    },
+    describe() { return [{ ns: SETTINGS_NAMESPACE, revision, value: scope?.get() }] },
+    async update(ns, patch, expectedRevision) {
+      if (expectedRevision !== undefined && expectedRevision !== revision) {
+        throw new Error(`settings namespace "${ns}" changed since it was read`)
+      }
+      revision += 1
+      section = { ...section, ...patch }
+    },
+  }
+  const ctx = {
+    credentials: {
+      async resolve(ref) {
+        if (ref === 'GRAFANA_TOKEN') await tokenGate
+        return creds[ref] ? { value: creds[ref] } : undefined
+      },
+      async unset(ref) { delete creds[ref] },
+    },
+    inject(services, callback) {
+      if (!services.includes('settings')) return
+      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
+    },
+    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
+    systemPrompt: { section() {} },
+    tools: { register(tool) { tools.push(tool); return () => {} } },
+  }
+  apply(ctx, {})
+  // 迁移 IIFE 跑到 resolve(GRAFANA_TOKEN) 处挂起（BASE_URL_REF 无值，第一段跳过；
+  // describe 读到空 sources，进入第二段）。
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // 用户此刻保存了自己的源站：revision 从 0 前进到 1。
+  await settingsService.update(SETTINGS_NAMESPACE, {
+    sources: [{ id: 'user-1', name: 'mine', baseUrl: 'https://mine.example.com', tokenRef: 'GRAFANA_TOKEN_user1' }],
+    defaultSource: 'user-1',
+  })
+
+  // 放行迁移 IIFE：它的写入带着过期 revision（0），被冲突拒绝并整体放弃。
+  releaseToken()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const cfg = scope.get()
+  assert.equal(cfg.sources.length, 1)
+  assert.equal(cfg.sources[0].id, 'user-1', 'the user save must survive the racing migration')
+  assert.equal(cfg.sources[0].name, 'mine')
+  assert.equal(cfg.defaultSource, 'user-1')
 })

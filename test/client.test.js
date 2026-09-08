@@ -102,8 +102,12 @@ function setup({ sources = [], defaultSource = '', creds = {}, locale = 'zh', re
       const [ns, ops] = args
       const bad = rejected('settings.mutate')
       if (bad) return bad
+      // 与宿主 dsh-settings 的 applyPathOp 语义一致：set 对目标路径整体赋值。
       for (const op of ops ?? []) {
-        if (ns === 'grafana' && op?.op === 'unset' && op?.path?.[0] === 'sources') grafanaValue.sources = []
+        if (ns !== 'grafana' || !op?.op) continue
+        if (op.op === 'set' && op.path?.[0] === 'sources') grafanaValue.sources = (op.value ?? []).map((s) => ({ ...s }))
+        if (op.op === 'set' && op.path?.[0] === 'defaultSource') grafanaValue.defaultSource = op.value
+        if (op.op === 'unset' && op.path?.[0] === 'sources') grafanaValue.sources = []
       }
       return { ok: true, value: descriptor('grafana', { ...grafanaValue }) }
     },
@@ -204,7 +208,6 @@ test('every remote call passes exactly the declared number of arguments', async 
   const declared = {
     'settings.describe': 0,
     'settings.mutate': 3,
-    'settings.update': 3,
     'credentials.describe': 1,
     'credentials.set': 2,
     'credentials.unset': 1,
@@ -223,7 +226,7 @@ test('describe returns an empty list without touching credentials when no source
   assert.equal(calls.some(([m]) => m === 'credentials.describe'), false)
 })
 
-test('writeSources replaces the whole sources array via unset + update and writes defaultSource', async () => {
+test('writeSources replaces the whole sources array via one atomic mutate with two set ops', async () => {
   const { face, calls } = setup({
     sources: [{ id: 'old', name: 'old', baseUrl: 'https://old.example.com', tokenRef: 'GRAFANA_TOKEN_old' }],
     defaultSource: 'old',
@@ -232,18 +235,16 @@ test('writeSources replaces the whole sources array via unset + update and write
     [{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }],
     'id-prod',
   )
-  // 先 mutate unset ['sources']（避免 update 对数组按下标深合并留下陈旧项）……
-  const mutateIndex = calls.findIndex(([m]) => m === 'settings.mutate')
-  const updateIndex = calls.findIndex(([m]) => m === 'settings.update')
-  assert.ok(mutateIndex >= 0 && updateIndex >= 0 && mutateIndex < updateIndex, 'unset must precede update')
+  // 恰好一次 settings.mutate，且不再有第二次写（旧实现是 unset + update 两步，
+  // 第二步失败时 sources 已被清空，存量配置会当场丢失）。
+  const writes = calls.filter(([m]) => m === 'settings.mutate' || m === 'settings.update')
+  assert.equal(writes.length, 1)
   // mutate(ns, ops, expectedRevision?)：位置参数；第三参留空表示不做乐观并发校验。
-  assert.equal(JSON.stringify(calls[mutateIndex][1].slice(0, 2)), JSON.stringify(['grafana', [{ op: 'unset', path: ['sources'] }]]))
-  assert.equal(calls[mutateIndex][1][2], undefined)
-  // ……再 update(ns, patch, revision?) 写入新的 sources + defaultSource。
-  assert.equal(JSON.stringify(calls[updateIndex][1].slice(0, 2)), JSON.stringify(['grafana', {
-    sources: [{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }], defaultSource: 'id-prod',
-  }]))
-  assert.equal(calls[updateIndex][1][2], undefined)
+  assert.equal(JSON.stringify(writes[0][1].slice(0, 2)), JSON.stringify(['grafana', [
+    { op: 'set', path: ['sources'], value: [{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }] },
+    { op: 'set', path: ['defaultSource'], value: 'id-prod' },
+  ]]))
+  assert.equal(writes[0][1][2], undefined)
   // 写入后旧源站被整体替换，只剩新源站；id 原样保留（只读，不重新生成）。
   const r = await face.describe()
   assert.equal(r.sources.length, 1)
@@ -254,9 +255,10 @@ test('writeSources replaces the whole sources array via unset + update and write
 test('writeSources derives the token ref from the id when a new source omits it', async () => {
   const { face, calls } = setup()
   await face.writeSources([{ id: 'abc-123', name: 'fresh', baseUrl: 'https://fresh.example.com' }], 'abc-123')
-  const updateCall = calls.find(([m]) => m === 'settings.update')
+  const mutateCall = calls.find(([m]) => m === 'settings.mutate')
+  const sourcesOp = mutateCall[1][1].find((op) => op.path?.[0] === 'sources')
   // 新源站未带 tokenRef → 按 id 派生 GRAFANA_TOKEN_<去横线>，与 Host 端解析一致。
-  assert.equal(JSON.stringify(updateCall[1][1].sources), JSON.stringify([{ id: 'abc-123', name: 'fresh', baseUrl: 'https://fresh.example.com', tokenRef: 'GRAFANA_TOKEN_abc123' }]))
+  assert.equal(JSON.stringify(sourcesOp.value), JSON.stringify([{ id: 'abc-123', name: 'fresh', baseUrl: 'https://fresh.example.com', tokenRef: 'GRAFANA_TOKEN_abc123' }]))
 })
 
 test('setToken and unsetToken route through the credential store with the per-source ref', async () => {
@@ -383,12 +385,24 @@ test('writeSources surfaces a rejected mutate instead of reporting success', asy
   )
 })
 
-test('writeSources surfaces a rejected update instead of reporting success', async () => {
-  const { face } = setup({ fail: { 'settings.update': 'namespace is not writable' } })
+test('writeSources is one atomic mutate: a rejection never leaves a half-written list', async () => {
+  // mutate 被拒（校验失败/revision 冲突）时 op 数组整体不落地——不存在「unset 已生效、
+  // 新值未写入」的中间态把源站列表清空。
+  const { face, calls } = setup({
+    sources: [{ id: 'old', name: 'old', baseUrl: 'https://old.example.com', tokenRef: 'GRAFANA_TOKEN_old' }],
+    defaultSource: 'old',
+    fail: { 'settings.mutate': 'validation refused' },
+  })
   await assert.rejects(
     () => face.writeSources([{ id: 'a', name: 'a', baseUrl: 'https://a.example.com' }], 'a'),
-    /namespace is not writable/,
+    /validation refused/,
   )
+  // 被拒之后再无第二次写尝试（旧实现会继续发 settings.update）。
+  assert.equal(calls.filter(([m]) => m === 'settings.mutate' || m === 'settings.update').length, 1)
+  // 存储值原样保留：describe 读回仍是旧源站。
+  const r = await face.describe()
+  assert.equal(r.sources.length, 1)
+  assert.equal(r.sources[0].id, 'old')
 })
 
 test('setToken surfaces a rejected credential write', async () => {

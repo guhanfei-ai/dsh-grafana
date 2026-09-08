@@ -56,6 +56,21 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-grafana
 
 Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台；`deploy.sh` 需要 Git Bash、WSL、macOS 或 Linux。
 
+## 升级到 0.12.0
+
+**两个工具改名。** `grafana_query` 改为 `grafana_panel_query`，`grafana_health` 改为 `grafana_status`。参数、输出、超时与审批行为均不变。
+
+| 旧名 | 新名 |
+| --- | --- |
+| `grafana_query` | `grafana_panel_query` |
+| `grafana_health` | `grafana_status` |
+
+旧名仍以「只报错」的转发 stub 保留在工具列表中：调用 `grafana_query` 或 `grafana_health` 会立即失败并指名新工具，进行中的对话一步即可自愈。自定义 prompt 与保存的工作流仍建议改用新名；按代理配置的工具白名单需要换成新名。
+
+**浏览器设置卡片需要 DSH 0.1.2 及以上。** 在更旧的宿主（0.1.0–0.1.1）上，卡片会显示明确的「宿主过旧」提示而非源站列表——这是版本门槛，不是配置丢失。宿主侧全部工具在这些版本上照常可用，插件本身也仍可安装在 `0.1.0-rc.6` 及以上。
+
+**配置自动迁移。** 旧版本的单源站配置会在启动时物化为名为 `default` 的源站（Base URL 与已存令牌不变），无需任何手动步骤；迁移也不会覆盖你在其运行期间保存的配置。
+
 ## 配置
 
 在 DSH Web 中打开 **设置 → 插件 → Grafana dashboard editor**。
@@ -156,7 +171,7 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_datasources` | 列出源站上已配置的数据源（uid、插件类型、显示名、是否默认、访问模式）。可按精确插件类型或大小写不敏感的名称子串过滤；最多返回 40 行，丢弃的行在末尾预算行中披露。调用 `grafana_metric` 前先用它确认要查询的 uid 或名称。只读。 |
 | `grafana_metric` | 无需大盘，直接对 Prometheus 或 Loki 数据源执行一条裸文本查询（PromQL 如 `up` 或 `rate(http_requests_total[5m])`，或 LogQL 流选择器），数据源按 uid 或精确显示名寻址。`mode: "instant"`（默认）在区间末端求值一次；`mode: "range"` 对序列采样并给出每条序列的统计、上升/下降/持平判定与火花线（对 Loki 的 range 查询返回的是日志行而非数值采样点，故这类序列只报行数与末行；Loki 的 instant 模式只接受 metric 查询，日志流选择器需用 range）。其它插件类型与服务端表达式会被拒绝并指向 `grafana_panel_query`。只读，不记录写快照。 |
 | `grafana_trend` | 一次调用回答大盘的「在涨还是在跌」：把每个可见查询目标以较粗的区间查询重跑，每条序列给出桶数、首/末/最小/最大/均值、方向判定与火花线。表格型结果报告行数与统计并标 `trend=n/a`，不伪造方向。与 `grafana_panel_query` 共用同一套面板管线（变量、adhoc 过滤、旧格式数据源引用、逐面板降级）。时间范围最长 90 天。只读，不记录写快照。 |
-| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。只读；告警文本是不可信数据。 |
+| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。活跃告警按 `limit` 参数封顶（默认 30、上限 100），规则定义段封顶 100 行；丢弃的部分在末尾预算行披露。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。只读；告警文本是不可信数据。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_status` | 检查 Grafana 连通性与 Service Account 凭证。 |
 | `grafana_sources` | 列出已配置的 Grafana 源站：每个源站的名称、只读 UID、URL、令牌是否已配，以及哪一台是默认源站。只读，绝不返回令牌值。在向其它工具传 `source` 之前，可用它发现合法的源站名称。 |

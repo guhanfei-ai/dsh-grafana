@@ -69,7 +69,7 @@
 `npm run verify` → 全绿（测试总数随版本增长，此处不写死计数）。含 `grafana_panel_query` 历轮新增（legacy 字符串 uid 索引解析、`$datasource` 解析与 “default” 映射、索引 403 透传、透传+adhoc 报错、promql/loki 裸多值 `(a|b)` 渲染含带点号值、ES 正则成功路径与空模式报错），以及本轮多源站新增：
 
 - Host：`grafana_sources` 列表输出（名称/UID/URL/令牌状态/默认标记）、`source` 按名称与按 id 解析、省略走默认源站、多源无默认时报错、写快照按 (源站, uid) 复合键跨源站隔离、push/clone 审批文案首行标明目标源站、配置写入口校验（源站 id 只读形状 `SOURCE_ID_PATTERN` 强制、重名拒绝）、legacy 单源配置启动迁移为 `default` 源站（沿用 `GRAFANA_TOKEN`、生成只读 UID）。
-- 客户端：源站列表读回与各源站令牌 configured 状态、整体写入的 `mutate unset ['sources']` + `update {sources,defaultSource}` 形状锁定、令牌按各自 ref 增删、移除源站联动 unset 其令牌、UID 生成（crypto.randomUUID 形状、唯一）与只读、名称必填/唯一/限长与数量上限 50 前置校验、URL 合法性校验、双代信封解析回退。
+- 客户端：源站列表读回与各源站令牌 configured 状态、整体写入的「单次 `mutate` 双 `set` op（sources + defaultSource 原子事务）」形状锁定、令牌按各自 ref 增删、移除源站联动 unset 其令牌、UID 生成（crypto.randomUUID 形状、唯一）与只读、名称必填/唯一/限长与数量上限 50 前置校验、URL 合法性校验、双代信封解析回退。
 
 ## 六、多源站真机验证清单（待维护者实测）
 
