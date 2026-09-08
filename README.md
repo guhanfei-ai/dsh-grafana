@@ -17,6 +17,7 @@ A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana das
 - Detect concurrent edits before writing.
 - Require native DSH user approval for every write.
 - Keep service-account credentials in the local DSH credential store.
+- Configure several named Grafana sources and target one per tool call.
 
 ## Requirements
 
@@ -74,6 +75,18 @@ allowInsecureHttp: false
 
 The settings `baseUrl` is the authoritative source; a legacy `GRAFANA_BASE_URL` credential (from earlier versions) is migrated into settings on startup and then used only as a fallback. The token reference defaults to `GRAFANA_TOKEN` and can be changed with `tokenRef`.
 
+### Multiple Grafana sources
+
+The settings card manages a **list of named Grafana sources** rather than a single URL/token pair. Each source has:
+
+- **Source name** (required, unique): any language. This is the value you pass as the `source` argument to target that instance.
+- **UID** (read-only): an auto-generated, globally unique id shown in faint text right under the name. It is the stable internal key — renaming a source never changes its UID or its stored token, and it can never be edited.
+- **Grafana URL** and **Service Account Token**: independent per source. Each token is stored write-only in the DSH credential store under its own reference (`GRAFANA_TOKEN_<uid>`); the migrated default source keeps the legacy `GRAFANA_TOKEN` reference.
+
+Click **Add source** to create one, **Remove source** to delete it (its stored token is cleared too), and **Set as default** to choose which source is used when a tool call omits `source`. **Save** persists the whole list; every name and URL is validated before anything is written, so an invalid entry never leaves a half-saved state.
+
+Every tool accepts an optional `source` argument (a configured source name); omit it to use the default source. Call `grafana_sources` to list the configured names, UIDs, base URLs, which token is configured, and which source is the default. Write approvals always show the target source name and URL on the first line so you can confirm which instance is modified. A single-source configuration from earlier versions is migrated on startup into one source named `default`. `allowInsecureHttp` remains a global setting that applies to all sources.
+
 ### Grafana permissions
 
 Prefer least-privilege RBAC with only the required dashboard and folder scopes:
@@ -87,6 +100,8 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 
 ## Tools
 
+Every tool accepts an optional `source` argument (a configured source name) to pick the target Grafana instance; omit it to use the default source. See [Multiple Grafana sources](#multiple-grafana-sources).
+
 | Tool | Behavior |
 | --- | --- |
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. With `summary: true` it returns a compact structural overview (panels, queries, thresholds, variables) instead of the full JSON and records no write snapshot — preferred for large dashboards. |
@@ -95,6 +110,7 @@ When fine-grained RBAC is unavailable, Grafana's Editor role is the fallback. Av
 | `grafana_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_health` | Checks connectivity and service-account validity. |
+| `grafana_sources` | Lists the configured Grafana sources: each name, its read-only UID, base URL, whether its token is configured, and which one is the default. Read-only; never returns token values. Use it to discover valid source names before passing `source` to other tools. |
 
 ### Template variable overrides (`grafana_query`)
 

@@ -87,7 +87,7 @@ test('API error details expose only bounded status and message fields', () => {
   assert.equal(detail, 'version-mismatch: changed elsewhere')
 })
 
-test('apply registers six tools and a hard approval gate for writes', async () => {
+test('apply registers seven tools and a hard approval gate for writes', async () => {
   const { listeners, sections, tools } = createContext()
   assert.deepEqual(tools.map((tool) => tool.name), [
     'grafana_get',
@@ -96,6 +96,7 @@ test('apply registers six tools and a hard approval gate for writes', async () =
     'grafana_query',
     'grafana_search',
     'grafana_health',
+    'grafana_sources',
   ])
   assert.equal(sections.length, 1)
 
@@ -158,7 +159,9 @@ test('approval gate builds the reason from the trusted snapshot, not from dashbo
     assert.match(decision.reason, /uid=abc123/)
     assert.match(decision.reason, /title="Overview"/)
     // 身份行必须用快照可信标题；伪造标题只允许出现在内容 diff 预览分节里。
-    const [identityLine] = decision.reason.split('\n')
+    // 多源站后首行是目标源站行，身份行按内容（uid=）定位而非固定下标。
+    const identityLine = decision.reason.split('\n').find((line) => line.includes('uid=abc123'))
+    assert.ok(identityLine, 'expected an identity line mentioning uid=abc123')
     assert.doesNotMatch(identityLine, /Tampered Title/)
     assert.match(decision.reason, /Diff vs current Grafana dashboard:/)
     assert.match(decision.reason, /~ field title: "Overview" -> "Tampered Title"/)
@@ -1002,6 +1005,7 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
   const tools = []
   let section = { ...userSection }
   const registrations = []
+  const listeners = new Map()
   // 可变的凭证状态：resolve 返回 { value }，unset 清空对应 ref。
   const creds = { ...credentialState }
   const ctx = {
@@ -1035,14 +1039,14 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
         },
       })
     },
-    on() { return () => {} },
+    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
     systemPrompt: { section() {} },
     tools: {
       register(tool) { tools.push(tool); return () => {} },
     },
   }
   apply(ctx, {})
-  return { registrations, tools, creds }
+  return { registrations, tools, creds, listeners }
 }
 
 test('apply registers a grafana settings namespace and resolves config through it', async () => {
@@ -1052,6 +1056,16 @@ test('apply registers a grafana settings namespace and resolves config through i
   assert.equal(ns, SETTINGS_NAMESPACE)
   assert.equal(typeof options.validate, 'function')
   assert.throws(() => options.validate({ ...scope.get(), tokenRef: 'bad ref' }), /Invalid credential reference/)
+  // 多源站写入口校验：源站 id 系统生成、只读，手改或缺失直接拒绝；名称必须唯一。
+  assert.throws(() => options.validate({ ...scope.get(), sources: [{ id: 'bad id!', name: 'prod' }] }), /Invalid Grafana source id/)
+  assert.throws(() => options.validate({ ...scope.get(), sources: [{ id: '', name: 'prod' }] }), /Invalid Grafana source id/)
+  assert.throws(() => options.validate({
+    ...scope.get(),
+    sources: [
+      { id: 'id-1', name: 'prod', baseUrl: '', tokenRef: '' },
+      { id: 'id-2', name: 'prod', baseUrl: '', tokenRef: '' },
+    ],
+  }), /Duplicate Grafana source name/)
 
   // 用户设置层的值优先于组合层 base，健康检查按其解析 base URL。
   await scope.update({ baseUrl: 'https://grafana.internal' })
@@ -2545,4 +2559,152 @@ test('internals exports the stable debug surface across the lib/ split', () => {
     assert.equal(typeof internals[key], 'function', `internals.${key} must stay a function`)
   }
   assert.ok(Object.isFrozen(internals))
+})
+
+// 多源站：grafana_sources 列出每个源站的名称、只读 UID、URL、令牌状态与默认标记。
+test('grafana_sources lists each source with its default marker, UID, URL, and token status', async () => {
+  const { tools } = createSettingsContext({
+    sources: [
+      { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' },
+      { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' },
+    ],
+    defaultSource: 'id-eu',
+  }, { GRAFANA_TOKEN_idprod: 'secret-prod' })
+  const out = await toolByName(tools, 'grafana_sources').execute({}, execution())
+  const lines = out.split('\n')
+  assert.equal(lines.length, 2)
+  // 顺序与 sources 一致；prod 令牌已配、非默认。
+  assert.equal(lines[0], 'name="prod" uid="id-prod" url="https://prod.example.com" token=configured')
+  // eu 是默认源站、令牌未配（凭证库无对应 ref）。
+  assert.equal(lines[1], '(default) name="eu" uid="id-eu" url="https://eu.example.com" token=missing')
+})
+
+// 多源站：工具按名称/按 id 解析 source，省略走默认源站，未知源站报错并列出可选名称。
+test('tools resolve the source argument by name or id, fall back to the default, and reject unknown sources', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => { calls.push(String(url)); return jsonResponse({ database: 'ok', commit: 'c', version: 'v' }) }
+  try {
+    const { tools } = createSettingsContext({
+      sources: [
+        { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' },
+        { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' },
+      ],
+      defaultSource: 'id-prod',
+    }, { GRAFANA_TOKEN_idprod: 'p', GRAFANA_TOKEN_ideu: 'e' })
+
+    // 按名称选源：health 第一跳 URL 证明命中 eu。
+    calls.length = 0
+    await toolByName(tools, 'grafana_health').execute({ source: 'eu' }, execution())
+    assert.equal(calls[0], 'https://eu.example.com/api/health')
+
+    // 按 id 选源同样命中 eu（名称优先、id 兜底）。
+    calls.length = 0
+    await toolByName(tools, 'grafana_health').execute({ source: 'id-eu' }, execution())
+    assert.equal(calls[0], 'https://eu.example.com/api/health')
+
+    // 省略 source：用默认源站 prod。
+    calls.length = 0
+    await toolByName(tools, 'grafana_health').execute({}, execution())
+    assert.equal(calls[0], 'https://prod.example.com/api/health')
+
+    // 未知源站：抛错并提示用 grafana_sources 查看。
+    await assert.rejects(
+      toolByName(tools, 'grafana_health').execute({ source: 'nope' }, execution()),
+      /Unknown Grafana source "nope"/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 多源站且无默认、又未指定 source：解析必须报错而非随便挑一台（避免写错源站）。
+test('resolveSource throws when several sources exist with no default and none is specified', async () => {
+  const { tools } = createSettingsContext({
+    sources: [
+      { id: 'a', name: 'alpha', baseUrl: 'https://alpha.example.com' },
+      { id: 'b', name: 'beta', baseUrl: 'https://beta.example.com' },
+    ],
+    defaultSource: '',
+  })
+  await assert.rejects(
+    toolByName(tools, 'grafana_health').execute({}, execution()),
+    /Multiple Grafana sources are configured/,
+  )
+})
+
+// 多源站：写快照按 (源站, uid) 复合键隔离——同一 uid 在两台源站互不覆盖，
+// 审批文案各自展示本源站的可信标题与目标源站行。
+test('write snapshots are isolated per source: the same uid on two sources does not collide', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const title = String(url).includes('prod.example.com') ? 'Prod Dash' : 'EU Dash'
+    return jsonResponse({ meta: { folderUid: 'f', folderTitle: 'Folder', canSave: true }, dashboard: { id: 7, uid: 'abc', title, version: 1, panels: [] } })
+  }
+  try {
+    const { tools, listeners } = createSettingsContext({
+      sources: [
+        { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' },
+        { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' },
+      ],
+      defaultSource: 'id-prod',
+    }, { GRAFANA_TOKEN_idprod: 'p', GRAFANA_TOKEN_ideu: 'e' })
+    const gate = listeners.get('tools/pre-execute')
+
+    // 先从 prod、再从 eu 取同一 uid=abc；若快照键仅为 uid，eu 会覆盖 prod。
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc', source: 'prod' }, execution())
+    await toolByName(tools, 'grafana_get').execute({ urlOrUid: 'abc', source: 'eu' }, execution())
+
+    const pushExec = (source) => ({
+      name: 'grafana_push',
+      arguments: { dashboardJson: JSON.stringify({ id: 7, uid: 'abc', title: 'x', version: 1, panels: [] }), changeSummary: 's', message: 'm', source },
+    })
+    const prodDecision = await gate(pushExec('prod'), async () => ({ kind: 'allow' }))
+    assert.match(prodDecision.reason, /title="Prod Dash"/)
+    assert.match(prodDecision.reason, /Target Grafana source: "prod" \(https:\/\/prod\.example\.com\)/)
+    const euDecision = await gate(pushExec('eu'), async () => ({ kind: 'allow' }))
+    assert.match(euDecision.reason, /title="EU Dash"/)
+    assert.match(euDecision.reason, /Target Grafana source: "eu" \(https:\/\/eu\.example\.com\)/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 多源站：clone 审批文案首行标明目标源站（名称 + URL），让审批人看清写到哪一台。
+test('clone approval states the target Grafana source name and URL on the first line', async () => {
+  const { listeners } = createSettingsContext({
+    sources: [{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }],
+    defaultSource: 'id-prod',
+  }, { GRAFANA_TOKEN_idprod: 'p' })
+  const gate = listeners.get('tools/pre-execute')
+  const decision = await gate({
+    name: 'grafana_clone',
+    arguments: { sourceUrlOrUid: 'abc', newTitle: 'Copy', source: 'prod' },
+  }, async () => ({ kind: 'allow' }))
+  assert.equal(decision.kind, 'ask')
+  const [firstLine] = decision.reason.split('\n')
+  assert.equal(firstLine, 'Target Grafana source: "prod" (https://prod.example.com).')
+  assert.match(decision.reason, /cloning source uid=abc/)
+})
+
+// 迁移：sources 为空且存在 legacy 单源配置（GRAFANA_TOKEN 凭证 + URL）时，
+// 启动迁移物化出一个 name="default" 的源站，沿用旧 GRAFANA_TOKEN ref，生成只读 UID。
+test('apply migrates legacy single-source config into a materialized default source', async () => {
+  const { registrations } = createSettingsContext({}, {
+    GRAFANA_TOKEN: 'legacy-token',
+    GRAFANA_BASE_URL: 'https://grafana.legacy.example.com',
+  })
+  const [{ scope }] = registrations
+  // 迁移 IIFE 是 fire-and-forget，flush 一次宏任务让其全部微任务跑完。
+  await new Promise((resolve) => setImmediate(resolve))
+  const cfg = scope.get()
+  assert.equal(Array.isArray(cfg.sources), true)
+  assert.equal(cfg.sources.length, 1)
+  const src = cfg.sources[0]
+  assert.equal(src.name, 'default')
+  assert.equal(src.baseUrl, 'https://grafana.legacy.example.com')
+  // 令牌沿用旧 ref（不搬运明文密钥），改名/换 URL 都不影响该 ref。
+  assert.equal(src.tokenRef, 'GRAFANA_TOKEN')
+  assert.ok(src.id, 'a read-only UID is generated for the migrated source')
+  assert.equal(cfg.defaultSource, src.id)
 })

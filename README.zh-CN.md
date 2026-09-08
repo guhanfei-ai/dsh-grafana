@@ -17,6 +17,7 @@
 - 写入前检测并发修改。
 - 每次写入都必须经过 DSH 原生用户审批。
 - Service Account 凭证只保存在本机 DSH 凭证库。
+- 可配置多个具名 Grafana 源站，每次工具调用按名称指定目标。
 
 ## 环境要求
 
@@ -74,6 +75,18 @@ allowInsecureHttp: false
 
 settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL` 凭证中的 URL 会在启动时自动迁移到 settings，之后凭证值仅作兜底。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
 
+### 多个 Grafana 源站
+
+设置卡片管理的是一个**具名 Grafana 源站列表**，而不再是单组 URL/令牌。每个源站包含：
+
+- **源站名称**（必填、唯一）：中英文皆可。它就是调用工具时传入 `source` 参数用以指定目标源站的值。
+- **UID**（只读）：自动生成、全球唯一，以淡色小字显示在名称正下方。它是内部稳定主键——改名不会改变 UID，也不会影响已存令牌，且用户无法编辑。
+- **Grafana URL** 与 **Service Account Token**：每个源站各自独立。令牌各自以仅写不读的方式存入 DSH 凭证库，凭证名为 `GRAFANA_TOKEN_<uid>`；迁移而来的默认源站沿用旧的 `GRAFANA_TOKEN`。
+
+点击**新增源站**创建，**移除源站**删除（其已存令牌也会一并清除），**设为默认**选择省略 `source` 时使用哪一台。**保存**会写入整个列表；写入前会先校验全部名称与 URL，因此非法条目不会留下半保存状态。
+
+每个工具都接受可选的 `source` 参数（源站名称），省略则用默认源站。调用 `grafana_sources` 可列出已配置的名称、UID、URL、令牌是否已配以及哪一台是默认源站。写操作的审批文案首行始终标明目标源站名称与 URL，方便确认改的是哪一台。早期版本的单源配置会在启动时迁移为一个名为 `default` 的源站。`allowInsecureHttp` 仍是全局设置，对所有源站生效。
+
 ### Grafana 权限
 
 优先使用最小权限 RBAC，只授予目标大盘及文件夹所需范围：
@@ -87,6 +100,8 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 
 ## 工具
 
+每个工具都接受可选的 `source` 参数（已配置的源站名称）用以指定目标 Grafana 实例；省略则用默认源站。详见[多个 Grafana 源站](#多个-grafana-源站)。
+
 | 工具 | 行为 |
 | --- | --- |
 | `grafana_get` | 获取完整大盘，并保存一个短期可信的版本和目录快照。传 `summary: true` 时改为返回结构化摘要（面板、查询、阈值、变量），不记录写快照，适合超大盘。 |
@@ -95,6 +110,7 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_health` | 检查 Grafana 连通性与 Service Account 凭证。 |
+| `grafana_sources` | 列出已配置的 Grafana 源站：每个源站的名称、只读 UID、URL、令牌是否已配，以及哪一台是默认源站。只读，绝不返回令牌值。在向其它工具传 `source` 之前，可用它发现合法的源站名称。 |
 
 ### 模板变量覆盖（`grafana_query`）
 
