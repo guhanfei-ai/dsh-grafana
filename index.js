@@ -132,14 +132,20 @@ export function apply(ctx, config = {}) {
         const current = descriptor?.value ?? scope.get()
         const hasSources = Array.isArray(current?.sources) && current.sources.length > 0
         if (!hasSources) {
-          const tokenPresent = Boolean((await sctx.credentials.resolve(TOKEN_REF))?.value)
+          // 沿用解析后的单源 tokenRef：旧版允许自定义引用（凭证库里存的也是那个
+          // ref），迁移时改回默认 GRAFANA_TOKEN 会让新源站指向不存在的凭证，
+          // 全部鉴权调用当场失败。
+          const legacyTokenRef = (typeof current?.tokenRef === 'string' && current.tokenRef.trim())
+            ? current.tokenRef.trim()
+            : TOKEN_REF
+          const tokenPresent = Boolean((await sctx.credentials.resolve(legacyTokenRef))?.value)
           const legacyUrl = current.baseUrl || stored?.value || ''
           if (legacyUrl || tokenPresent) {
             const id = generateSourceId()
             await sctx.settings.update(
               SETTINGS_NAMESPACE,
               {
-                sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: TOKEN_REF }],
+                sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }],
                 defaultSource: id,
               },
               Number.isInteger(descriptor?.revision) ? descriptor.revision : undefined,
@@ -169,6 +175,9 @@ export function apply(ctx, config = {}) {
       const src = rt.resolveSource(exec.arguments?.source)
       grafanaSource = { name: src.name, baseUrl: src.baseUrl }
       srt = rt.forSource(src)
+      // 把审批时解析出的源站绑定到本次调用：执行阶段若解析到别的源站
+      // （默认源站在等待批准期间被改掉）就拒绝写入，而不是写到另一台。
+      rt.bindApproval(exec, src)
     } catch (error) {
       grafanaSource = { error: error?.message ?? String(error) }
     }

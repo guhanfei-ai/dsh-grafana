@@ -100,20 +100,23 @@ async function assertNoWriteSnapshot(listeners) {
 const AM_PATH = '/api/alertmanager/grafana/api/v2/alerts'
 const RULES_PATH = '/api/v1/provisioning/alert-rules'
 
+// 状态枚举以 Alertmanager v2 契约为准（Grafana 的 GettableAlerts 直接复用它）：
+// active / suppressed / unprocessed，没有 firing。fixture 必须用真实形状，否则
+// 测试会与实现共享同一个错误假设，把「漏报全部活跃告警」测成绿的。
 const FIRING = {
   labels: { alertname: 'HighRPM', severity: 'warning', grafana_folder: 'prod' },
   annotations: { summary: 'RPM above 900 for 5m', dashboardUid: 'fixture-dash-0001' },
-  status: { state: 'firing', silencedBy: [], inhibitedBy: [] },
+  status: { state: 'active', silencedBy: [], inhibitedBy: [] },
   startsAt: '2026-09-08T10:12:00Z',
   endsAt: '0001-01-01T00:00:00Z',
   fingerprint: '9f8e7d6c',
   generatorURL: 'https://grafana.example.com/alerting/grafana/abc/view',
 }
-// AM 会把被静默的告警仍标成 state=firing：判据是 silencedBy，不是 state。
+// AM 会把被静默的告警仍标成 state=active：判据是 silencedBy，不是 state。
 const SILENCED = {
   labels: { alertname: 'DiskFull', severity: 'critical', grafana_folder: 'prod' },
   annotations: { description: 'disk at 95%' },
-  status: { state: 'firing', silencedBy: ['maint-window'], inhibitedBy: [] },
+  status: { state: 'active', silencedBy: ['maint-window'], inhibitedBy: [] },
   startsAt: '2026-09-08T09:00:00Z',
   fingerprint: '1a2b3c4d',
 }
@@ -127,7 +130,7 @@ const INHIBITED = {
 const STAGING = {
   labels: { alertname: 'HighLatency', severity: 'info', grafana_folder: 'staging' },
   annotations: { summary: 'p99 over 800ms' },
-  status: { state: 'firing', silencedBy: [], inhibitedBy: [] },
+  status: { state: 'active', silencedBy: [], inhibitedBy: [] },
   startsAt: '2026-09-08T07:00:00Z',
   fingerprint: 'ccddeeff',
 }
@@ -151,12 +154,16 @@ const RULES = [
 // ── 纯函数 ─────────────────────────────────────────────────────────────────
 
 test('alertState trusts silence and inhibition over the raw Alertmanager state', () => {
+  // 上游 active（Alertmanager v2 的「正在烧」）映射为工具对外的 firing。
   assert.equal(alertState(FIRING), 'firing')
-  // AM 标着 firing，但已被静默：模型要问的是「还有没有人在被叫」。
+  // 旧版本/其它实现仍可能直接给 firing，同样认。
+  assert.equal(alertState({ status: { state: 'firing' } }), 'firing')
+  // AM 标着 active，但已被静默：模型要问的是「还有没有人在被叫」。
   assert.equal(alertState(SILENCED), 'suppressed')
   assert.equal(alertState(INHIBITED), 'suppressed')
   // 第三态如实报出，不猜成 firing。
   assert.equal(alertState({ status: { state: 'unprocessed' } }), 'unprocessed')
+  assert.equal(alertState({ status: { state: 'suppressed' } }), 'suppressed')
   assert.equal(alertState({}), 'unknown')
   assert.equal(alertState(null), 'unknown')
 })
@@ -379,7 +386,7 @@ test('grafana_alerts caps both sections and discloses each cap separately', asyn
   const many = Array.from({ length: MAX_ALERT_ROWS + 5 }, (_, i) => ({
     labels: { alertname: `A${i}`, grafana_folder: 'prod' },
     annotations: { summary: 'x' },
-    status: { state: 'firing', silencedBy: [], inhibitedBy: [] },
+    status: { state: 'active', silencedBy: [], inhibitedBy: [] },
     startsAt: '2026-09-08T10:00:00Z',
   }))
   const manyRules = Array.from({ length: MAX_ALERT_RULE_ROWS + 3 }, (_, i) => ({

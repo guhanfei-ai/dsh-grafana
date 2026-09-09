@@ -20,16 +20,20 @@ import {
   TREND_MAX_BUCKETS,
   TREND_WINDOW_DAYS,
 } from '../lib/constants.js'
+import { collectPanelQueries } from '../lib/panels.js'
 import {
   bucketizeSeries,
   classifyTrend,
   filterDatasources,
   formatDatasourceRows,
+  interpolateVariables,
+  interpolateVariablesJson,
   renderSparkline,
   resolveTimeRangeMs,
   summarizeFrames,
   summarizeMetricResult,
   summarizeTrendFrames,
+  variableValuesOf,
 } from '../lib/query.js'
 
 // 本文件覆盖 grafana_datasources / grafana_metric / grafana_trend 三个只读观测工具，
@@ -824,7 +828,9 @@ test('grafana_trend stamps the sampling keys on every query but server-side expr
     assert.equal(second.maxDataPoints, TREND_DEFAULT_BUCKETS)
     // 表达式 target 由服务端引擎解析，不接受采样键：三键均不得出现。
     assert.equal(expression.refId, 'B')
-    assert.equal(expression.expression, '$A / 60')
+    // 本面板的 A 因撞车改名为 p2xA，表达式里的 $A 必须跟着改：Grafana 表达式
+    // 引擎按 refId 在同一次请求里解析依赖，留在 $A 会绑到第一面板的 A 上。
+    assert.equal(expression.expression, '$p2xA / 60')
     assert.equal('range' in expression, false)
     assert.equal('instant' in expression, false)
     assert.equal('intervalMs' in expression, false)
@@ -1095,4 +1101,509 @@ test('summarizeFrames and summarizeTrendFrames redact credential shapes in in-ba
     summarizeTrendFrames([record], { A: { error } }, { points: 24, range: 'now-1h..now' }),
     ['panel id=7 "RPM": query A: failed: upstream echoed [redacted] in the error body'],
   )
+})
+
+// ── 跨面板表达式依赖（Grafana 表达式引擎按 refId 解析） ────────────────────────
+// 两个面板都用 refId "A" 时，后一个被改名（p<panelId>xA）；表达式里的 $A / A 必须
+// 跟着改，否则会绑到第一个面板的 A——同样的查询在浏览器里是对的，插件却给出错值。
+const EXPR_PROM = { type: 'prometheus', uid: 'prom-prod' }
+const EXPR_DS = { type: '__expr__', uid: '__expr__' }
+const SHARED_REFID_DASHBOARD = {
+  id: 7, uid: 'abc123', title: 'Overview', version: 1,
+  panels: [
+    { id: 1, title: 'First', datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+    {
+      id: 2,
+      title: 'Second',
+      datasource: EXPR_PROM,
+      targets: [
+        { refId: 'A', expr: 'vector(60)' },
+        { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A / 60' },
+        { refId: 'C', datasource: EXPR_DS, type: 'reduce', reducer: 'last', expression: 'A' },
+        {
+          refId: 'D',
+          datasource: EXPR_DS,
+          type: 'threshold',
+          expression: 'C',
+          conditions: [{ type: 'query', evaluator: { params: [0], type: 'gt' }, operator: { type: 'and' }, query: { params: ['C'] }, reducer: { params: [], type: 'last' } }],
+        },
+      ],
+    },
+  ],
+}
+
+test('refId de-duplication rewrites the expression and condition references of the same panel', () => {
+  const { queries } = collectPanelQueries({
+    dashboard: SHARED_REFID_DASHBOARD,
+    selected: SHARED_REFID_DASHBOARD.panels,
+    ...variableValuesOf(SHARED_REFID_DASHBOARD, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(queries.map((query) => query.refId), ['A', 'p2xA', 'B', 'C', 'D'])
+  // math：裸 $A 与裸 A 都要指向改名后的本面板查询，而不是第一个面板的 A。
+  assert.equal(queries[2].expression, '$p2xA / 60')
+  assert.equal(queries[3].expression, 'p2xA')
+  // threshold：expression 与 conditions[].query.params 都是 refId 引用。
+  assert.equal(queries[4].expression, 'C')
+  assert.deepEqual(queries[4].conditions[0].query.params, ['C'])
+  // 非表达式 target 的查询文本不是 refId 引用，一个字都不许动。
+  assert.equal(queries[0].expr, 'vector(600)')
+  assert.equal(queries[1].expr, 'vector(60)')
+})
+
+// 依赖闭包：本面板的输入被跳过（未解析变量）时，表达式必须一起跳过——留在请求里
+// 只会让服务端拿另一面板的同名查询当输入，算出看起来正常却是错的值。
+test('an expression whose own input was skipped is skipped instead of borrowing another panel', () => {
+  const dashboard = {
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+      {
+        id: 2,
+        datasource: EXPR_PROM,
+        targets: [
+          { refId: 'A', expr: 'up{job="$undefined_var"}' },
+          { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A / 60' },
+        ],
+      },
+    ],
+  }
+  const { queries, skipped } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(queries.map((query) => query.refId), ['A'])
+  assert.equal(skipped.some((entry) => /is not part of this request/.test(entry.message)), true)
+})
+
+// Grafana 的「隐藏查询只参与表达式」是常见写法：被隐藏的输入必须跟着一起发，
+// 否则表达式缺依赖。
+test('a hidden input referenced by an expression is sent with the panel', () => {
+  const dashboard = {
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+      {
+        id: 2,
+        datasource: EXPR_PROM,
+        targets: [
+          { refId: 'A', hide: true, expr: 'vector(60)' },
+          { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A / 60' },
+        ],
+      },
+    ],
+  }
+  const { queries } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(queries.map((query) => query.refId), ['A', 'p2xA', 'B'])
+  assert.equal(queries[2].expression, '$p2xA / 60')
+})
+
+// 引用语法提取，不以「本面板已有目标」为白名单：A 根本不在本面板时同样是缺失
+// 依赖，否则这条引用会悄悄绑到另一个面板的 A 上（错误数值，且没有任何提示）。
+test('an expression referencing a refId this panel does not have is skipped', () => {
+  const dashboard = {
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+      { id: 2, datasource: EXPR_PROM, targets: [{ refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A/60' }] },
+    ],
+  }
+  const { queries, skipped } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(queries.map((query) => query.refId), ['A'])
+  assert.equal(skipped.some((entry) => entry.refIds.includes('B') && /is not part of this request/.test(entry.message)), true)
+})
+
+// 数学函数与 refId 同名：`abs($A)` 里的 abs 是函数不是引用，不能被改名。
+test('a math function name is never rewritten even when a refId shares it', () => {
+  const dashboard = {
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'abs', expr: 'vector(600)' }] },
+      {
+        id: 2,
+        datasource: EXPR_PROM,
+        targets: [
+          { refId: 'abs', expr: 'vector(60)' },
+          { refId: 'A', expr: 'vector(1)' },
+          { refId: 'B', datasource: EXPR_DS, type: 'math', expression: 'abs($A)' },
+        ],
+      },
+    ],
+  }
+  const { queries } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.equal(queries.at(-1).expression, 'abs($A)')
+})
+
+// 完整括号引用内部的名字不是独立依赖：`${Query A}` 不能被拆出一个 A。
+test('a braced reference is never mistaken for the refIds inside it', () => {
+  const dashboard = {
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+      {
+        id: 2,
+        datasource: EXPR_PROM,
+        targets: [
+          { refId: 'A', expr: 'up{job="$missing_var"}' },
+          { refId: 'Query A', expr: 'vector(60)' },
+          { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '${Query A}/60' },
+        ],
+      },
+    ],
+  }
+  const { queries } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  // A 因变量未解析被跳过，但 B 依赖的是 Query A，应正常发出。
+  assert.deepEqual(queries.map((query) => query.refId).sort(), ['A', 'B', 'Query A'].sort())
+  assert.equal(queries.find((query) => query.refId === 'B').expression, '${Query A}/60')
+})
+
+// 多级依赖闭包：隐藏链 A→B→C 要整条带上；失效链要逐级传播到稳定。
+test('dependency closure is computed transitively for hidden and failing chains', () => {
+  const chained = (first) => ({
+    panels: [
+      { id: 1, datasource: EXPR_PROM, targets: [{ refId: 'A', expr: 'vector(600)' }] },
+      {
+        id: 2,
+        datasource: EXPR_PROM,
+        targets: [
+          { refId: 'A', ...first },
+          { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A/60', ...(first.hide ? { hide: true } : {}) },
+          { refId: 'C', datasource: EXPR_DS, type: 'math', expression: '$B*2' },
+        ],
+      },
+    ],
+  })
+  // 隐藏链：A、B 都隐藏但被依赖，C 可见 → 整条发出。
+  const hidden = chained({ expr: 'vector(60)', hide: true })
+  const hiddenResult = collectPanelQueries({
+    dashboard: hidden,
+    selected: hidden.panels,
+    ...variableValuesOf(hidden, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(hiddenResult.queries.map((query) => query.refId), ['A', 'p2xA', 'B', 'C'])
+
+  // 失效链：A 变量解析失败 → B、C 连带跳过，不留断开的引用。
+  const broken = chained({ expr: 'up{job="$missing_var"}' })
+  const brokenResult = collectPanelQueries({
+    dashboard: broken,
+    selected: broken.panels,
+    ...variableValuesOf(broken, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(brokenResult.queries.map((query) => query.refId), ['A'])
+  assert.equal(brokenResult.skipped.filter((entry) => /is not part of this request/.test(entry.message)).length, 2)
+})
+
+// 词法边界：带空格的 refId 只能在 ${} 里引用；`1e3` 里的 `e3` 是数字不是引用。
+test('expression rewriting matches whole references only', () => {
+  for (const [refId, expression, expected] of [
+    ['Query A', '${Query A} / 60', '${p2xQuery A} / 60'],
+    ['e3', '$e3 / 1e3', '$p2xe3 / 1e3'],
+  ]) {
+    const dashboard = {
+      panels: [
+        { id: 1, datasource: EXPR_PROM, targets: [{ refId, expr: 'vector(600)' }] },
+        {
+          id: 2,
+          datasource: EXPR_PROM,
+          targets: [
+            { refId, expr: 'vector(60)' },
+            { refId: 'B', datasource: EXPR_DS, type: 'math', expression },
+          ],
+        },
+      ],
+    }
+    const { queries } = collectPanelQueries({
+      dashboard,
+      selected: dashboard.panels,
+      ...variableValuesOf(dashboard, null),
+      adhocEntries: [],
+      datasourceIndex: null,
+    })
+    assert.equal(queries[1].refId, `p2x${refId}`)
+    assert.equal(queries[2].expression, expected)
+  }
+})
+
+test('a panel whose refIds never collide keeps its expression references untouched', () => {
+  const dashboard = { panels: [SHARED_REFID_DASHBOARD.panels[1]] }
+  const { queries } = collectPanelQueries({
+    dashboard,
+    selected: dashboard.panels,
+    ...variableValuesOf(dashboard, null),
+    adhocEntries: [],
+    datasourceIndex: null,
+  })
+  assert.deepEqual(queries.map((query) => query.refId), ['A', 'B', 'C', 'D'])
+  assert.equal(queries[1].expression, '$A / 60')
+  assert.equal(queries[2].expression, 'A')
+})
+
+// 逐面板降级（批量失败后）同样带着改写后的引用：整批请求里改名过，单面板重发
+// 时若退回原名，引用就断了。
+test('the per-panel fallback keeps the rewritten references', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/dashboards/uid/')) {
+      return jsonResponse({ meta: { folderUid: '', canSave: true }, dashboard: SHARED_REFID_DASHBOARD })
+    }
+    const body = JSON.parse(init.body)
+    bodies.push(body)
+    // 第一次批量请求失败，逼出逐面板降级。
+    if (body.queries.length > 1) throw new Error('batch exploded')
+    return jsonResponse({ results: {} })
+  }
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_panel_query').execute({ urlOrUid: 'abc123' }, execution())
+    const perPanel = bodies.slice(1)
+    assert.equal(perPanel.length, 2)
+    const second = perPanel[1]
+    assert.deepEqual(second.queries.map((query) => query.refId), ['p2xA', 'B', 'C', 'D'])
+    assert.equal(second.queries[1].expression, '$p2xA / 60')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// reduce/resample 的 expression 是「整个输入 refId」（Grafana v11 pkg/expr/commands.go
+// 的 UnmarshalReduceCommand / UnmarshalResampleCommand 只去掉可选的 $ 前缀，
+// NeedsVars 返回该完整名称），不能按 math 公式拆词。输入名可以含空格、连字符，
+// 甚至以数字开头——拆词会让本面板明明存在的输入被判成缺失依赖，或让多面板
+// 同名的数字输入悄悄绑到别的面板上。
+const exprHarness = (panels) => collectPanelQueries({
+  dashboard: { panels },
+  selected: panels,
+  ...variableValuesOf({ panels }, null),
+  adhocEntries: [],
+  datasourceIndex: null,
+})
+
+test('reduce and resample treat the whole expression as one input refId', () => {
+  const { queries, skipped } = exprHarness([
+    {
+      id: 1, datasource: EXPR_PROM, targets: [
+        { refId: 'Query A', expr: 'vector(1)' },
+        { refId: 'B', datasource: EXPR_DS, type: 'reduce', reducer: 'last', expression: 'Query A' },
+      ],
+    },
+    {
+      id: 2, datasource: EXPR_PROM, targets: [
+        { refId: 'Query A', expr: 'vector(2)' },
+        { refId: 'C', datasource: EXPR_DS, type: 'resample', downsampler: 'last', expression: '$Query A' },
+      ],
+    },
+  ])
+  // 依赖按整体名命中，两个面板的输入都发出；第二面板输入跨面板撞车改名。
+  assert.deepEqual(queries.map((query) => query.refId), ['Query A', 'B', 'p2xQuery A', 'C'])
+  // expression 整体跟随改写（带 $ 前缀的同样收敛到新名）。
+  assert.equal(queries[1].expression, 'Query A')
+  assert.equal(queries[3].expression, 'p2xQuery A')
+  assert.equal(skipped.length, 0)
+})
+
+test('a hyphenated input name stays whole for reduce', () => {
+  const { queries, skipped } = exprHarness([
+    {
+      id: 1, datasource: EXPR_PROM, targets: [
+        { refId: 'A-B', expr: 'vector(1)' },
+        { refId: 'B', datasource: EXPR_DS, type: 'reduce', reducer: 'last', expression: 'A-B' },
+      ],
+    },
+  ])
+  // `A-B` 是一个 refId，不是「A 减 B」：依赖命中本面板输入（词法拆词会把 A-B
+  // 拆散，把这个 reduce 误判成缺失依赖而白白跳过）。
+  assert.deepEqual(queries.map((query) => query.refId), ['A-B', 'B'])
+  assert.equal(queries[1].expression, 'A-B')
+  assert.equal(skipped.length, 0)
+})
+
+test('a numeric input name is followed through the rename', () => {
+  const { queries, skipped } = exprHarness([
+    { id: 1, datasource: EXPR_PROM, targets: [{ refId: '1', expr: 'vector(1)' }] },
+    {
+      id: 2, datasource: EXPR_PROM, targets: [
+        { refId: '1', expr: 'vector(2)' },
+        { refId: 'B', datasource: EXPR_DS, type: 'reduce', reducer: 'last', expression: '1' },
+      ],
+    },
+  ])
+  // 两面板同用 refId "1"：第二面板输入正确改名，其 reduce 的 expression 必须跟到
+  // 新名——词法扫描对数字开头的名字视而不见，会把 expression=1 原样留下，静默
+  // 绑到第一面板的输入上。
+  assert.deepEqual(queries.map((query) => query.refId), ['1', 'p2x1', 'B'])
+  assert.equal(queries[2].expression, 'p2x1')
+  assert.equal(skipped.length, 0)
+})
+
+// math 的裸名字是常量或函数（Grafana 的 math 命令只认 $name / ${name}）：不制造
+// 缺失依赖，也不参与改写。
+test('math bare names are constants, not references', () => {
+  const { queries, skipped } = exprHarness([
+    {
+      id: 2, datasource: EXPR_PROM, targets: [
+        { refId: 'A', expr: 'vector(2)' },
+        { refId: 'B', datasource: EXPR_DS, type: 'math', expression: '$A + zzz' },
+      ],
+    },
+  ])
+  // zzz 是常量：不因「zzz 不在本面板」而跳过 B。
+  assert.deepEqual(queries.map((query) => query.refId), ['A', 'B'])
+  assert.equal(queries[1].expression, '$A + zzz')
+  assert.equal(skipped.length, 0)
+})
+
+// ── All 全选变量（Grafana 保存 $__all，查询前必须展开） ───────────────────────
+test('an All variable expands to its custom allValue or to every option but All', () => {
+  // 自定义 allValue：原样展开（常见写法是正则，插件不再加工）。
+  const custom = {
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true, allValue: '.*',
+      current: { value: '$__all', text: 'All' },
+      options: [{ value: '$__all', text: 'All' }, { value: 'a', text: 'a' }],
+    }] },
+    panels: [],
+  }
+  assert.equal(interpolateVariables('up{job=~"$job"}', variableValuesOf(custom, null).values), 'up{job=~".*"}')
+
+  // 无 allValue：展开除 All 之外的全部 option（Prometheus 多值渲染为 (a|b)）。
+  const fromOptions = {
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true,
+      current: { value: ['$__all'], text: 'All' },
+      options: [{ value: '$__all', text: 'All' }, { value: 'a', text: 'a' }, { value: 'b', text: 'b' }],
+    }] },
+    panels: [],
+  }
+  // 面板管线走的是 JSON 插值（promql 模式下裸多值渲染为 (a|b)）。
+  assert.equal(
+    interpolateVariablesJson('up{job=~"$job"}', variableValuesOf(fromOptions, null).values, { promql: true }),
+    'up{job=~"(a|b)"}',
+  )
+  // 覆盖值里的 $__all 与浏览器里选 All 等价。
+  assert.equal(
+    interpolateVariablesJson('up{job=~"$job"}', variableValuesOf(fromOptions, { job: '$__all' }).values, { promql: true }),
+    'up{job=~"(a|b)"}',
+  )
+  // 普通保存值不受影响。
+  assert.equal(
+    interpolateVariablesJson('up{job=~"$job"}', variableValuesOf(fromOptions, { job: 'a' }).values, { promql: true }),
+    'up{job=~"a"}',
+  )
+})
+
+// 自定义 All 是用户写好的最终文本：Grafana 不对它再套格式修饰符，二次转义会把
+// `.*` 变成 `\.\*`、把 `'a','b'` 变成 `'''a'',''b'''`，查询范围随之错误。
+test('a custom All value is not formatted twice', () => {
+  const withAllValue = (allValue) => variableValuesOf({
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true, allValue,
+      current: { value: '$__all', text: 'All' },
+      options: [{ value: '$__all' }, { value: 'a' }],
+    }] },
+    panels: [],
+  }, null).values
+  assert.equal(interpolateVariables('$job', withAllValue('.*')), '.*')
+  assert.equal(interpolateVariables('${job:raw}', withAllValue('.*')), '.*')
+  assert.equal(interpolateVariables('${job:regex}', withAllValue('.*')), '.*')
+  assert.equal(interpolateVariables('${job:sqlstring}', withAllValue("'a','b'")), "'a','b'")
+  // 按 option 展开的值没有这层豁免：它是普通多值，照常格式化。
+  const fromOptions = variableValuesOf({
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true,
+      current: { value: '$__all', text: 'All' },
+      options: [{ value: '$__all' }, { value: 'a' }, { value: "b'c" }],
+    }] },
+    panels: [],
+  }, null).values
+  assert.equal(interpolateVariables('${job:sqlstring}', fromOptions), "'a','b''c'")
+})
+
+// 保存态无法展开 All 时，调用方用 variables 明确给值必须能救回来（报错本身指的就是这条路）。
+test('an explicit override restores a variable whose saved All state cannot be expanded', () => {
+  const dashboard = {
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true,
+      current: { value: '$__all', text: 'All' },
+      options: [{ value: '$__all', text: 'All' }],
+    }] },
+    panels: [],
+  }
+  const { values } = variableValuesOf(dashboard, { job: 'a' })
+  assert.equal(interpolateVariables('up{job=~"$job"}', values), 'up{job=~"a"}')
+})
+
+test('an All variable with nothing to expand into is reported instead of queried', () => {
+  const dashboard = {
+    templating: { list: [{
+      name: 'job', type: 'query', multi: true, includeAll: true,
+      current: { value: '$__all', text: 'All' },
+      options: [{ value: '$__all', text: 'All' }],
+    }] },
+    panels: [],
+  }
+  // 把 $__all 当筛选值发出去只会静默匹配不到任何序列，必须显式报错。
+  assert.throws(() => variableValuesOf(dashboard, null), /is set to All, but this dashboard stores neither/)
+})
+
+// ── 日志帧：正文列不是首列（首列常常是时间戳） ─────────────────────────────────
+const LOG_FRAME = {
+  schema: { fields: [{ name: 'Time', type: 'time' }, { name: 'Line', type: 'string' }] },
+  data: { values: [[1788912000000, 1788912001000], ['first log line', 'last log line']] },
+}
+const LOG_RECORD = { panel: { id: 4, title: 'Logs' }, refId: 'A', originalRefId: 'A' }
+
+test('log frames report the last log line, not the last timestamp', () => {
+  for (const output of [
+    summarizeFrames([LOG_RECORD], { A: { frames: [LOG_FRAME] } }).join('\n'),
+    summarizeTrendFrames([LOG_RECORD], { A: { frames: [LOG_FRAME] } }, { points: 24, range: 'now-1h..now' }).join('\n'),
+    summarizeMetricResult([LOG_FRAME], { mode: 'range', datasource: { type: 'loki', uid: 'loki-1' }, expr: '{app="x"}' }).join('\n'),
+  ]) {
+    assert.match(output, /last="?last log line/)
+    // 时间戳被当成末行日志是这个缺陷的全部症状：它绝不能出现在输出里。
+    assert.doesNotMatch(output, /1788912001000/)
+  }
+})
+
+test('log frames pick the body column by name when the field order changes', () => {
+  // 顺序调换 + 多个 string 列：按字段名命中正文（Line），而不是首列。
+  const frame = {
+    schema: { fields: [
+      { name: 'level', type: 'string' },
+      { name: 'ts', type: 'time' },
+      { name: 'Line', type: 'string' },
+    ] },
+    data: { values: [['info', 'error'], [1788912000000, 1788912001000], ['msg one', 'msg two']] },
+  }
+  const line = summarizeFrames([LOG_RECORD], { A: { frames: [frame] } }).join('\n')
+  assert.match(line, /last="msg two"/)
+  assert.doesNotMatch(line, /last="error"/)
+  assert.doesNotMatch(line, /1788912001000/)
 })

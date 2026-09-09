@@ -5,23 +5,27 @@ import vm from 'node:vm'
 
 // 在 vm 沙箱里加载浏览器 bundle：注入 URL、window.__ModuleLoader__ 与 crypto
 // （generateSourceId 走 crypto.randomUUID 路径需要它）。返回 { definition, runtime }。
-function loadBrowserModule() {
+function loadBrowserModule(react = {}) {
   let definition
-  const window = { __ModuleLoader__: { load(value) { definition = value } } }
+  const window = { __ModuleLoader__: { load(value) { definition = value } }, confirm: () => true }
   vm.runInNewContext(
     readFileSync(new URL('../client.js', import.meta.url), 'utf8'),
     { URL, window, crypto: globalThis.crypto },
   )
   const runtime = definition.factory((id) => {
-    if (id === 'react/jsx-runtime') return { jsx() {}, jsxs() {} }
-    if (id === 'react') return {}
+    // jsx/jsxs 返回可遍历的节点：组件级用例要按 type/children 找到按钮与输入框。
+    if (id === 'react/jsx-runtime') {
+      const node = (type, props) => ({ type, props })
+      return { jsx: node, jsxs: node }
+    }
+    if (id === 'react') return react
     throw new Error(`Unexpected browser dependency: ${id}`)
   })
   return { definition, runtime }
 }
 
-function loadBrowserRuntime() {
-  return loadBrowserModule().runtime
+function loadBrowserRuntime(react) {
+  return loadBrowserModule(react).runtime
 }
 
 // 装配 face 并挂上可变的 settings/credentials mock。所有跨 realm 对象一律用
@@ -41,14 +45,16 @@ function loadBrowserRuntime() {
 //   · settings.describe 的 value 是聚合格 { writable, hasDocument, namespaces[] }。
 // remote:false 模拟没有 remote.* 命名空间服务的旧宿主；fail 按方法名注入 { ok:false }
 // 应答（例如 { 'credentials.describe': '...' }），用于验证失败不会被静默吞掉。
-function setup({ sources = [], defaultSource = '', creds = {}, locale = 'zh', remote = true, fail = {} } = {}) {
+function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = 'zh', fail = {} } = {}) {
   const calls = []
-  let grafanaValue = { sources: sources.map((s) => ({ ...s })), defaultSource }
+  // state 是后端的可变权威：多个卡片（多个设置页）可以共享同一份，用来复现并发保存。
   const credState = { ...creds }
-  let face
-  const rejected = (what) => (fail[what] ? { ok: false, error: { message: fail[what] } } : null)
+  const state = { sources: sources.map((s) => ({ ...s })), defaultSource, revision: 0, creds: credState, writes: [] }
+  // 可变副本：用例可以在运行期摘掉某条失败注入，模拟「故障恢复」。
+  const failState = { ...fail }
+  const rejected = (what) => (failState[what] ? { ok: false, error: { message: failState[what] } } : null)
   // 真机 describe 应答里每个命名空间描述符的完整键集。
-  const descriptor = (ns, value) => ({ ns, schema: null, value, base: {}, user: {}, applies: 'live', secrets: [], revision: 0 })
+  const descriptor = (ns, value) => ({ ns, schema: null, value, base: {}, user: {}, applies: 'live', secrets: [], revision: state.revision })
   const credentials = {
     async describe(...args) {
       calls.push(['credentials.describe', args])
@@ -82,7 +88,7 @@ function setup({ sources = [], defaultSource = '', creds = {}, locale = 'zh', re
       const bad = rejected('settings.describe')
       if (bad) return bad
       return { ok: true, value: { writable: true, hasDocument: true, namespaces: [
-        descriptor('grafana', { sources: grafanaValue.sources.map((s) => ({ ...s })), defaultSource: grafanaValue.defaultSource }),
+        descriptor('grafana', { sources: state.sources.map((s) => ({ ...s })), defaultSource: state.defaultSource }),
         descriptor('locale', { preference: locale }),
       ] } }
     },
@@ -92,45 +98,123 @@ function setup({ sources = [], defaultSource = '', creds = {}, locale = 'zh', re
       const bad = rejected('settings.update')
       if (bad) return bad
       if (ns === 'grafana' && patch) {
-        if (patch.sources !== undefined) grafanaValue.sources = patch.sources.map((s) => ({ ...s }))
-        if (patch.defaultSource !== undefined) grafanaValue.defaultSource = patch.defaultSource
+        if (patch.sources !== undefined) state.sources = patch.sources.map((s) => ({ ...s }))
+        if (patch.defaultSource !== undefined) state.defaultSource = patch.defaultSource
       }
-      return { ok: true, value: descriptor('grafana', { ...grafanaValue }) }
+      return { ok: true, value: descriptor('grafana', { ...state }) }
     },
+    // 与宿主一致的乐观并发语义：带过期 expectedRevision 的写入以冲突拒绝。
     async mutate(...args) {
       calls.push(['settings.mutate', args])
-      const [ns, ops] = args
+      const [ns, ops, expectedRevision] = args
       const bad = rejected('settings.mutate')
       if (bad) return bad
+      if (expectedRevision !== undefined && expectedRevision !== state.revision) {
+        return { ok: false, error: { message: 'revision conflict' } }
+      }
+      state.writes.push({ expectedRevision })
       // 与宿主 dsh-settings 的 applyPathOp 语义一致：set 对目标路径整体赋值。
       for (const op of ops ?? []) {
         if (ns !== 'grafana' || !op?.op) continue
-        if (op.op === 'set' && op.path?.[0] === 'sources') grafanaValue.sources = (op.value ?? []).map((s) => ({ ...s }))
-        if (op.op === 'set' && op.path?.[0] === 'defaultSource') grafanaValue.defaultSource = op.value
-        if (op.op === 'unset' && op.path?.[0] === 'sources') grafanaValue.sources = []
+        if (op.op === 'set' && op.path?.[0] === 'sources') state.sources = (op.value ?? []).map((s) => ({ ...s }))
+        if (op.op === 'set' && op.path?.[0] === 'defaultSource') state.defaultSource = op.value
+        if (op.op === 'unset' && op.path?.[0] === 'sources') state.sources = []
       }
-      return { ok: true, value: descriptor('grafana', { ...grafanaValue }) }
+      state.revision += 1
+      return { ok: true, value: descriptor('grafana', { ...state }) }
     },
   }
-  const services = remote ? { 'remote.settings': settings, 'remote.credentials': credentials } : {}
-  const runtime = loadBrowserRuntime()
+  return { calls, state, credState, fail: failState, settings, credentials }
+}
+
+// backend：传入已建好的后端即可让多个卡片共享同一份权威状态（复现并发保存）。
+function setup({ backend = null, react = null, remote = true, ...backendOptions } = {}) {
+  const built = backend ?? buildBackend(backendOptions)
+  const services = remote ? { 'remote.settings': built.settings, 'remote.credentials': built.credentials } : {}
+  let face
+  let component = null
+  const runtime = loadBrowserRuntime(react ?? {})
   runtime.apply({
     // cordis ctx.get 语义（4.0.2 实测）：服务缺席时返回 undefined，不抛。
     // 刻意不提供 connection —— 任何回退到 connection.api 的实现都会当场失败。
     get(name) { return services[name] },
     slots: {
       inject(name, callback) { assert.equal(name, 'settings.plugin.item'); callback() },
-      register(specification) {
+      register(specification, card) {
         // keyed slot：key 必须与 index.js 的 SETTINGS_NAMESPACE 一致，且不带 id/order。
         assert.equal(specification.key, 'grafana')
         assert.equal('id' in specification, false)
         assert.equal('order' in specification, false)
         face = specification.inject().grafanaCard
+        component = card
         return () => {}
       },
     },
   })
-  return { face, calls }
+  return { ...built, face, component }
+}
+
+// 并发用例的共享后端：一个已落库的源站 + 一枚已生效的令牌，带版本检查的 mutate。
+function sharedBackend(options = {}) {
+  return buildBackend({
+    locale: 'en',
+    sources: [{ id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }],
+    defaultSource: 'id-a',
+    creds: { GRAFANA_TOKEN_ida: 'demo-token-original' },
+    ...options,
+  })
+}
+
+// 组件级用例：用最小 React 替身（useState 按调用顺序存取、useEffect 只在挂载时
+// 收集）跑真实的 GrafanaCard 闭包——保存、回读与事件处理都来自未修改的 client.js。
+// 这不是 DOM/浏览器验收，只覆盖状态与远端调用序列。
+function cardHarness(options = {}) {
+  const states = []
+  const effects = []
+  let cursor = 0
+  let mounted = false
+  const react = {
+    useState(initial) {
+      const index = cursor++
+      if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial
+      return [states[index], (value) => {
+        states[index] = typeof value === 'function' ? value(states[index]) : value
+      }]
+    },
+    useEffect(effect) { if (!mounted) effects.push(effect) },
+  }
+  // 传入 backend 时多个卡片共用同一份权威状态，用来复现两个设置页的并发保存。
+  const { backend = null, ...rest } = options
+  const harness = setup({ ...rest, backend, react })
+  const render = () => { cursor = 0; return harness.component({ grafanaCard: harness.face }) }
+  render()
+  mounted = true
+  for (const effect of effects) effect()
+  const nodes = (tree) => (!tree || typeof tree !== 'object' ? [] : [
+    tree, ...[tree.props?.children].flat().flatMap(nodes),
+  ])
+  const buttons = () => nodes(render()).filter((node) => node.type === 'button')
+  const inputs = () => nodes(render()).filter((node) => node.type === 'input')
+  return {
+    ...harness,
+    states,
+    buttons,
+    // 等首次 describe 落地，再展开卡片（收起时子内容不渲染）。
+    async ready() {
+      await new Promise(setImmediate)
+      buttons()[0].props.onClick()
+    },
+    change(type, value) {
+      const input = inputs().find((node) => node.props.type === type)
+      assert.ok(input, `no input of type ${type}`)
+      input.props.onChange({ target: { value } })
+    },
+    click(label) {
+      const button = buttons().find((node) => node.props.children === label)
+      assert.ok(button, `no button labelled ${label}`)
+      return button.props.onClick()
+    },
+  }
 }
 
 test('browser module declares the dsh-grafana id, the slots-only inject, and the keyed grafana slot', () => {
@@ -170,11 +254,16 @@ test('describe reads back every source with its token status and the default sou
   const r = await face.describe()
   assert.equal(JSON.stringify(r), JSON.stringify({
     hostUnsupported: false,
+    // 载荷结构有效（读到 namespaces 与 grafana 命名空间）：凭证回收路径可放心
+    // 把它当权威状态；unconfirmed 只在信封 ok 但业务载荷缺失时为 true。
+    unconfirmed: false,
     sources: [
       { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod', tokenConfigured: true },
       { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: false },
     ],
     defaultSource: 'id-eu',
+    // 配置版本随 describe 一起取回：写入时回传，用于拒绝基于陈旧基线的覆盖。
+    revision: 0,
   }))
 })
 
@@ -221,7 +310,7 @@ test('every remote call passes exactly the declared number of arguments', async 
 test('describe returns an empty list without touching credentials when no source is configured', async () => {
   const { face, calls } = setup()
   const r = await face.describe()
-  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: false, sources: [], defaultSource: '' }))
+  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: false, unconfirmed: false, sources: [], defaultSource: '', revision: 0 }))
   // 无源站 → 无 tokenRef 可查，不应调用 credentials.describe。
   assert.equal(calls.some(([m]) => m === 'credentials.describe'), false)
 })
@@ -346,7 +435,7 @@ test('describe reports an unsupported host instead of rendering an empty source 
   // 而不是渲染成“尚未配置源站”的空白态（这就是本缺陷的原始症状）。
   const { face, calls } = setup({ remote: false })
   const r = await face.describe()
-  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: true, sources: [], defaultSource: '' }))
+  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: true, sources: [], defaultSource: '', unconfirmed: true }))
   // 未命中远端门面时不应发出任何远端调用。
   assert.equal(calls.length, 0)
   // 语言偏好在旧宿主上退回浏览器语言（空串），不抛错。
@@ -577,6 +666,228 @@ test('two consecutive failed removals yield distinct pending token refs', async 
   assert.equal(JSON.stringify(pending.map((entry) => entry.name)), JSON.stringify(['a', 'b']))
 })
 
+// 配置允许多个源站共用一个自定义 tokenRef：移除其中一个时，剩余源站仍引用的
+// 凭证不能被回收——「被移除的卡片不再用它」不等于「无人在用」，凭证只写不读，
+// 删掉在用的就再也拿不回来。移除路径与保存路径的轮换保护遵守同一原则。
+test('removing one source keeps the token another source still shares', async () => {
+  const internals = loadBrowserRuntime().internals
+  const shared = 'GRAFANA_TOKEN_shared'
+  const alpha = { id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: shared }
+  const beta = { id: 'id-b', name: 'b', baseUrl: 'https://beta.example.com', tokenRef: shared }
+  const { face, calls, state } = setup({ sources: [alpha, beta], defaultSource: 'id-a', creds: { [shared]: 'demo-shared' } })
+  const outcome = await internals.removeSourceRemote(face, {
+    nextSources: [beta], nextDefault: 'id-b', tokenRef: shared, tokenConfigured: true,
+  })
+  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+  // 未发 unset：剩余源站仍引用该凭证。
+  assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
+  assert.equal(state.creds[shared], 'demo-shared')
+  // 剩余源站的令牌仍可用。
+  const described = await face.describe()
+  assert.equal(described.sources.some((s) => s.id === 'id-b' && s.tokenConfigured), true)
+})
+
+// 移除后用于确认引用的读取收到畸形载荷（信封 ok 但没有 namespaces / grafana 命名空间）：
+// 这是「无法确认」，不是「权威的空列表」——当空集合用会放行对共享凭证的删除。
+test('a malformed post-removal describe keeps the shared token instead of treating it as unreferenced', async () => {
+  const internals = loadBrowserRuntime().internals
+  const shared = 'GRAFANA_TOKEN_shared'
+  const alpha = { id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: shared }
+  const beta = { id: 'id-b', name: 'b', baseUrl: 'https://beta.example.com', tokenRef: shared }
+  const { face, state, settings } = setup({ sources: [alpha, beta], defaultSource: 'id-a', creds: { [shared]: 'demo-shared' } })
+  const realDescribe = settings.describe
+  let malformedOnce = false
+  settings.describe = async (...args) => {
+    // 保存（移除写入）成功后的第一次引用确认读取：{ok:true,value:{}}。
+    if (!malformedOnce) {
+      malformedOnce = true
+      return { ok: true, value: {} }
+    }
+    return realDescribe(...args)
+  }
+  const outcome = await internals.removeSourceRemote(face, {
+    nextSources: [beta], nextDefault: 'id-b', tokenRef: shared, tokenConfigured: true,
+  })
+  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+  // 共享凭证仍在（后续 describe 恢复正常后可见剩余源站仍在引用它）。
+  assert.equal(state.creds[shared], 'demo-shared')
+  const described = await face.describe()
+  assert.equal(described.unconfirmed, false)
+  assert.equal(described.sources.some((s) => s.id === 'id-b' && s.tokenConfigured), true)
+})
+
+// 旧宿主（describe 同时带 hostUnsupported 与 unconfirmed）：升级指引优先于
+// 「数据无法解析」——不能让不可信读取的提示遮蔽明确的宿主不兼容诊断。
+test('an unsupported host shows the upgrade notice, not the unconfirmed-read error', async () => {
+  const card = cardHarness({ remote: false })
+  await card.ready()
+  assert.equal(card.states[3], true)
+  assert.equal(String(card.states[6]), '')
+  assert.equal(card.states[9], false)
+  // Reload 按钮不出现：旧宿主的出路是升级宿主，不是重读。
+  assert.equal(card.buttons().some((node) => node.props.children === 'Reload'), false)
+})
+
+// 确认框保留共享/无法确认则保留的语义，但不再承诺「界面会如实提示」——
+// 那两个保留分支没有对应的界面提示行为，承诺了就是误导。
+test('the remove confirmation keeps the shared-credential wording without promising a notice', () => {
+  const { STRINGS } = loadBrowserRuntime().internals
+  for (const lang of ['zh', 'en']) {
+    const text = STRINGS[lang].confirmRemoveSource
+    assert.match(text, /共用|shares/)
+    assert.doesNotMatch(text, /如实提示|says so/)
+  }
+})
+
+// 保存路径的同形防护（G3 原文场景）：轮换成功后的引用确认读取畸形时，被替换的
+// 共享凭证必须保留——畸形读取不等于「无人引用」。
+test('a malformed read after a successful rotation keeps the shared token', async () => {
+  const remote = sharedBackend()
+  remote.state.sources = [
+    { id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+    { id: 'id-b', name: 'b', baseUrl: 'https://beta.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+  ]
+  remote.state.creds.GRAFANA_TOKEN_alpha = 'demo-shared'
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  assert.ok(card.states[0].every((row) => row.tokenConfigured))
+  const realDescribe = remote.settings.describe
+  let armed = false
+  let malformedOnce = false
+  remote.settings.describe = async (...args) => {
+    // 初始加载已完成（armed 后的第一次读取正是保存路径的引用确认）。
+    if (armed && !malformedOnce) {
+      malformedOnce = true
+      return { ok: true, value: {} }
+    }
+    return realDescribe(...args)
+  }
+  card.change('password', 'demo-alpha-replacement')
+  armed = true
+  await card.click('Save this source')
+  // 保存本身成功：畸形读取只跳过旧引用清理，不把保存渲染成失败。
+  assert.equal(card.states[5], true)
+  const [alpha, beta] = remote.state.sources
+  assert.equal(remote.state.creds[alpha.tokenRef], 'demo-alpha-replacement')
+  // 第二源站仍指向原引用；畸形读取没有被当成「无人引用」，共享凭证必须还在。
+  assert.equal(beta.tokenRef, 'GRAFANA_TOKEN_alpha')
+  assert.equal(remote.state.creds.GRAFANA_TOKEN_alpha, 'demo-shared')
+})
+
+// 结构有效性按宿主契约判定（Host 端 Config 定义 sources: array(...).default([])，
+// 写入口保证每行可识别）：value 非对象、sources 非数组、条目被 normalizeSource
+// 丢弃，都不是合法配置——unconfirmed 必须为 true；合法空配置（sources: []）为 false。
+test('face.describe marks structurally invalid source payloads as unconfirmed', async () => {
+  for (const [value, expected] of [
+    [{}, true],
+    [{ sources: 'invalid' }, true],
+    [{ sources: [null] }, true],
+    ['not-an-object', true],
+    [{ sources: [] }, false],
+    [{ sources: [{ id: 'id-a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }] }, false],
+  ]) {
+    const remote = sharedBackend()
+    const describe = remote.settings.describe
+    remote.settings.describe = async () => ({ ok: true, value: { namespaces: [{ ns: 'grafana', revision: 1, value }] } })
+    const { face } = setup({ backend: remote })
+    const r = await face.describe()
+    assert.equal(r.unconfirmed, expected, `payload ${JSON.stringify(value)} must be unconfirmed=${expected}`)
+    assert.equal(r.unconfirmed, expected)
+    remote.settings.describe = describe
+  }
+})
+
+// 命名空间在场但业务载荷无效（三种形状）：轮换成功后的引用确认读取返回这种载荷，
+// 不能把它当成「权威的空列表」放行对共享凭证的删除。
+test('a namespace with a malformed source payload is unconfirmed, not an empty list', async () => {
+  for (const value of [{}, { sources: 'invalid' }, { sources: [null] }]) {
+    const remote = sharedBackend()
+    remote.state.sources = [
+      { id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+      { id: 'id-b', name: 'b', baseUrl: 'https://beta.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+    ]
+    remote.state.creds.GRAFANA_TOKEN_alpha = 'demo-shared'
+    const card = cardHarness({ backend: remote })
+    await card.ready()
+    assert.ok(card.states[0].every((row) => row.tokenConfigured))
+    const mutate = remote.settings.mutate
+    const describe = remote.settings.describe
+    let next = false
+    remote.settings.mutate = async (...args) => { const result = await mutate(...args); next = true; return result }
+    remote.settings.describe = async (...args) => {
+      // 写入成功后的第一次引用确认读取：命名空间在场、业务载荷无效。
+      if (next) { next = false; return { ok: true, value: { namespaces: [{ ns: 'grafana', revision: 1, value }] } } }
+      return describe(...args)
+    }
+    card.change('password', 'demo-alpha-replacement')
+    await card.click('Save this source')
+    const [alpha, beta] = remote.state.sources
+    assert.equal(remote.state.creds[alpha.tokenRef], 'demo-alpha-replacement')
+    // 第二源站仍指向共享引用：降级出的空列表没有被当「无人引用」，共享凭证保留。
+    assert.equal(beta.tokenRef, 'GRAFANA_TOKEN_alpha')
+    assert.equal(remote.state.creds.GRAFANA_TOKEN_alpha, 'demo-shared')
+    assert.equal(card.states[0][1].tokenConfigured, true)
+  }
+})
+
+// 初次读取 unconfirmed（信封 ok 但载荷缺失）：不能清空基线并开放写入——否则随后
+// 一次保存不带修订号，把已存源站整表替换成新卡。出路是 Reload：恢复正常后替换
+// 基线、带修订号写入。
+test('an unconfirmed initial read keeps the card read-only instead of enabling an empty-baseline save', async () => {
+  const remote = sharedBackend()
+  const describe = remote.settings.describe
+  remote.settings.describe = async () => ({ ok: true, value: {} })
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  // 未就绪：loaded=false、错误指路 Reload、新增被拦（本地仍是空草稿，不是降级基线）。
+  assert.equal(card.states[9], false)
+  assert.match(String(card.states[6]), /cannot be parsed/)
+  card.click('Add source')
+  assert.equal(card.states[0].length, 0)
+  // 恢复正常后 Reload：基线替换、开放写入。
+  remote.settings.describe = describe
+  await card.click('Reload')
+  assert.equal(card.states[9], true)
+  assert.equal(card.states[0].length, 1)
+  assert.equal(String(card.states[6]), '')
+  // 此时保存带修订号（写入不再是空基线的整表覆盖）。
+  card.change('password', 'demo-replacement')
+  await card.click('Save this source')
+  assert.equal(remote.state.writes.at(-1).expectedRevision, 0)
+  assert.equal(remote.state.sources.length, 1)
+  const activeRef = remote.state.sources[0].tokenRef
+  assert.equal(remote.state.creds[activeRef], 'demo-replacement')
+})
+
+// 保存成功但写后回读 unconfirmed：保存已生效（新凭证在库），界面如实显示同步失败
+// 而不是「已保存」；基线不被畸形载荷清空，恢复正常后 Reload 即回到一致状态。
+test('a successful save whose resync read is unconfirmed reports the sync failure, not success', async () => {
+  const remote = sharedBackend()
+  const describe = remote.settings.describe
+  let malformed = false
+  remote.settings.describe = async (...args) => {
+    if (malformed) return { ok: true, value: {} }
+    return describe(...args)
+  }
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  card.change('password', 'demo-replacement')
+  malformed = true
+  await card.click('Save this source')
+  // 保存已生效，但回读无法确认：不显示「已保存」，显示读取错误；基线未被清空。
+  assert.equal(card.states[5], false)
+  assert.match(String(card.states[6]), /cannot be parsed/)
+  const activeRef = remote.state.sources[0].tokenRef
+  assert.equal(remote.state.creds[activeRef], 'demo-replacement')
+  assert.equal(card.states[0].length, 1)
+  // 恢复正常后的下一次保存（草稿未清，仍可保存）以旧基线的修订号触发冲突，
+  // 冲突路径的重读把卡片带回一致状态——显示新令牌已配置。
+  malformed = false
+  await card.click('Save this source')
+  assert.match(String(card.states[6]), /revision conflict/)
+  assert.equal(card.states[0][0].tokenConfigured, true)
+})
+
 test('the card dictionary carries the host-too-old notice in both locales', () => {
   const { STRINGS } = loadBrowserRuntime().internals
   for (const lang of ['zh', 'en']) {
@@ -684,4 +995,279 @@ test('the per-card and save-all captions exist in both locales', () => {
   }
   assert.notEqual(STRINGS.zh.saveCurrentSource, STRINGS.en.saveCurrentSource)
   assert.notEqual(STRINGS.zh.saveAllSources, STRINGS.en.saveAllSources)
+})
+
+// ── 保存并发：整表替换必须带版本检查 ──────────────────────────────────────────
+test('writeSources sends the revision it last read so a stale page cannot overwrite a newer one', async () => {
+  const source = { id: 'id-a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }
+  const { face, calls } = setup({ sources: [source], creds: { GRAFANA_TOKEN_ida: true } })
+  await face.describe()
+  await face.writeSources([{ ...source, name: 'a-edited' }], 'id-a')
+  const mutate = calls.find(([m]) => m === 'settings.mutate')
+  // 第三参必须显式传（arity 严格），且带上最近一次 describe 读到的版本。
+  assert.equal(mutate[1].length, 3)
+  assert.equal(mutate[1][2], 0)
+  // 未显式传版本时同样按最后一次读取的版本做检查（调用方漏传也不能退化成无条件写）：
+  // 重新读取拿到前进后的版本，再一次不传版本地写。
+  await face.describe()
+  await face.writeSources([{ ...source, name: 'a-edited-2' }], 'id-a', undefined)
+  assert.equal(calls.filter(([m]) => m === 'settings.mutate').at(-1)[1][2], 1)
+})
+
+test('the browser module rejects a save that would overwrite a newer configuration', async () => {
+  const row = (id) => ({ id, name: id, baseUrl: `https://${id}.example.com`, tokenRef: `GRAFANA_TOKEN_${id}` })
+  // 两个设置页各读一次同一版本，各自改不同的源站后先后保存。
+  const first = setup({ sources: [row('alpha'), row('beta')], defaultSource: 'alpha' })
+  const second = setup({ sources: [row('alpha'), row('beta')], defaultSource: 'alpha' })
+  // 两页共用同一个后端：第二次写入必须被版本检查挡下，而不是把第一次的改动抹掉。
+  const backend = first.settings.mutate
+  let revision = 0
+  const shared = async (ns, ops, expectedRevision) => {
+    if (expectedRevision !== undefined && expectedRevision !== revision) {
+      return { ok: false, error: { message: 'revision conflict' } }
+    }
+    revision += 1
+    return backend(ns, ops)
+  }
+  first.settings.mutate = shared
+  second.settings.mutate = shared
+  const initial = await second.face.describe()
+  await first.face.writeSources(
+    (await first.face.describe()).sources.map((s) => (s.id === 'alpha' ? { ...s, name: 'alpha-edited' } : s)),
+    'alpha',
+  )
+  await assert.rejects(
+    second.face.writeSources(initial.sources.map((s) => (s.id === 'beta' ? { ...s, name: 'beta-edited' } : s)), 'alpha'),
+    /revision conflict/,
+  )
+  // 先保存的那一页改动仍在；后一页只是被告知要重试，不是静默丢了另一个源站。
+  const after = await first.face.describe()
+  assert.deepEqual(after.sources.map((s) => s.name), ['alpha-edited', 'beta'])
+})
+
+// ── 令牌与 URL 的一致性 ──────────────────────────────────────────────────────
+test('tokenWritePlan stages every token change to a persisted source under a one-off reference', () => {
+  const { tokenWritePlan, stagedTokenRef } = loadBrowserRuntime().internals
+  const draft = { id: 'id-a', name: 'a', baseUrl: 'https://new.example.com', tokenRef: 'GRAFANA_TOKEN_ida', tokenDraft: 'tok-new' }
+  const stored = { id: 'id-a', name: 'a', baseUrl: 'https://old.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }
+  // 已落库的源站一律暂存：只改令牌同样可能被配置的版本检查拒绝，而凭证写入在检查之前。
+  const staged = tokenWritePlan(draft, stored)
+  assert.equal(staged.staged, true)
+  assert.equal(staged.replaces, 'GRAFANA_TOKEN_ida')
+  assert.match(staged.ref, /^GRAFANA_TOKEN_ida_PENDING_[A-Za-z0-9_]+$/)
+  const sameUrl = tokenWritePlan({ ...draft, baseUrl: 'https://old.example.com' }, stored)
+  assert.equal(sameUrl.staged, true)
+  // 每次保存独占一个引用：复用的键会被另一页（或下一次保存）覆盖，或被旧的
+  // 「重试清理」提示删掉正在生效的凭证。
+  assert.notEqual(staged.ref, sameUrl.ref)
+  assert.notEqual(stagedTokenRef('GRAFANA_TOKEN_ida'), stagedTokenRef('GRAFANA_TOKEN_ida'))
+  // 从未落库的新源站没有「正在生效的令牌」可被覆盖，就地写入即可。
+  const fresh = tokenWritePlan(draft, null)
+  assert.equal(fresh.staged, false)
+  assert.equal(fresh.ref, 'GRAFANA_TOKEN_ida')
+  // 无草稿不产生写入。
+  assert.equal(tokenWritePlan({ ...draft, tokenDraft: '' }, stored), null)
+})
+
+test('a failed settings write leaves the old token serving the old URL instead of the new one', async () => {
+  const card = cardHarness({
+    sources: [{ id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }],
+    defaultSource: 'id-a',
+    creds: { GRAFANA_TOKEN_ida: 'token-alpha' },
+    locale: 'en',
+  })
+  await card.ready()
+  card.change('url', 'https://replacement.example.com')
+  card.change('password', 'token-replacement')
+  // settings 持久化失败（凭证写入发生在前）。
+  card.settings.mutate = async () => ({ ok: false, error: { message: 'settings persistence failed' } })
+  await card.click('Save this source')
+  // 生效配置仍是旧 URL + 旧令牌；新令牌既没有写到旧 ref，也没留下孤儿暂存凭证。
+  const stored = await card.face.describe()
+  assert.equal(stored.sources[0].baseUrl, 'https://alpha.example.com')
+  assert.equal(stored.sources[0].tokenRef, 'GRAFANA_TOKEN_ida')
+  assert.equal(card.credState.GRAFANA_TOKEN_ida, 'token-alpha')
+  assert.deepEqual(Object.keys(card.credState), ['GRAFANA_TOKEN_ida'])
+  assert.match(String(card.states[6]), /settings persistence failed/)
+})
+
+test('a successful token save stops being dirty and does not revert a later rotation', async () => {
+  const card = cardHarness({
+    sources: [{ id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }],
+    defaultSource: 'id-a',
+    locale: 'en',
+  })
+  await card.ready()
+  card.change('password', 'token-v1')
+  await card.click('Save this source')
+  // 保存成功后草稿清空：卡片不再显示「未保存」，按钮随之禁用。
+  assert.equal(card.states[0][0].tokenDraft, '')
+  assert.equal(card.buttons().find((node) => node.props.children === 'Save this source').props.disabled, true)
+  // 别处把令牌轮换到 v2，本页再保存时不得把 v1 写回去。
+  card.credState.GRAFANA_TOKEN_ida = 'token-v2'
+  await card.click('Save all sources')
+  assert.equal(card.credState.GRAFANA_TOKEN_ida, 'token-v2')
+  assert.equal(card.calls.filter(([m]) => m === 'credentials.set').length, 1)
+})
+
+// 两个页面依次保存同一源站：后保存者的暂存引用必须是自己的，配置被 CAS 拒绝后
+// 只能回收自己的那一条，不能删掉另一页已经生效的凭证。
+test('a stale second save cannot delete the credential the winning page just activated', async () => {
+  const remote = sharedBackend()
+  const first = cardHarness({ backend: remote })
+  const second = cardHarness({ backend: remote })
+  await first.ready()
+  await second.ready()
+  first.change('url', 'https://new-a.example.com')
+  first.change('password', 'demo-token-a')
+  second.change('url', 'https://new-b.example.com')
+  second.change('password', 'demo-token-b')
+  await first.click('Save this source')
+  const activeRef = remote.state.sources[0].tokenRef
+  assert.equal(remote.state.creds[activeRef], 'demo-token-a')
+  await second.click('Save this source')
+  assert.equal(remote.state.sources[0].baseUrl, 'https://new-a.example.com')
+  assert.equal(second.states[6], 'revision conflict')
+  // 生效凭证仍在：第二页只回收了自己那条独占的暂存引用。
+  assert.equal(remote.state.creds[activeRef], 'demo-token-a')
+})
+
+// 单页：首次保存失败且暂存清理失败留下重试提示；再次保存成功后，旧提示指向的
+// 引用已被新的独占引用取代，点重试不能删掉正在生效的凭证。
+test('a stale cleanup notice never deletes the credential that has since gone live', async () => {
+  const remote = sharedBackend()
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  card.change('url', 'https://replacement.example.com')
+  card.change('password', 'demo-token-replacement')
+  remote.state.failMutate = true
+  const realUnset = remote.credentials.unset
+  remote.credentials.unset = async () => ({ ok: false, error: { message: 'credential cleanup unavailable' } })
+  await card.click('Save this source')
+  assert.equal(card.states[7].length, 1)
+  remote.state.failMutate = false
+  remote.credentials.unset = realUnset
+  await card.click('Save this source')
+  const activeRef = remote.state.sources[0].tokenRef
+  assert.equal(remote.state.creds[activeRef], 'demo-token-replacement')
+  // 旧提示仍在（那条孤儿凭证确实还在），但重试必须发现该引用已生效并放弃删除。
+  await card.click('Retry token cleanup')
+  assert.equal(remote.state.creds[activeRef], 'demo-token-replacement')
+  assert.equal(card.states[7].length, 0)
+})
+
+// 配置提交成功但应答丢失（RPC 断开）：不能推断「写入未生效」去删暂存凭证。
+test('a lost write response keeps the staged credential instead of deleting a committed one', async () => {
+  const remote = sharedBackend()
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  card.change('url', 'https://replacement.example.com')
+  card.change('password', 'demo-token-replacement')
+  const mutate = remote.settings.mutate
+  remote.settings.mutate = async (...args) => {
+    const result = await mutate(...args)
+    assert.equal(result.ok, true)
+    // 宿主已提交，调用方没收到应答：结果未知，不是拒绝。
+    throw new Error('RPC connection lost after commit')
+  }
+  await card.click('Save this source')
+  const activeRef = remote.state.sources[0].tokenRef
+  assert.equal(remote.state.sources[0].baseUrl, 'https://replacement.example.com')
+  assert.equal(remote.state.creds[activeRef], 'demo-token-replacement')
+})
+
+// 只改令牌（URL 不变）同样受保存一致性约束：被 CAS 拒绝的那一页不能已经换掉令牌。
+test('a stale token-only save does not overwrite the token another page stored', async () => {
+  const remote = sharedBackend()
+  const first = cardHarness({ backend: remote })
+  const second = cardHarness({ backend: remote })
+  await first.ready()
+  await second.ready()
+  first.change('password', 'demo-token-a')
+  second.change('password', 'demo-token-b')
+  await first.click('Save this source')
+  await second.click('Save this source')
+  assert.equal(second.states[6], 'revision conflict')
+  const activeRef = remote.state.sources[0].tokenRef
+  // 生效的仍是第一页的令牌；第二页那次被拒绝的保存没有覆盖当前凭证。
+  assert.equal(remote.state.creds[activeRef], 'demo-token-a')
+})
+
+// 配置允许多个源站共用一个自定义 tokenRef：轮换其中一个时，另一个仍在使用的
+// 引用不能被当成「已替换」清掉——凭证只写不读，删了就再也拿不回来。
+test('rotating one source keeps a credential another source still references', async () => {
+  const remote = sharedBackend()
+  remote.state.sources = [
+    { id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+    { id: 'id-b', name: 'b', baseUrl: 'https://beta.example.com', tokenRef: 'GRAFANA_TOKEN_alpha' },
+  ]
+  remote.state.creds.GRAFANA_TOKEN_alpha = 'demo-shared'
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  assert.ok(card.states[0].every((row) => row.tokenConfigured))
+  card.change('password', 'demo-alpha-replacement')
+  await card.click('Save this source')
+  assert.equal(card.states[5], true)
+  const [alpha, beta] = remote.state.sources
+  assert.equal(remote.state.creds[alpha.tokenRef], 'demo-alpha-replacement')
+  // 第二源站仍指向原引用，凭证必须还在。
+  assert.equal(beta.tokenRef, 'GRAFANA_TOKEN_alpha')
+  assert.equal(remote.state.creds.GRAFANA_TOKEN_alpha, 'demo-shared')
+  assert.equal(card.states[0][1].tokenConfigured, true)
+})
+
+// 信封缺失/畸形不等于明确拒绝：宿主可能已经提交，不能回滚（删除已生效凭证）。
+test('a malformed reply after commit is treated as unknown, not as a rejection', async () => {
+  const remote = sharedBackend()
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  card.change('password', 'demo-replacement')
+  const mutate = remote.settings.mutate
+  remote.settings.mutate = async (...args) => {
+    await mutate(...args)
+    // 没有 ok 字段：无从判定宿主是拒绝还是已提交。
+    return undefined
+  }
+  await card.click('Save this source')
+  assert.match(String(card.states[6]), /failed/)
+  assert.match(remote.state.sources[0].tokenRef, /_PENDING_/)
+  assert.equal(remote.state.creds[remote.state.sources[0].tokenRef], 'demo-replacement')
+})
+
+// 带首尾空白的草稿：提交用 trim 后的值，清草稿也必须 trim 后比较。
+test('a whitespace-padded token draft is cleared once saved', async () => {
+  const remote = sharedBackend()
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  card.change('password', '  demo-token-v1  ')
+  await card.click('Save this source')
+  assert.equal(card.states[0][0].tokenDraft, '')
+  // 别处轮换到 v2，本页再保存不得把带空白的旧草稿写回去。
+  const activeRef = remote.state.sources[0].tokenRef
+  remote.state.creds[activeRef] = 'demo-token-v2'
+  await card.click('Save all sources')
+  assert.equal(remote.state.creds[activeRef], 'demo-token-v2')
+})
+
+// 首次读取失败时不开放写入：以空基线保存会把已存源站整批抹掉。
+test('sources are not writable before the configuration has been read successfully', async () => {
+  const card = cardHarness({
+    sources: [{ id: 'id-a', name: 'alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }],
+    defaultSource: 'id-a',
+    locale: 'en',
+    fail: { 'settings.describe': 'temporary read failure' },
+  })
+  await card.ready()
+  assert.match(String(card.states[6]), /temporary read failure/)
+  // 故障恢复后仍不开放写入：本页从未拿到过权威基线，此时保存会用空列表覆盖
+  // 后端已有的全部源站。
+  delete card.fail['settings.describe']
+  await card.click('Add source')
+  assert.match(String(card.states[6]), /not been read successfully/)
+  assert.equal(card.calls.some(([m]) => m === 'settings.mutate'), false)
+  // 重新读取之后才拿到基线；写入仍然要由用户显式触发。
+  await card.click('Reload')
+  assert.equal(card.calls.some(([m]) => m === 'settings.mutate'), false)
+  const after = await card.face.describe()
+  assert.deepEqual(after.sources.map((s) => s.name), ['alpha'])
 })

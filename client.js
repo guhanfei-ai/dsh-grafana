@@ -122,9 +122,17 @@ window.__ModuleLoader__.load({
 				unsavedBadge: "未保存",
 				saved: "已保存。新会话将使用更新后的配置。",
 				invalidUrl: "Grafana URL 必须是不含凭证、查询参数或片段的绝对 HTTP(S) 地址。",
-				confirmRemoveSource: "确定要移除该源站吗？其已存储的令牌也会一并清除。",
+				confirmRemoveSource: "确定要移除该源站吗？其专用令牌会一并清除；若该令牌仍被其它源站共用、或清理状态无法确认，则会保留。",
 				removedTokenPending: "源站“{name}”已移除，但其令牌清理失败（源站列表已更新，可点击重试补清）：",
+				replacedTokenPending: "源站“{name}”已改用新令牌，但其被替换的旧令牌清理失败（可点击重试补清）：",
+				stagedTokenPending: "保存未生效，暂存的新令牌（{name}）未能回收（可点击重试清除）：",
 				retryTokenCleanup: "重试清除令牌",
+				reload: "重新读取",
+				notLoaded: "尚未成功读取配置，为避免覆盖已有源站，保存已停用。请点击“重新读取”。",
+				revisionConflict: "配置已在别处被修改，已载入最新内容。请确认后重新保存。",
+				unconfirmedWrite: "保存结果未能确认，该凭证暂不自动清除。",
+				cleanupUnverified: "无法确认该凭证是否仍在生效，已保留未清理。请重新读取后再试。",
+				unconfirmedRead: "宿主返回的配置数据无法解析（不是合法的源站列表）。为避免覆盖已存源站或误删凭证，已暂停写入；请点击“重新读取”。",
 				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。"
 			},
 			en: {
@@ -158,9 +166,17 @@ window.__ModuleLoader__.load({
 				unsavedBadge: "Unsaved",
 				saved: "Saved. New conversations will use the updated configuration.",
 				invalidUrl: "Grafana URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
-				confirmRemoveSource: "Remove this source? Its stored token will also be cleared.",
+				confirmRemoveSource: "Remove this source? Its stored token is cleared too — unless another source still shares that credential, or the reference state cannot be confirmed, in which case it is kept.",
 				removedTokenPending: "The source “{name}” was removed, but clearing its stored token failed (the source list is already updated; retry to finish the cleanup):",
+				replacedTokenPending: "The source “{name}” now uses its new token, but clearing the token it replaced failed (retry to finish the cleanup):",
+				stagedTokenPending: "The save did not take effect and the staged new token ({name}) could not be discarded (retry to clear it):",
 				retryTokenCleanup: "Retry token cleanup",
+				reload: "Reload",
+				notLoaded: "The configuration has not been read successfully yet, so saving is disabled to avoid overwriting existing sources. Click “Reload”.",
+				revisionConflict: "The configuration changed elsewhere; the latest content has been loaded. Review it and save again.",
+				unconfirmedWrite: "The save result could not be confirmed, so this credential is not cleared automatically.",
+				cleanupUnverified: "Whether this credential is still in use could not be confirmed, so it was left in place. Reload and try again.",
+				unconfirmedRead: "The host returned configuration data that cannot be parsed (not a valid source list). Writing is paused to avoid overwriting stored sources or deleting credentials in use; click “Reload”.",
 				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page."
 			}
 		};
@@ -233,16 +249,69 @@ window.__ModuleLoader__.load({
 			const b = storedRow(st);
 			return a.name !== b.name || a.baseUrl !== b.baseUrl || a.tokenRef !== b.tokenRef;
 		}
+		// 令牌暂存引用：已经落库的源站改令牌（无论是否同时改 URL）都用它。
+		// 两步写入无法保证一致——先覆盖原 ref 会在配置写入失败时留下「新令牌 + 旧
+		// 地址」，而交换顺序又会变成把旧令牌发往新地址。新令牌先落到本次保存独占的
+		// 暂存 ref，再由一次带版本检查的 settings 写入切换过去。
+		// 每次保存都生成全新引用：固定的 _PENDING 键会被另一页（或本页的下一次保存）
+		// 复用——那要么覆盖别人已经生效的凭证，要么被一条旧的「重试清理」提示删掉
+		// 正在生效的令牌。
+		function stagedTokenRef(ref) {
+			return `${ref}_PENDING_${generateSourceId().replace(/[^A-Za-z0-9_]/g, "")}`;
+		}
+
+		// 单个源站卡片的令牌写入计划；没有待提交草稿返回 null。
+		// 已落库的源站一律走暂存：只改令牌同样可能被配置的版本检查拒绝，而凭证写入
+		// 发生在检查之前——原地覆盖的话，被拒绝的那次保存也已经换掉了正在用的令牌。
+		function tokenWritePlan(draft, stored) {
+			const value = String(draft?.tokenDraft ?? "").trim();
+			if (!value) return null;
+			const canonical = draft.tokenRef || tokenRefForId(draft.id);
+			if (!stored) return { ref: canonical, value, staged: false, replaces: null };
+			return { ref: stagedTokenRef(canonical), value, staged: true, replaces: canonical };
+		}
+
+		// 一次保存的令牌编排（纯函数，供「保存当前源站」与「保存全部源站」共用）：
+		// tokenWrites 待写入的凭证；staleRefs 生效后要清掉的旧凭证；stagedRefs 配置
+		// 写入失败时要回收的暂存凭证；committed 已提交的令牌（回读时据此清草稿）；
+		// tokenRefFor 该卡片在本次写入里应采用的 tokenRef。
+		function buildSavePlan(drafts, storedById) {
+			const tokenWrites = [];
+			const staleRefs = [];
+			const stagedRefs = [];
+			const committed = new Map();
+			const tokenRefFor = new Map();
+			for (const draft of drafts) {
+				const plan = tokenWritePlan(draft, storedById.get(draft.id) ?? null);
+				if (!plan) continue;
+				tokenWrites.push({ ref: plan.ref, value: plan.value });
+				committed.set(draft.id, plan.value);
+				tokenRefFor.set(draft.id, plan.ref);
+				if (plan.staged) {
+					stagedRefs.push(plan.ref);
+					if (plan.replaces) staleRefs.push({ ref: plan.replaces, name: draft.name });
+				}
+			}
+			return { tokenWrites, staleRefs, stagedRefs, committed, tokenRefFor };
+		}
+
 		// 写后回读的合并：存储为准刷新权威字段与令牌状态，保留仍存在的草稿编辑、
 		// 令牌草稿与聚焦态；存储里已移除的卡片草稿一并丢弃；未保存的新卡片原样保留。
-		function mergeDrafts(described, drafts) {
+		// committed（Map id→令牌值）是本次成功提交且随后未被再次编辑的令牌草稿：
+		// 这些草稿必须清空，否则「已保存」的卡片一直算脏，下一次保存会把这枚旧令牌
+		// 再写一遍，把别处的令牌轮换撤销掉。
+		function mergeDrafts(described, drafts, committed) {
 			const describedIds = new Set(described.map((s) => s.id));
 			const draftById = new Map(drafts.map((s) => [s.id, s]));
 			const merged = described.map((s) => {
 				const d = draftById.get(s.id);
 				const base = { ...s, tokenDraft: "", tokenFocus: false };
 				if (!d) return base;
-				return { ...base, name: d.name, baseUrl: d.baseUrl, tokenDraft: d.tokenDraft ?? "", tokenFocus: d.tokenFocus ?? false };
+				const submitted = committed && typeof committed.get === "function" ? committed.get(s.id) : undefined;
+				// 提交的是 trim 后的值，比较也必须 trim：否则 "  tok  " 这类带空白的
+				// 输入保存后仍算脏，下一次保存会把它再写一遍，撤销别处的令牌轮换。
+				const tokenDraft = submitted !== undefined && String(d.tokenDraft ?? "").trim() === submitted ? "" : (d.tokenDraft ?? "");
+				return { ...base, name: d.name, baseUrl: d.baseUrl, tokenDraft, tokenFocus: d.tokenFocus ?? false };
 			});
 			// 存储里缺席的草稿分两类：令牌「已配置」只可能对曾持久化的源站成立，故这类草稿
 			// 说明该卡片已被别处移出存储 → 丢弃其陈旧草稿；从未持久化的新卡片令牌必未配置，
@@ -261,13 +330,26 @@ window.__ModuleLoader__.load({
 		// 「移除源站」的远端编排（接线层可单测）：源站列表先写、令牌后清。令牌清理
 		// 失败不回滚源站删除——新源站 id 是全新 UUID，不会复用该 ref，残留的只是一条
 		// 无引用的孤儿凭证——但必须如实报告失败并保留待重试的 ref，绝不谎报成功。
-		// remotes 即 face（只用 writeSources / unsetToken）；plan = { nextSources,
-		// nextDefault, tokenRef, tokenConfigured }。返回 { tokenCleaned: true } 或
-		// { tokenCleaned: false, tokenRef, error }（error 已收敛为字符串消息；HOST_UNSUPPORTED
+		// 凭证回收带引用保护（与保存路径的轮换保护同一原则）：配置允许多个源站共用
+		// 一个自定义 tokenRef，「被移除的卡片不再用它」不等于「无人在用」；凭证只写
+		// 不读，删掉在用的就再也拿不回来。写入已生效，随后的 describe 读到的就是新
+		// 列表；读取失败或业务载荷畸形（unconfirmed）时一律不回收——留一条孤儿凭证
+		// 远好过删掉另一源站正在使用的凭证。
+		// remotes 即 face（只用 writeSources / describe / unsetToken）；plan = { nextSources,
+		// nextDefault, tokenRef, tokenConfigured, expectedRevision? }。返回 { tokenCleaned: true }
+		// 或 { tokenCleaned: false, tokenRef, error }（error 已收敛为字符串消息；HOST_UNSUPPORTED
 		// 等本地化翻译由组件层完成）。
 		async function removeSourceRemote(remotes, plan) {
-			await remotes.writeSources(plan.nextSources, plan.nextDefault);
+			await remotes.writeSources(plan.nextSources, plan.nextDefault, plan.expectedRevision);
 			if (!plan.tokenConfigured) return { tokenCleaned: true };
+			try {
+				const fresh = await remotes.describe();
+				if (fresh?.unconfirmed !== false) return { tokenCleaned: true };
+				const stillUsed = new Set((fresh.sources ?? []).map((s) => s.tokenRef || tokenRefForId(s.id)));
+				if (stillUsed.has(plan.tokenRef)) return { tokenCleaned: true };
+			} catch {
+				return { tokenCleaned: true };
+			}
 			try {
 				await remotes.unsetToken(plan.tokenRef);
 			} catch (error) {
@@ -323,6 +405,12 @@ window.__ModuleLoader__.load({
 			// 这里只补凭证库那一刀；某条重试成功才移除该条提示。
 			const [tokenCleanups, setTokenCleanups] = react.useState([]);
 			const [lang, setLang] = react.useState(detectLanguage);
+			// loaded：是否至少成功读取过一次配置。没有权威基线就开放写入，等于允许
+			// 一张空列表覆盖掉全部已存源站，故读取失败期间一律不写。
+			const [loaded, setLoaded] = react.useState(false);
+			// revision：最近一次成功读取的配置版本。写入时回传，宿主据此拒绝基于
+			// 陈旧基线的整表覆盖（两个设置页同时编辑时后保存的一方会收到冲突）。
+			const [revision, setRevision] = react.useState(null);
 			// 展开状态是卡片本地的阅读手势，Host 与设置页都不参与（同官方 PluginCard）。
 			const [open, setOpen] = react.useState(false);
 			const T = STRINGS[lang] ?? STRINGS.en;
@@ -335,19 +423,47 @@ window.__ModuleLoader__.load({
 				? defaultSource
 				: (sources.length === 1 ? sources[0].id : "");
 
+			function messageOf(e) {
+				const message = String(e && e.message ? e.message : e);
+				return message === HOST_UNSUPPORTED ? T.hostTooOld : message;
+			}
+
+			function applyDescribed(r) {
+				// 明确的宿主不兼容（缺 remote.settings 远端门面）优先于普通的不可信
+				// 读取：旧宿主（describe 同时带 hostUnsupported 与 unconfirmed）要看到
+				// 升级指引，而不是一条误导性的「数据无法解析，请重新读取」。写入仍被
+				// 阻断（门面缺席时写路径一律抛 HOST_UNSUPPORTED）。
+				if (r?.hostUnsupported) {
+					setHostUnsupported(true);
+					return;
+				}
+				// 读取可信才替换基线并开放写入：unconfirmed（信封 ok 但业务载荷缺失/
+				// 畸形）不是权威状态——拿它清空基线、置 loaded，会让随后一次保存不带
+				// 修订号地整表覆盖已存源站。处理方式与读取失败一致：显示错误、保持
+				// 未就绪，出路是 Reload。
+				if (r?.unconfirmed) {
+					setError(T.unconfirmedRead);
+					return;
+				}
+				setHostUnsupported(false);
+				const described = r.sources ?? [];
+				setSources(described.map((s) => ({ ...s, tokenDraft: "", tokenFocus: false })));
+				setStored(described);
+				setDefaultSource(r.defaultSource ?? "");
+				setRevision(Number.isInteger(r.revision) ? r.revision : null);
+				setLoaded(true);
+			}
+
 			react.useEffect(() => {
 				let alive = true;
 				face.describe().then((r) => {
 					if (!alive) return;
-					setHostUnsupported(Boolean(r.hostUnsupported));
-					const described = r.sources ?? [];
-					setSources(described.map((s) => ({ ...s, tokenDraft: "", tokenFocus: false })));
-					setStored(described);
-					setDefaultSource(r.defaultSource ?? "");
+					applyDescribed(r);
 				}).catch((e) => {
 					// 读取失败必须可见。静默 catch 会把任何远端故障渲染成空白源站列表，
 					// 且控制台零报错——正是本卡片曾经读写全废却无人察觉的原因。
-					if (alive) setError(String(e && e.message ? e.message : e));
+					// 读取没成功就保持未就绪：此时任何保存都会用空基线覆盖已存源站。
+					if (alive) setError(messageOf(e));
 				});
 				return () => { alive = false; };
 			}, [face]);
@@ -367,35 +483,134 @@ window.__ModuleLoader__.load({
 			}
 
 			function onAdd() {
+				// 没有权威基线时不开放新增：此时保存只会把「只有这张新卡」的列表
+				// 写回后端，把已存的其它源站整批抹掉。
+				if (!loaded) { setError(T.notLoaded); return; }
 				const id = generateSourceId();
 				setSources((prev) => [...prev, { id, name: "", baseUrl: "", tokenRef: tokenRefForId(id), tokenConfigured: false, tokenDraft: "", tokenFocus: false }]);
 			}
 
 			// 写入后回读并合并：以存储为准刷新权威字段与令牌状态，保留其它卡片未保存的草稿。
-			async function reread() {
+			// committed 为本次成功提交的令牌草稿（id→值），对应卡片若未被再次编辑就清空草稿。
+			// 读取不可信（unconfirmed）时抛错而非合并：合并一个降级出来的空列表会把
+			// 本地基线清掉，调用方按读取失败处理（保存结果如实显示为同步失败）。
+			async function reread(committed) {
 				const r = await face.describe();
+				if (r?.unconfirmed) throw new Error(T.unconfirmedRead);
 				const described = r.sources ?? [];
-				setSources((prev) => mergeDrafts(described, prev));
+				setSources((prev) => mergeDrafts(described, prev, committed));
 				setStored(described);
 				setDefaultSource(r.defaultSource ?? "");
+				setRevision(Number.isInteger(r.revision) ? r.revision : null);
 			}
 
-			// 统一的写入落点：先写令牌草稿（若有），再整表写 sources + defaultSource，最后回读合并。
-			// nextSources 为完整的目标数组（含未改动卡片），tokenDrafts 为待写入的 { ref, value }。
-			async function persist(nextSources, nextDefault, tokenDrafts) {
+			// 首次读取失败后的重新读取：不成功就一直不开放写入。
+			async function reload() {
+				setSaving(true); setSaved(false); setError("");
+				try {
+					applyDescribed(await face.describe());
+				} catch (e) {
+					setError(messageOf(e));
+				} finally {
+					setSaving(false);
+				}
+			}
+
+			// 记录一条凭证清理失败（保留重试入口）。kind 决定提示文案：
+			// removed=移除源站后的孤儿令牌；replaced=轮换后被替换的旧令牌；staged=保存
+			// 失败后未能回收的暂存令牌。
+			function noteTokenCleanup(entry) {
+				setTokenCleanups((prev) => mergeTokenCleanup(prev, { ...entry, error: messageOf(entry.error) }));
+			}
+
+			// 统一的写入落点：先写令牌草稿，再整表写 sources + defaultSource（带版本检查），
+			// 生效后清理被替换的旧凭证，最后回读合并。
+			// 失败时保证「生效的 URL 与令牌」仍然配套：配置没写成就回收暂存的新令牌，
+			// 不让新令牌留在旧地址上生效。
+			async function persist({ nextSources, nextDefault, plan }) {
+				if (!loaded) { setError(T.notLoaded); return; }
+				// 配置写入是「宿主明确拒绝」还是「结果未知」，决定暂存凭证能不能回收。
+				let rejected = false;
 				setSaving(true); setSaved(false); setError("");
 				try {
 					// 先完成全部校验再开始任何写入，避免名称/URL 非法时令牌已落库的半保存状态。
 					validateSources(nextSources, T);
-					for (const { ref, value } of tokenDrafts) await face.setToken(ref, value);
-					await face.writeSources(nextSources, nextDefault);
-					await reread();
-					setSaved(true);
+					for (const { ref, value } of plan.tokenWrites) await face.setToken(ref, value);
+					try {
+						await face.writeSources(nextSources, nextDefault, revision);
+					} catch (writeError) {
+						// 只有宿主明确拒绝才算「确定没写入」，此时暂存的新令牌成了孤儿
+						// 凭证，可以回收。结果未知（RPC 断开等）时不能删——宿主可能已经
+						// 提交，删掉就等于把一个正在生效的令牌抹掉。
+						rejected = Boolean(writeError && writeError.remoteRejected);
+						if (rejected) {
+							for (const ref of plan.stagedRefs) {
+								try {
+									await face.unsetToken(ref);
+								} catch (error) {
+									noteTokenCleanup({ ref, name: ref, error, kind: "staged" });
+								}
+							}
+						}
+						throw writeError;
+					}
+					// 配置已生效：被替换掉的旧令牌可以清除了——前提是没有别的源站还在用它。
+					// 配置允许多个源站共用一个自定义 tokenRef，「本源站不再引用」不等于
+					// 「无人引用」；凭证只写不读，删掉就再也拿不回来。
+					const stillUsed = await activeTokenRefs();
+					for (const entry of plan.staleRefs) {
+						// 无法确认（读取失败）时一律不动：留一条孤儿凭证远好过删掉在用的。
+						if (stillUsed === null || stillUsed.has(entry.ref)) continue;
+						try {
+							await face.unsetToken(entry.ref);
+						} catch (error) {
+							noteTokenCleanup({ ref: entry.ref, name: entry.name, error, kind: "replaced" });
+						}
+					}
+					// 同步回读：写入已成功，回读失败（含 unconfirmed）只影响界面同步——
+					// 显示读取错误、不显示「已保存」即可，不进入写入错误的处理链（否则会
+					// 误触发「结果未知」的暂存凭证处置，把已生效的保存当成未确认）。
+					let readError = null;
+					try {
+						await reread(plan.committed);
+					} catch (e) {
+						readError = e;
+						await reread().catch(() => {});
+					}
+					if (readError === null) setSaved(true);
+					else setError(messageOf(readError));
 				} catch (e) {
-					const message = String(e && e.message ? e.message : e);
-					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
+					setError(messageOf(e));
+					// 基线可能已经前进（版本冲突、别处先写）：以服务端为准重读一次，
+					// 用户草稿保留，重新保存即可带上新版本。重读失败也不影响上面的报错。
+					await reread().catch(() => {});
+					// 结果未知时暂存凭证必须留着按权威状态处置，不能当成孤儿。
+					if (!rejected && plan.stagedRefs.length > 0) await settleUnconfirmedStaged(plan.stagedRefs);
 				} finally {
 					setSaving(false);
+				}
+			}
+
+			// 当前仍在被引用的凭证引用集合；无法读取权威状态（读取抛错，或信封 ok
+			// 但业务载荷缺失/畸形）时返回 null（调用方按「无法确认」处理，不做任何删除）。
+			async function activeTokenRefs() {
+				try {
+					const fresh = await face.describe();
+					if (fresh?.unconfirmed) return null;
+					return new Set((fresh.sources ?? []).map((s) => s.tokenRef || tokenRefForId(s.id)));
+				} catch {
+					return null;
+				}
+			}
+
+			// 写入结果未知后的暂存凭证处置：先问权威状态——若配置已经切到某个暂存引用，
+			// 说明这次写入其实生效了，那条引用正在生效，绝不能清。其余的保留为待清理项
+			// （重试前会再确认一次，见 retryTokenCleanup）。
+			async function settleUnconfirmedStaged(refs) {
+				const activeRefs = await activeTokenRefs();
+				for (const ref of refs) {
+					if (activeRefs !== null && activeRefs.has(ref)) continue;
+					noteTokenCleanup({ ref, name: ref, error: new Error(T.unconfirmedWrite), kind: "staged" });
 				}
 			}
 
@@ -409,31 +624,27 @@ window.__ModuleLoader__.load({
 			async function onSaveOne(id) {
 				const draft = sources.find((s) => s.id === id);
 				if (!draft) return;
-				const nextSources = nextSourcesFor(stored, draft);
-				const tokenDrafts = [];
-				const t = String(draft.tokenDraft ?? "").trim();
-				if (t) tokenDrafts.push({ ref: draft.tokenRef || tokenRefForId(draft.id), value: t });
-				await persist(nextSources, resolveDefault(nextSources, defaultSource), tokenDrafts);
+				const plan = buildSavePlan([draft], storedById);
+				const effective = plan.tokenRefFor.has(id) ? { ...draft, tokenRef: plan.tokenRefFor.get(id) } : draft;
+				const nextSources = nextSourcesFor(stored, effective);
+				await persist({ nextSources, nextDefault: resolveDefault(nextSources, defaultSource), plan });
 			}
 
 			// 「保存全部源站」：提交所有卡片的草稿（含新增），一次性整表写入。
 			async function onSaveAll() {
-				const nextSources = sources.map((s) => ({
+				const plan = buildSavePlan(sources, storedById);
+				const nextSources = sources.map((s) => storedRow({
 					id: s.id,
 					name: String(s.name ?? "").trim(),
 					baseUrl: String(s.baseUrl ?? "").trim(),
-					tokenRef: s.tokenRef || tokenRefForId(s.id)
+					tokenRef: plan.tokenRefFor.get(s.id) ?? s.tokenRef,
 				}));
-				const tokenDrafts = [];
-				for (const s of sources) {
-					const t = String(s.tokenDraft ?? "").trim();
-					if (t) tokenDrafts.push({ ref: s.tokenRef || tokenRefForId(s.id), value: t });
-				}
-				await persist(nextSources, resolveDefault(nextSources, defaultSource), tokenDrafts);
+				await persist({ nextSources, nextDefault: resolveDefault(nextSources, defaultSource), plan });
 			}
 
 			// 移除即写：确认后立即从存储删除该卡片并清除其令牌，不再等保存按钮。
 			async function onRemove(id) {
+				if (!loaded) { setError(T.notLoaded); return; }
 				if (!window.confirm(T.confirmRemoveSource)) return;
 				const target = sources.find((s) => s.id === id);
 				if (!target) return;
@@ -450,6 +661,7 @@ window.__ModuleLoader__.load({
 					const outcome = await removeSourceRemote(face, {
 						nextSources,
 						nextDefault,
+						expectedRevision: revision,
 						tokenRef: target.tokenRef || tokenRefForId(target.id),
 						tokenConfigured: Boolean(target.tokenConfigured),
 					});
@@ -460,14 +672,14 @@ window.__ModuleLoader__.load({
 					setDefaultSource(nextDefault);
 					// 再记录清理失败（保留重试入口）：即使回读失败，提示也不会丢。
 					if (!outcome.tokenCleaned) {
-						const error = outcome.error === HOST_UNSUPPORTED ? T.hostTooOld : outcome.error;
-						setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref: outcome.tokenRef, name: target.name, error }));
+						noteTokenCleanup({ ref: outcome.tokenRef, name: target.name, error: outcome.error, kind: "removed" });
 					}
 					await reread();
 					if (outcome.tokenCleaned) setSaved(true);
 				} catch (e) {
-					const message = String(e && e.message ? e.message : e);
-					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
+					setError(messageOf(e));
+					// 同上：基线可能已前进，重读一次再让用户重试。
+					await reread().catch(() => {});
 				} finally {
 					setSaving(false);
 				}
@@ -479,11 +691,24 @@ window.__ModuleLoader__.load({
 			async function retryTokenCleanup(ref) {
 				if (!ref) return;
 				setSaving(true); setSaved(false);
+				// 引用可能已经被后来的保存重新启用（另一页写入、或本页保存成功后又改过）：
+				// 先按权威状态确认它仍未生效再清。宁可留一条孤儿凭证，也不能删掉正在用
+				// 的令牌——凭证是只写的，删掉就再也拿不回来。
+				const activeRefs = await activeTokenRefs();
+				if (activeRefs === null) {
+					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: T.cleanupUnverified }));
+					setSaving(false);
+					return;
+				}
+				if (activeRefs.has(ref)) {
+					setTokenCleanups((prev) => dropTokenCleanup(prev, ref));
+					setSaving(false);
+					return;
+				}
 				try {
 					await face.unsetToken(ref);
 				} catch (e) {
-					const message = String(e && e.message ? e.message : e);
-					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: message === HOST_UNSUPPORTED ? T.hostTooOld : message }));
+					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: messageOf(e) }));
 					setSaving(false);
 					return;
 				}
@@ -503,19 +728,29 @@ window.__ModuleLoader__.load({
 			// 设为默认即写：只改 defaultSource，sources 数组以存储值原样回写（不动草稿）。
 			// 未落库的卡片防御性拒绝：渲染层已不显示该按钮，这里兜底防止未来接线回归。
 			async function onSetDefault(id) {
+				if (!loaded) { setError(T.notLoaded); return; }
 				if (!canSetDefault(sources.find((s) => s.id === id), storedById)) return;
 				const nextSources = stored.map(storedRow);
 				setSaving(true); setSaved(false); setError("");
 				try {
-					await face.writeSources(nextSources, id);
+					await face.writeSources(nextSources, id, revision);
 					await reread();
 					setSaved(true);
 				} catch (e) {
-					const message = String(e && e.message ? e.message : e);
-					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
+					setError(messageOf(e));
+					await reread().catch(() => {});
 				} finally {
 					setSaving(false);
 				}
+			}
+
+			// 待清理凭证的提示文案按来源分档：移除源站的孤儿令牌、轮换后被替换的
+			// 旧令牌、保存失败后未回收的暂存令牌。三种都得给出各自的重试入口。
+			function cleanupMessage(entry) {
+				const name = String(entry.name || entry.ref);
+				if (entry.kind === "replaced") return T.replacedTokenPending.replace("{name}", name);
+				if (entry.kind === "staged") return T.stagedTokenPending.replace("{name}", name);
+				return T.removedTokenPending.replace("{name}", name);
 			}
 
 			function renderSource(s) {
@@ -530,7 +765,7 @@ window.__ModuleLoader__.load({
 						dirty ? h("span", { style: S.badge, children: T.unsavedBadge }) : null,
 						h("span", { style: S.spacer }),
 						// 未落库的卡片不显示「设为默认」：默认指向不存在的 id 会造成悬空引用。
-					isDefault || !canSetDefault(s, storedById) ? null : h("button", { type: "button", style: S.smallButton, disabled: saving, onClick: () => onSetDefault(s.id), children: T.setDefault }),
+						isDefault || !canSetDefault(s, storedById) ? null : h("button", { type: "button", style: S.smallButton, disabled: saving, onClick: () => onSetDefault(s.id), children: T.setDefault }),
 						h("button", { type: "button", style: S.smallButton, disabled: saving, onClick: () => onRemove(s.id), children: T.removeSource })
 					] }),
 					h("input", {
@@ -608,7 +843,9 @@ window.__ModuleLoader__.load({
 					!hostUnsupported && sources.length === 0 ? h("p", { style: S.hint, children: T.sourcesEmpty }) : null,
 					hostUnsupported ? null : hs("div", { style: S.list, children: sources.map(renderSource) }),
 					hs("div", { style: S.footer, children: [
-						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported, onClick: onAdd, children: T.addSource })
+						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported, onClick: onAdd, children: T.addSource }),
+						// 读取失败后唯一的出路：重新读取。没有权威基线时新增/保存都被拦住。
+						!loaded && !hostUnsupported ? h("button", { type: "button", style: S.button, disabled: saving, onClick: reload, children: T.reload }) : null
 					] }),
 					hs("div", { style: S.footer, children: [
 						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported || !anyDirty, onClick: onSaveAll, children: saving ? T.saving : T.saveAllSources }),
@@ -618,135 +855,175 @@ window.__ModuleLoader__.load({
 					// 令牌清理待重试：每条一个独立的提示与重试按钮（按 ref 累积，互不覆盖），
 					// 独立于通用 error 展示，提示保留到各自重试成功为止。
 					...tokenCleanups.map((entry) => hs("div", { key: entry.ref, style: S.footer, children: [
-						h("p", { style: S.err, children: `${T.removedTokenPending.replace("{name}", String(entry.name || entry.ref))} ${entry.error}` }),
+						h("p", { style: S.err, children: `${cleanupMessage(entry)} ${entry.error}` }),
 						h("button", { type: "button", style: S.button, disabled: saving, onClick: () => retryTokenCleanup(entry.ref), children: T.retryTokenCleanup })
 					] }))
 				] }) : null
 			] });
 		}
 
-	// 宿主远端门面（dsh 0.1.2+）：settings / credentials 等命名空间服务由 dsh-api-gateway
-	// 以 remote.<ns> 之名挂载（dsh-api-remotes 负责 $mount）。必须用 ctx.get 读而不是
-	// ctx.remote.<ns>：cordis 4.0.2 实测，未声明 inject 的点号访问直接抛
-	// “cannot get property ... without inject”，而 ctx.get 在服务缺席时只返回 undefined。
-	// ≤ 0.1.1 的宿主没有这些服务（当时门面在 connection.api 上，0.1.2 重构后已消失），
-	// 返回 undefined 即触发卡片的升级提示。
-	function remoteNamespace(ctx, ns) {
-		return typeof ctx.get === "function" ? ctx.get(`remote.${ns}`) : undefined;
-	}
+		// 宿主远端门面（dsh 0.1.2+）：settings / credentials 等命名空间服务由 dsh-api-gateway
+		// 以 remote.<ns> 之名挂载（dsh-api-remotes 负责 $mount）。必须用 ctx.get 读而不是
+		// ctx.remote.<ns>：cordis 4.0.2 实测，未声明 inject 的点号访问直接抛
+		// “cannot get property ... without inject”，而 ctx.get 在服务缺席时只返回 undefined。
+		// ≤ 0.1.1 的宿主没有这些服务（当时门面在 connection.api 上，0.1.2 重构后已消失），
+		// 返回 undefined 即触发卡片的升级提示。
+		function remoteNamespace(ctx, ns) {
+			return typeof ctx.get === "function" ? ctx.get(`remote.${ns}`) : undefined;
+		}
 
-	// 远端应答统一拆封：remote.* 一律返回 { ok, value } 或 { ok:false, error:{ message } }，
-	// 没有 result.value 外层（那是 WebSocket 传输信封，远端门面已经拆过了）。
-	// 失败必须抛出可读信息：静默降级成空数据会把故障伪装成“没有配置”。
-	function unwrap(response, what) {
-		if (!response || response.ok !== true) throw new Error(response?.error?.message || `${what} failed`);
-		return response.value;
-	}
+		// 远端应答统一拆封：remote.* 一律返回 { ok, value } 或 { ok:false, error:{ message } }，
+		// 没有 result.value 外层（那是 WebSocket 传输信封，远端门面已经拆过了）。
+		// 失败必须抛出可读信息：静默降级成空数据会把故障伪装成“没有配置”。
+		// remoteRejected 标记区分两种失败：宿主明确拒绝（可以据此回滚）与结果未知
+		// （RPC 断开、传输异常——宿主可能已经提交，绝不能当成回滚信号）。
+		function remoteRejectedError(message) {
+			const error = new Error(message);
+			error.remoteRejected = true;
+			return error;
+		}
 
-	// settings.describe() 成功应答的 value 是聚合格 { writable, hasDocument, namespaces[] }，
-	// 每个描述符的键集为 [ns, schema, value, base, user, applies, secrets, revision]。
-	// 本函数只做结构解析（拆信封与 ok 判定由 unwrap 负责），畸形值回退空数组。
-	function settingsNamespacesOf(value) {
-		const list = value?.namespaces;
-		return Array.isArray(list) ? list : [];
-	}
+		function unwrap(response, what) {
+			if (response && typeof response === "object" && response.ok === true) return response.value;
+			const message = (response && typeof response === "object" ? response.error?.message : undefined) || `${what} failed`;
+			// 只有形状完整、明确写着 ok:false 的应答才算「宿主明确拒绝」。信封缺失或
+			// 畸形（undefined、null、没有 ok 字段）时无从判定，必须按结果未知处理——
+			// 当成拒绝会回滚一次其实已经提交、且已经生效的写入。
+			if (response && typeof response === "object" && response.ok === false) throw remoteRejectedError(message);
+			throw new Error(message);
+		}
 
-	function apply(ctx) {
-		// 每次调用时解析远端门面（不在 apply 时缓存）：卡片挂载发生在设置页渲染之后，
-		// 而设置页自身 inject ["remote", "remote.settings"]，缺它整页都渲染不出来，
-		// 故此时 dsh-api-remotes 的 $mount 必然已完成，不存在挂载竞态。
-		const settingsApi = () => remoteNamespace(ctx, "settings");
-		const credentialsApi = () => remoteNamespace(ctx, "credentials");
-		const face = {
-			// sources + 各源站令牌 configured 状态 + defaultSource。
-			// URL/名称存 settings（非 secret，返回明文）；令牌存凭证库（只返回 configured）。
-			// 宿主没有 remote.settings 时返回 hostUnsupported:true，让卡片显式提示升级。
-			describe: async () => {
-				const settings = settingsApi();
-				if (!settings?.describe) return { hostUnsupported: true, sources: [], defaultSource: "" };
-				const described = unwrap(await settings.describe(), "settings.describe");
-				const grafanaNs = settingsNamespacesOf(described).find((n) => n?.ns === SETTINGS_NS);
-				const value = grafanaNs?.value ?? {};
-				const rawSources = Array.isArray(value.sources) ? value.sources : [];
-				const sources = rawSources.map(normalizeSource).filter(Boolean);
-				const refs = sources.map((s) => s.tokenRef);
-				let creds = {};
-				const credentials = credentialsApi();
-				if (refs.length && credentials?.describe) {
-					// describe(refs)：位置参数数组；value 直接就是 ref → { configured, source?, writable } 的 record。
-					creds = unwrap(await credentials.describe(refs), "credentials.describe") ?? {};
-				}
-				const defaultSource = typeof value.defaultSource === "string" ? value.defaultSource : "";
-				return {
-					hostUnsupported: false,
-					sources: sources.map((s) => ({ ...s, tokenConfigured: Boolean(creds[s.tokenRef]?.configured) })),
-					defaultSource
-				};
-			},
-			// 令牌走凭证库（仅写不读）：set(ref, value) / unset(ref)，均为位置参数。
-			setToken: async (ref, value) => {
-				const credentials = credentialsApi();
-				if (!credentials?.set) throw new Error(HOST_UNSUPPORTED);
-				unwrap(await credentials.set(ref, value), "credentials.set");
-			},
-			unsetToken: async (ref) => {
-				const credentials = credentialsApi();
-				if (!credentials?.unset) throw new Error(HOST_UNSUPPORTED);
-				unwrap(await credentials.unset(ref), "credentials.unset");
-			},
-			// 写入整个 sources 数组 + defaultSource。单次 mutate 双 set op：set 对目标路径
-			// 整体赋值（数组整体替换，不做按下标合并），两个 op 在宿主写队列的单个事务里
-			// 一起应用、一起持久化——此前「先 mutate unset 再 update」两步写在第二步失败时，
-			// sources 已被清空而新值未落地，存量用户的全部源站配置会当场丢失。
-			// 位置参数：mutate(ns, ops, expectedRevision?)。网关按声明参数表严格校验 arity
-			// （dsh-api-gateway prepareInvocation：values.length !== descriptor.parameters.length
-			// 即抛 `client api: <endpoint> expected N argument(s), got M`，0.1.2-rc.1 真机实测），
-			// 第三参类型上是 union([undefined, number()]) 但 arity 上不可省，故显式传 void 0
-			// 表示不做乐观并发校验（官方 agent-preset 包同此写法）。
-			writeSources: async (sources, defaultSource) => {
-				const settings = settingsApi();
-				if (!settings?.mutate) throw new Error(HOST_UNSUPPORTED);
-				const normalized = sources.map((s) => ({
-					id: s.id,
-					name: s.name,
-					baseUrl: s.baseUrl,
-					tokenRef: s.tokenRef || tokenRefForId(s.id)
-				}));
-				unwrap(await settings.mutate(SETTINGS_NS, [
-					{ op: "set", path: ["sources"], value: normalized },
-					{ op: "set", path: ["defaultSource"], value: defaultSource },
-				], void 0), "settings.mutate");
-			},
-			// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
-			// 语言只是外观，失败不值得报错打断卡片，故这里吸掉异常退回浏览器语言。
-			localePreference: async () => {
-				const settings = settingsApi();
-				if (!settings?.describe) return "";
-				try {
+		// settings.describe() 成功应答的 value 是聚合格 { writable, hasDocument, namespaces[] }，
+		// 每个描述符的键集为 [ns, schema, value, base, user, applies, secrets, revision]。
+		// 本函数只做结构解析（拆信封与 ok 判定由 unwrap 负责），畸形值回退空数组。
+		function settingsNamespacesOf(value) {
+			const list = value?.namespaces;
+			return Array.isArray(list) ? list : [];
+		}
+
+		function apply(ctx) {
+			// 每次调用时解析远端门面（不在 apply 时缓存）：卡片挂载发生在设置页渲染之后，
+			// 而设置页自身 inject ["remote", "remote.settings"]，缺它整页都渲染不出来，
+			// 故此时 dsh-api-remotes 的 $mount 必然已完成，不存在挂载竞态。
+			const settingsApi = () => remoteNamespace(ctx, "settings");
+			const credentialsApi = () => remoteNamespace(ctx, "credentials");
+			// 最近一次成功 describe 读到的配置版本。写入时即便调用方没有显式传版本，
+			// 也按它做乐观并发检查——否则「本页读到的基线」形同虚设，陈旧页面仍能把
+			// 别的页面刚写进去的源站整批覆盖掉。
+			let describedRevision = null;
+			const face = {
+				// sources + 各源站令牌 configured 状态 + defaultSource。
+				// URL/名称存 settings（非 secret，返回明文）；令牌存凭证库（只返回 configured）。
+				// 宿主没有 remote.settings 时返回 hostUnsupported:true，让卡片显式提示升级。
+				describe: async () => {
+					const settings = settingsApi();
+					if (!settings?.describe) return { hostUnsupported: true, sources: [], defaultSource: "", unconfirmed: true };
 					const described = unwrap(await settings.describe(), "settings.describe");
-					const locale = settingsNamespacesOf(described).find((n) => n?.ns === "locale");
-					const pref = locale?.value?.preference;
-					return typeof pref === "string" ? pref : "";
-				} catch {
-					return "";
+					const namespaces = settingsNamespacesOf(described);
+					const grafanaNs = namespaces.find((n) => n?.ns === SETTINGS_NS);
+					// 业务载荷有效性。宿主按 schema 合成 value（Host 端 Config 定义
+					// sources: array(...).default([])），契约内的 value 恒为对象且 sources 恒为
+					// 数组；写入口（validateConfig）保证每行都是可识别的源站形状。因此：
+					// value 不是对象、sources 不是数组、或 normalizeSource 丢弃了任何一行，
+					// 都说明这不是宿主契约内的合法配置——经降级/过滤得到的空列表不是
+					// 「权威的空配置」，把它用于删除决策会放行对共享凭证的删除，把它用于
+					// 基线会让随后的保存不带修订号地整表覆盖已存源站。
+					const rawValue = grafanaNs?.value;
+					const rawSources = rawValue && typeof rawValue === "object" && !Array.isArray(rawValue) && Array.isArray(rawValue.sources) ? rawValue.sources : null;
+					const sources = rawSources === null ? [] : rawSources.map(normalizeSource).filter(Boolean);
+					// 信封 ok 但载荷缺失/畸形（没有 namespaces 数组、没有 grafana 命名空间、
+					// 或上述业务载荷无效）时为 true：渲染层可降级，凭证回收与基线替换必须
+					// 按「无法确认」处理。
+					const unconfirmed = !Array.isArray(described?.namespaces) || !grafanaNs
+						|| rawSources === null || sources.length !== rawSources.length;
+					// revision 随 describe 一起取回：写入时回传，宿主据此拒绝基于陈旧
+					// 基线（例如两个设置页各读一次后先后保存）的整表覆盖。
+					const revision = Number.isInteger(grafanaNs?.revision) ? grafanaNs.revision : null;
+					describedRevision = revision;
+					const value = rawValue && typeof rawValue === "object" && !Array.isArray(rawValue) ? rawValue : {};
+					const refs = sources.map((s) => s.tokenRef);
+					let creds = {};
+					const credentials = credentialsApi();
+					if (refs.length && credentials?.describe) {
+						// describe(refs)：位置参数数组；value 直接就是 ref → { configured, source?, writable } 的 record。
+						creds = unwrap(await credentials.describe(refs), "credentials.describe") ?? {};
+					}
+					const defaultSource = typeof value.defaultSource === "string" ? value.defaultSource : "";
+					return {
+						hostUnsupported: false,
+						unconfirmed,
+						sources: sources.map((s) => ({ ...s, tokenConfigured: Boolean(creds[s.tokenRef]?.configured) })),
+						defaultSource,
+						revision
+					};
+				},
+				// 令牌走凭证库（仅写不读）：set(ref, value) / unset(ref)，均为位置参数。
+				setToken: async (ref, value) => {
+					const credentials = credentialsApi();
+					if (!credentials?.set) throw new Error(HOST_UNSUPPORTED);
+					unwrap(await credentials.set(ref, value), "credentials.set");
+				},
+				unsetToken: async (ref) => {
+					const credentials = credentialsApi();
+					if (!credentials?.unset) throw new Error(HOST_UNSUPPORTED);
+					unwrap(await credentials.unset(ref), "credentials.unset");
+				},
+				// 写入整个 sources 数组 + defaultSource。单次 mutate 双 set op：set 对目标路径
+				// 整体赋值（数组整体替换，不做按下标合并），两个 op 在宿主写队列的单个事务里
+				// 一起应用、一起持久化——此前「先 mutate unset 再 update」两步写在第二步失败时，
+				// sources 已被清空而新值未落地，存量用户的全部源站配置会当场丢失。
+				// expectedRevision：回传最近一次 describe 读到的版本。它只保证这两条 op 作为
+				// 一次写入落地，真正挡住「陈旧页面覆盖新配置」的是它——单事务的原子性救不了
+				// 基于旧列表的整表替换。版本不可得（旧宿主）时退化为不做校验。
+				// 位置参数：mutate(ns, ops, expectedRevision?)。网关按声明参数表严格校验 arity
+				// （dsh-api-gateway prepareInvocation：values.length !== descriptor.parameters.length
+				// 即抛 `client api: <endpoint> expected N argument(s), got M`，0.1.2-rc.1 真机实测），
+				// 第三参类型上是 union([undefined, number()]) 但 arity 上不可省，故显式传 void 0
+				// 表示不做乐观并发校验（官方 agent-preset 包同此写法）。
+				writeSources: async (sources, defaultSource, expectedRevision) => {
+					const settings = settingsApi();
+					if (!settings?.mutate) throw new Error(HOST_UNSUPPORTED);
+					const normalized = sources.map((s) => ({
+						id: s.id,
+						name: s.name,
+						baseUrl: s.baseUrl,
+						tokenRef: s.tokenRef || tokenRefForId(s.id)
+					}));
+					unwrap(await settings.mutate(SETTINGS_NS, [
+						{ op: "set", path: ["sources"], value: normalized },
+						{ op: "set", path: ["defaultSource"], value: defaultSource },
+					], Number.isInteger(expectedRevision) ? expectedRevision : (Number.isInteger(describedRevision) ? describedRevision : void 0)), "settings.mutate");
+				},
+				// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
+				// 语言只是外观，失败不值得报错打断卡片，故这里吸掉异常退回浏览器语言。
+				localePreference: async () => {
+					const settings = settingsApi();
+					if (!settings?.describe) return "";
+					try {
+						const described = unwrap(await settings.describe(), "settings.describe");
+						const locale = settingsNamespacesOf(described).find((n) => n?.ns === "locale");
+						const pref = locale?.value?.preference;
+						return typeof pref === "string" ? pref : "";
+					} catch {
+						return "";
+					}
 				}
-			}
-		};
-		ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-			// keyed slot：设置页按 Host 端 settings namespace（见 index.js 的
-			// SETTINGS_NAMESPACE）派发卡片，没有 key 的注册永远不会被渲染。
-			name: "settings.plugin.item",
-			key: "grafana",
-			inject: () => ({ grafanaCard: face })
-		}, GrafanaCard));
-	}
+			};
+			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
+				// keyed slot：设置页按 Host 端 settings namespace（见 index.js 的
+				// SETTINGS_NAMESPACE）派发卡片，没有 key 的注册永远不会被渲染。
+				name: "settings.plugin.item",
+				key: "grafana",
+				inject: () => ({ grafanaCard: face })
+			}, GrafanaCard));
+		}
 
 		exports.apply = apply;
 		exports.inject = inject;
 		// 供测试驱动的纯函数、应答解析与卡片文案（不参与运行时契约）。
 		// STRINGS 入列是为了让“宿主过旧”提示的双语存在性可被断言：卡片的 render 路径
 		// 本仓库没有 DOM 测试台，文案键缺失只能在这一层拦住。
-		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault, removeSourceRemote, mergeTokenCleanup, dropTokenCleanup, localStateAfterRemoval });
+		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault, removeSourceRemote, mergeTokenCleanup, dropTokenCleanup, localStateAfterRemoval, stagedTokenRef, tokenWritePlan, buildSavePlan });
 		return module.exports;
 	}
 });

@@ -75,9 +75,9 @@ test('parseUid accepts Grafana-compatible UIDs and dashboard URLs', () => {
 test('normalizeBaseUrl allows HTTP out of the box and can enforce HTTPS only', () => {
   assert.equal(internals.normalizeBaseUrl('https://grafana.example.com/'), 'https://grafana.example.com')
   assert.equal(internals.normalizeBaseUrl('http://127.0.0.1:3000/'), 'http://127.0.0.1:3000')
-  assert.equal(internals.normalizeBaseUrl('http://grafana.internal/'), 'http://grafana.internal')
-  assert.equal(internals.normalizeBaseUrl('http://grafana.internal/', true), 'http://grafana.internal')
-  assert.throws(() => internals.normalizeBaseUrl('http://grafana.internal/', false), /Plain HTTP is disabled/)
+  assert.equal(internals.normalizeBaseUrl('http://grafana.example.com/'), 'http://grafana.example.com')
+  assert.equal(internals.normalizeBaseUrl('http://grafana.example.com/', true), 'http://grafana.example.com')
+  assert.throws(() => internals.normalizeBaseUrl('http://grafana.example.com/', false), /Plain HTTP is disabled/)
   assert.throws(() => internals.normalizeBaseUrl('https://user:pass@grafana.example.com'), /embedded credentials/)
   assert.throws(() => internals.normalizeBaseUrl('https://grafana.example.com?target=x'), /query string or fragment/)
 })
@@ -1618,7 +1618,7 @@ test('apply registers a grafana settings namespace and resolves config through i
   }), /Duplicate Grafana source name/)
 
   // 用户设置层的值优先于组合层 base，健康检查按其解析 base URL。
-  await scope.update({ baseUrl: 'https://grafana.internal' })
+  await scope.update({ baseUrl: 'https://grafana.example.com' })
   const originalFetch = globalThis.fetch
   const calls = []
   globalThis.fetch = async (url) => {
@@ -1632,7 +1632,7 @@ test('apply registers a grafana settings namespace and resolves config through i
   } finally {
     globalThis.fetch = originalFetch
   }
-  assert.equal(calls[0], 'https://grafana.internal/api/health')
+  assert.equal(calls[0], 'https://grafana.example.com/api/health')
 })
 
 test('apply migrates a legacy credential-stored URL into the settings namespace on startup', async () => {
@@ -2485,7 +2485,11 @@ test('grafana_panel_query adhoc mixed datasources stay in one batch request with
       {
         id: 1, type: 'timeseries', title: 'ES',
         datasource: { type: 'elasticsearch', uid: 'es' },
-        targets: [{ refId: 'A', query: 'count(*)' }],
+        targets: [
+          { refId: 'A', query: 'count(*)' },
+          // 表达式只能引用本面板的查询，故与 A 同面板（依赖闭包会校验这一点）。
+          { refId: 'D', datasource: { type: '__expr__', uid: '__expr__' }, expression: '$A * 2' },
+        ],
       },
       {
         id: 2, type: 'timeseries', title: 'Prom',
@@ -2496,10 +2500,6 @@ test('grafana_panel_query adhoc mixed datasources stay in one batch request with
         id: 3, type: 'timeseries', title: 'PG',
         datasource: { type: 'postgres', uid: 'pg' },
         targets: [{ refId: 'C', rawSql: 'SELECT 1 FROM t WHERE ${__adhoc}' }],
-      },
-      {
-        id: 4, type: 'timeseries', title: 'Expr',
-        targets: [{ refId: 'D', datasource: { type: '__expr__', uid: '__expr__' }, expression: '$A * 2' }],
       },
     ],
   }
@@ -3137,7 +3137,13 @@ test('grafana_sources lists each source with its default marker, UID, URL, and t
 test('tools resolve the source argument by name or id, fall back to the default, and reject unknown sources', async () => {
   const originalFetch = globalThis.fetch
   const calls = []
-  globalThis.fetch = async (url) => { calls.push(String(url)); return jsonResponse({ database: 'ok', commit: 'c', version: 'v' }) }
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    // /api/search 必须返回列表：凭证校验以「拿到了大盘列表」为准。
+    return String(url).includes('/api/search')
+      ? jsonResponse([])
+      : jsonResponse({ database: 'ok', commit: 'c', version: 'v' })
+  }
   try {
     const { tools } = createSettingsContext({
       sources: [
@@ -3332,4 +3338,304 @@ test('startup migration yields to a concurrent user save instead of overwriting 
   assert.equal(cfg.sources[0].id, 'user-1', 'the user save must survive the racing migration')
   assert.equal(cfg.sources[0].name, 'mine')
   assert.equal(cfg.defaultSource, 'user-1')
+})
+
+// 迁移必须沿用解析后的单源 tokenRef：旧版允许自定义引用，凭证库里存的也是那个
+// ref。改回默认 GRAFANA_TOKEN 会让物化出的源站指向不存在的凭证，全部鉴权失败。
+test('startup migration keeps a custom legacy tokenRef instead of resetting it', async () => {
+  const { registrations, creds } = createSettingsContext({ tokenRef: 'CUSTOM_GRAFANA_TOKEN' }, {
+    CUSTOM_GRAFANA_TOKEN: 'custom-token',
+  })
+  const [{ scope }] = registrations
+  await new Promise((resolve) => setImmediate(resolve))
+  const [source] = scope.get().sources
+  assert.equal(source.tokenRef, 'CUSTOM_GRAFANA_TOKEN')
+  // 原凭证原样留着，没有被搬走也没有被清掉。
+  assert.equal(creds.CUSTOM_GRAFANA_TOKEN, 'custom-token')
+})
+
+// ── 写入目标绑定：审批的是哪一台就只能写哪一台 ────────────────────────────────
+// 宿主对同一次调用复用同一个 exec 对象（tools/pre-execute → 工具 execute），
+// 故下面的 harness 与真实宿主同形：gate 与 execute 传同一个 exec。
+function mutableSourcesContext(sources, creds = {}) {
+  const tools = []
+  const listeners = new Map()
+  let section = { sources, defaultSource: sources[0].id }
+  const credentialState = { ...creds }
+  const settingsService = {
+    register(ns, schema, options = {}) {
+      const scope = { get: () => schema({ ...options.base, ...section }) }
+      options.validate?.(scope.get())
+      return scope
+    },
+    // sources 非空：迁移不参与本用例。
+    describe() { return [] },
+    async update(ns, patch) { section = { ...section, ...patch } },
+  }
+  const ctx = {
+    credentials: {
+      async resolve(ref) { return credentialState[ref] ? { value: credentialState[ref] } : undefined },
+      async unset(ref) { delete credentialState[ref] },
+    },
+    inject(services, callback) {
+      if (!services.includes('settings')) return
+      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
+    },
+    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
+    systemPrompt: { section() {} },
+    tools: { register(tool) { tools.push(tool); return () => {} } },
+  }
+  apply(ctx, {})
+  return {
+    tools,
+    listeners,
+    // 模拟「另一处把默认源站改掉了」。
+    setDefaultSource(id) { section = { ...section, defaultSource: id } },
+    setSources(list) { section = { ...section, sources: list } },
+  }
+}
+
+const HTML_RESPONSE = () => new Response('<html><body>Login</body></html>', {
+  status: 200,
+  headers: { 'Content-Type': 'text/html' },
+})
+
+test('a write whose approved source changed while the user was asked is refused', async () => {
+  const originalFetch = globalThis.fetch
+  const posts = []
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      posts.push(String(url))
+      return jsonResponse({ uid: 'fixture-copy', version: 1, status: 'success', url: '/d/fixture-copy/copy' })
+    }
+    return jsonResponse({ meta: { folderUid: 'folder', canSave: true }, dashboard: { id: 7, uid: 'fixture-dash', version: 3, title: 'Overview', panels: [] } })
+  }
+  try {
+    const h = mutableSourcesContext([
+      { id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' },
+      { id: 'b', name: 'Beta', baseUrl: 'https://beta.example.com', tokenRef: 'TOKEN_B' },
+    ], { TOKEN_A: 'a', TOKEN_B: 'b' })
+    const gate = h.listeners.get('tools/pre-execute')
+    // 与宿主同形：gate 与 execute 共用同一个 exec 对象。
+    const exec = { name: 'grafana_clone', arguments: { sourceUrlOrUid: 'fixture-dash' } }
+    const decision = await gate(exec, async () => ({ kind: 'allow' }))
+    assert.equal(decision.kind, 'ask')
+    assert.match(decision.reason, /Target Grafana source: "Alpha"/)
+    // 等待用户批准期间，另一个设置页把默认源站改成了 Beta。
+    h.setDefaultSource('b')
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_clone').execute(exec.arguments, exec),
+      /approved for has changed: approval named "Alpha", the call now resolves to "Beta"/,
+    )
+    // 一个字节都没发给 Beta。
+    assert.deepEqual(posts, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 源站 id 不变、地址被改成另一台实例：同 id/uid/version 并不能证明数据来自同一
+// 实例，旧快照不得继续写回（否则会把 A 实例读到的内容写进 B 实例）。
+test('changing a source URL invalidates the write snapshot taken before the change', async () => {
+  const originalFetch = globalThis.fetch
+  const posts = []
+  const dashboard = { id: 7, uid: 'fixture-dash', version: 3, title: 'Overview', panels: [] }
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      posts.push(String(url))
+      return jsonResponse({ uid: dashboard.uid, version: 4, status: 'success', url: '/d/fixture-dash/x' })
+    }
+    return jsonResponse({ meta: { folderUid: 'folder', canSave: true }, dashboard })
+  }
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'stable', name: 'Primary', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    await toolByName(h.tools, 'grafana_get').execute({ urlOrUid: dashboard.uid }, execution())
+    h.setSources([{ id: 'stable', name: 'Primary', baseUrl: 'https://beta.example.com', tokenRef: 'TOKEN_A' }])
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_push').execute({
+        dashboardJson: JSON.stringify({ ...dashboard, title: 'Changed' }),
+        changeSummary: 'Rename',
+        message: 'Rename',
+      }, execution()),
+      /No recent trusted snapshot exists/,
+    )
+    assert.deepEqual(posts, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 子路径部署：Grafana 返回的 url 已含 AppSubUrl，再拼一次就成 /grafana/grafana/。
+test('clone returns a dashboard URL that does not duplicate the base URL sub-path', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      return jsonResponse({ uid: 'fixture-copy', version: 1, status: 'success', url: '/grafana/d/fixture-copy/copy' })
+    }
+    return jsonResponse({ meta: { folderUid: 'folder', canSave: true }, dashboard: { id: 7, uid: 'fixture-dash', version: 3, title: 'Overview', panels: [] } })
+  }
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'a', name: 'Alpha', baseUrl: 'https://grafana.example.com/grafana', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    const out = await toolByName(h.tools, 'grafana_clone').execute({ sourceUrlOrUid: 'fixture-dash' }, execution())
+    assert.match(out, /url=https:\/\/grafana\.example\.com\/grafana\/d\/fixture-copy\/copy/)
+    assert.doesNotMatch(out, /grafana\/grafana/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// HTTP 200 但正文不是 JSON（登录网关/代理拦下了 API 请求）：绝不能凭默认值报成功。
+test('an HTTP 200 login page is never reported as a successful write or a valid credential', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = { id: 7, uid: 'fixture-dash', version: 3, title: 'Overview', panels: [] }
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') return HTML_RESPONSE()
+    return jsonResponse({ meta: { folderUid: 'folder', canSave: true }, dashboard })
+  }
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    await toolByName(h.tools, 'grafana_get').execute({ urlOrUid: dashboard.uid }, execution())
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_push').execute({
+        dashboardJson: JSON.stringify(dashboard),
+        changeSummary: 'Example update',
+        message: 'Example update',
+      }, execution()),
+      /non-JSON body/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // 拦截页常常回显请求凭证：这条新增错误分支必须走既有脱敏，不能把令牌原样插入文案。
+  globalThis.fetch = async () => new Response('<html>Authorization: Bearer glsa_AAAAAAAAAAAAAAAAAAAA</html>', {
+    status: 200,
+    headers: { 'Content-Type': 'text/html' },
+  })
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_status').execute({}, execution()),
+      (error) => {
+        assert.match(error.message, /non-JSON body/)
+        assert.equal(error.message.includes('glsa_'), false)
+        assert.match(error.message, /\[redacted\]/)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // 保存结果里的上游文本（status / message / uid）同样要先脱敏：新增的 JSON 失败
+  // 分支不能成为既有脱敏约定的例外。
+  for (const toolName of ['grafana_push', 'grafana_clone']) {
+    globalThis.fetch = async (url, init = {}) => jsonResponse(init.method === 'POST'
+      ? { uid: dashboard.uid, status: 'error', version: 4, message: 'Authorization: Bearer glsa_AAAAAAAAAAAAAAAAAAAA' }
+      : { meta: { folderUid: 'folder', canSave: true }, dashboard })
+    try {
+      const h = mutableSourcesContext(
+        [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+        { TOKEN_A: 'a' },
+      )
+      if (toolName === 'grafana_push') {
+        await toolByName(h.tools, 'grafana_get').execute({ urlOrUid: dashboard.uid }, execution())
+      }
+      const action = toolName === 'grafana_push'
+        ? toolByName(h.tools, 'grafana_push').execute({
+          dashboardJson: JSON.stringify(dashboard),
+          changeSummary: 'Example update',
+          message: 'Example update',
+        }, execution())
+        : toolByName(h.tools, 'grafana_clone').execute({ sourceUrlOrUid: dashboard.uid, newTitle: 'Example copy' }, execution())
+      await assert.rejects(action, (error) => {
+        assert.match(error.message, /cannot be confirmed/)
+        assert.equal(error.message.includes('glsa_'), false)
+        assert.match(error.message, /\[redacted\]/)
+        return true
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  // 健康端点同样被拦：credential=valid 是编出来的结论，必须报错。
+  globalThis.fetch = async () => HTML_RESPONSE()
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_status').execute({}, execution()),
+      /non-JSON body/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // JSON 但形状不对（没有 database 字段）：同样不能算健康检查通过。
+  globalThis.fetch = async (url) => (String(url).includes('/api/health')
+    ? jsonResponse({ version: '11.0.0' })
+    : jsonResponse([]))
+  try {
+    const h = mutableSourcesContext(
+      [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+      { TOKEN_A: 'a' },
+    )
+    await assert.rejects(
+      toolByName(h.tools, 'grafana_status').execute({}, execution()),
+      /did not return the expected health payload/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// 保存响应只有字段存在性检查是不够的：status 不是 success、uid 与请求不一致、
+// 没有新版本号，都是 HTTP 200 里的矛盾应答，不能报成写入成功（还会清掉快照）。
+test('grafana_push accepts only a save response that confirms status, uid and version', async () => {
+  const originalFetch = globalThis.fetch
+  const dashboard = { id: 7, uid: 'fixture-dash', version: 3, title: 'Overview', panels: [] }
+  const cases = [
+    [{ uid: dashboard.uid, status: 'error', version: 4 }, /did not confirm the save \(status="error"\)/],
+    [{ uid: 'other-dashboard', status: 'success', version: 4 }, /confirmed a different dashboard/],
+    [{ uid: dashboard.uid, status: 'success' }, /reported no valid new version/],
+    [{ version: 4 }, /returned no status for this save/],
+  ]
+  for (const [result, expected] of cases) {
+    globalThis.fetch = async (url, init = {}) => {
+      if (init.method === 'POST') return jsonResponse(result)
+      return jsonResponse({ meta: { folderUid: 'folder', canSave: true }, dashboard })
+    }
+    try {
+      const h = mutableSourcesContext(
+        [{ id: 'a', name: 'Alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'TOKEN_A' }],
+        { TOKEN_A: 'a' },
+      )
+      await toolByName(h.tools, 'grafana_get').execute({ urlOrUid: dashboard.uid }, execution())
+      await assert.rejects(
+        toolByName(h.tools, 'grafana_push').execute({
+          dashboardJson: JSON.stringify(dashboard),
+          changeSummary: 'Example update',
+          message: 'Example update',
+        }, execution()),
+        expected,
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
 })
