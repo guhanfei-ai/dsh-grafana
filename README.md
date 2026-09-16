@@ -2,7 +2,7 @@
 
 [简体中文](./README.zh-CN.md)
 
-A DeepSeek Harness plugin for fetching, editing, and safely updating Grafana dashboards through conversation. It operates on dashboard JSON directly—no screenshots required.
+A DeepSeek Harness plugin for agent-native Grafana observability — dashboards, live metrics, trends, alerts and cross-source investigation, with safe, reviewable dashboard updates. It operates on Grafana APIs and dashboard JSON directly; no screenshots required.
 
 > Project status: pre-1.0. The safety controls and automated tests cover the core update path, but Grafana 12+ compatibility is not yet certified.
 

@@ -2,7 +2,7 @@
 
 [English](./README.md)
 
-一个用于通过对话读取、编辑并安全写回 Grafana 大盘的 DeepSeek Harness 插件。插件直接操作 Dashboard JSON，不需要截图。
+一个面向 Agent 的 Grafana 可观测 DeepSeek Harness 插件——读取大盘、查询实时指标、跟踪趋势与告警、跨源对比调查，并能安全、可审查地写回大盘。插件直接操作 Grafana API 与 Dashboard JSON，不需要截图。
 
 > 项目状态：1.0 前版本。核心写回路径已经具备安全保护和自动化测试，但尚未完成 Grafana 12+ 兼容性认证。
 
