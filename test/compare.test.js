@@ -679,6 +679,48 @@ test('grafana_compare caps each source at MAX_COMPARE_SERIES_PER_SOURCE and disc
   assert.equal(seriesLines.length, MAX_COMPARE_SERIES_PER_SOURCE)
 })
 
+test('grafana_compare counts hidden series from later frames instead of silently truncating', async () => {
+  // 回归：帧收集循环曾在打满上限后 break，导致后续 frame 里的 series 既没显示
+  // 也没计入 hidden —— 静默截断。这里第一个 frame 正好打满上限，第二个 frame 还
+  // 有 3 条，输出必须披露 (+3 hidden)。
+  const originalFetch = globalThis.fetch
+  const numericFrame = (count, offset) => {
+    const fields = []
+    const values = []
+    for (let i = 0; i < count; i += 1) {
+      fields.push({ name: `Value${offset + i}`, type: 'number', labels: { job: 'api' } })
+      values.push([offset + i + 1])
+    }
+    return { schema: { fields }, data: { values } }
+  }
+  globalThis.fetch = async (url, init) => {
+    const host = /^https:\/\/([^.]+)\.example\.com/.exec(String(url))[1]
+    if (String(init?.method ?? 'GET').toUpperCase() === 'POST') {
+      if (host === 'alpha') {
+        return jsonResponse({ results: { A: { frames: [numericFrame(MAX_COMPARE_SERIES_PER_SOURCE, 0), numericFrame(3, 10)] } } })
+      }
+      return jsonResponse({ results: { A: { frames: [numericFrame(1, 0)] } } })
+    }
+    return jsonResponse([{ uid: `${host[0]}p`, type: 'prometheus', name: 'Prometheus', isDefault: true }])
+  }
+  try {
+    const { tools } = createSettingsContext({
+      sources: [
+        { id: 'id-a', name: 'alpha', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' },
+        { id: 'id-b', name: 'beta', baseUrl: 'https://beta.example.com', tokenRef: 'GRAFANA_TOKEN_idb' },
+      ],
+      defaultSource: 'id-a',
+    }, { GRAFANA_TOKEN_ida: 'a', GRAFANA_TOKEN_idb: 'b' })
+    const tool = toolByName(tools, 'grafana_compare')
+    const out = await tool.execute({ sources: ['alpha', 'beta'], datasource: 'Prometheus', query: 'up' }, execution())
+    const alphaLine = out.split('\n').find((l) => l.startsWith('alpha:'))
+    assert.ok(alphaLine, `expected alpha line in: ${JSON.stringify(out)}`)
+    assert.match(alphaLine, new RegExp(`series=${MAX_COMPARE_SERIES_PER_SOURCE} \\(\\+3 hidden\\)`))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 // ── 零值/NaN 边界：summary 不出 ∞% ──────────────────────────────────────────
 
 test('grafana_compare reports n/a instead of infinity when summary ratio is undefined (zero-value or all-zero cases)', () => {
