@@ -137,6 +137,7 @@ The exact scope each tool needs:
 | `grafana_panel_query` | `dashboards:read` + `datasources:query` |
 | `grafana_datasources` | `datasources:read` |
 | `grafana_metric` | `datasources:read` + `datasources:query` |
+| `grafana_compare` | `datasources:read` + `datasources:query` (per source) |
 | `grafana_trend` | `dashboards:read` + `datasources:query` |
 | `grafana_alerts` | `alert.instances:read`; `definitions: true` also needs `alert.provisioning:read`; `ruleStates: true` needs its own rules-read permission (a refusal is reported in place with the missing scope) |
 | `grafana_search` | `dashboards:read` |
@@ -165,6 +166,7 @@ The tool surface covers the full read-to-write loop:
 | Live panel values | `grafana_panel_query` |
 | Trend of a dashboard's series | `grafana_trend` |
 | Ad-hoc bare query (PromQL / LogQL) | `grafana_metric` |
+| Cross-source metric comparison | `grafana_compare` |
 | Datasource discovery | `grafana_datasources` |
 | Active alerts & rule definitions | `grafana_alerts` |
 | Source & credential health | `grafana_status`, `grafana_sources` |
@@ -182,11 +184,52 @@ Every tool accepts an optional `source` argument (a configured source name) to p
 | `grafana_panel_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_panel_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
 | `grafana_datasources` | Lists the datasources provisioned on a source (uid, plugin type, display name, whether it is the default, access mode, and the configured URL — a `url="(empty)"` row usually means a misconfigured datasource whose queries will fail, so pick another uid). Filter by exact plugin type or a case-insensitive name substring. Results are paged (default 40 rows per page; `limit` changes the page size, `page` fetches later pages), with a final line reporting the page, the total, and how to continue. Call it before `grafana_metric` to learn which uid or name to query. Read-only. |
 | `grafana_metric` | Runs one bare-text query (PromQL such as `up` or `rate(http_requests_total[5m])`, or a LogQL stream selector) directly against a Prometheus or Loki datasource, addressed by uid or exact display name — no dashboard needed. `mode: "instant"` (default) evaluates once at the range end; `mode: "range"` samples the series and reports per-series stats, a rising/falling/flat verdict, and a sparkline — with the actual sampling step on the header line (`step=`) and the returned point count per series (`points=`), so the precision and coverage of the answer are visible (a range query against loki returns log lines rather than numeric samples, so those series report a line count and the last line instead; on loki, instant mode accepts metric queries only — use range for log-stream selectors). Other plugin types and server-side expressions are rejected with a pointer to `grafana_panel_query`. Read-only; records no write snapshot. |
+| `grafana_compare` | Runs the same Prometheus query against the corresponding datasource on multiple configured Grafana sources (2-10 at a time) and returns a compact side-by-side comparison — addresses the datasource by display name or uid, but resolves it independently per source so two Grafana instances with different UIDs for the same logical datasource still line up. When every source returns a single numeric value, the output ends with a small numeric summary (highest, lowest, average, max/min ratio); a per-source failure, no-data, or multi-series result never drops the successful ones — every error is sanitized and bounded (no credentials, no upstream paths). Read-only; records no write snapshot and triggers no approval. |
 | `grafana_trend` | Answers "is it going up or down?" for a dashboard's panels in one call: every visible query target is re-run as a coarse range query and each series is reported with the returned point count, bucket count, first/last/min/max/avg, a direction verdict, and a sparkline; the header line discloses the actual sampling step. Table-shaped results report rows and stats with `trend=n/a` rather than a fabricated direction. Uses the same panel pipeline as `grafana_panel_query` (variables, adhoc filters, legacy datasource references, per-panel fallback). The range may span at most 90 days. Read-only; records no write snapshot. |
 | `grafana_alerts` | Lists the alerts currently firing on a source from the built-in Alertmanager (default `state=firing`; `"suppressed"` for silenced/inhibited, `"all"` for both). The upstream `active` state (Alertmanager v2's "firing") is reported as `state=firing`, so a normally firing alert is never dropped as unknown. Filter by folder, a case-insensitive substring across labels and annotations, or a dashboard URL/uid. Active alerts are capped at the `limit` argument (default 30, max 100) with anything dropped disclosed on a final budget line. `definitions: true` appends the provisioned alert rule definitions in a second request (its own permission, its own failure isolation). `ruleStates: true` appends the evaluation state of every rule (`rule-state` lines: `inactive`, `pending`, `firing`, `recording`, `unknown`) from the Prometheus-compatible rules API — `pending` means the condition is met but the `for` duration has not elapsed, which the Alertmanager view cannot answer; filter that section with `ruleState`. Both rule sections are paged with `rulesPage` (100 rows per page) and disclose the total and the next page. Read-only; alert text is untrusted data. |
 | `grafana_search` | Searches by optional title text and exact tag, returning at most 50 rows. |
 | `grafana_status` | Checks connectivity and service-account validity. |
 | `grafana_sources` | Lists the configured Grafana sources: each name, its read-only UID, base URL, whether its token is configured, and which one is the default. Read-only; never returns token values. Use it to discover valid source names before passing `source` to other tools. |
+
+### Cross-source comparison examples (`grafana_compare`)
+
+`grafana_compare` runs the same PromQL query against the corresponding datasource on every listed source and returns one compact comparison view, so a multi-source question takes one tool call instead of three plus manual comparison. Common patterns:
+
+Region comparison — same P99 latency across regions:
+
+```json
+{
+  "sources": ["tokyo", "singapore", "us"],
+  "datasource": "Prometheus",
+  "query": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"payment\"}[5m])))"
+}
+```
+
+Environment comparison — error rate between production and staging:
+
+```json
+{
+  "sources": ["prod", "staging"],
+  "datasource": "Prometheus",
+  "query": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))"
+}
+```
+
+Cluster comparison — node CPU across Grafana clusters A, B, C with a longer range:
+
+```json
+{
+  "sources": ["cluster-a", "cluster-b", "cluster-c"],
+  "datasource": "Prometheus",
+  "query": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100)",
+  "mode": "range",
+  "from": "now-15m",
+  "to": "now",
+  "points": 60
+}
+```
+
+When every source returns a single numeric value the output ends with a small summary (highest, lowest, average, max/min ratio). If any source returns multiple series, fails, or returns no data, the summary is omitted and each source is shown with its per-series breakdown or sanitized error instead — a high-cardinality query can never be misread as a direct scalar comparison.
 
 ### Template variable overrides (`grafana_panel_query`)
 

@@ -171,6 +171,7 @@ test('apply registers the whole tool surface and a hard approval gate for writes
     'grafana_datasources',
     'grafana_metric',
     'grafana_trend',
+    'grafana_compare',
     'grafana_alerts',
     'grafana_search',
     'grafana_status',
@@ -3687,6 +3688,7 @@ const VALID_ARGS = {
   grafana_panel_query: { urlOrUid: 'abc123' },
   grafana_datasources: {},
   grafana_metric: { datasource: 'prom-prod', expr: 'up{job="api"}' },
+  grafana_compare: { sources: ['a', 'b'], datasource: 'Prometheus', query: 'up' },
   grafana_trend: { urlOrUid: 'abc123' },
   grafana_alerts: {},
   grafana_search: {},
@@ -3697,7 +3699,7 @@ const VALID_ARGS = {
 test('read-only tools without shared write state opt into parallel dispatch', () => {
   const { tools } = createContext()
   // 无共享写状态的只读工具：允许并行。
-  for (const name of ['grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
+  for (const name of ['grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_compare', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
     const tool = toolByName(tools, name)
     assert.equal(typeof tool.isConcurrencySafe, 'function', `${name} must declare isConcurrencySafe`)
     assert.equal(tool.isConcurrencySafe(VALID_ARGS[name]), true)
