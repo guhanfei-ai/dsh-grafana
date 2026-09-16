@@ -118,6 +118,7 @@ function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = '
         if (ns !== 'grafana' || !op?.op) continue
         if (op.op === 'set' && op.path?.[0] === 'sources') state.sources = (op.value ?? []).map((s) => ({ ...s }))
         if (op.op === 'set' && op.path?.[0] === 'defaultSource') state.defaultSource = op.value
+        if (op.op === 'set' && op.path?.[0] === 'readOnly') state.readOnly = op.value === true
         if (op.op === 'unset' && op.path?.[0] === 'sources') state.sources = []
       }
       state.revision += 1
@@ -195,10 +196,17 @@ function cardHarness(options = {}) {
   ])
   const buttons = () => nodes(render()).filter((node) => node.type === 'button')
   const inputs = () => nodes(render()).filter((node) => node.type === 'input')
+  // 模式开关：卡顶的 role=switch 按钮（children 是 thumb 节点，不能按文案找）。
+  const switchButton = () => {
+    const node = buttons().find((n) => n.props.role === 'switch')
+    assert.ok(node, 'no role="switch" button on the card')
+    return node
+  }
   return {
     ...harness,
     states,
     buttons,
+    switchButton,
     // 等首次 describe 落地，再展开卡片（收起时子内容不渲染）。
     async ready() {
       await new Promise(setImmediate)
@@ -236,8 +244,8 @@ test('browser module declares the dsh-grafana id, the slots-only inject, and the
       },
     },
   })
-  // 多源站 face 契约：读回源站列表、整体写入、令牌增删、语言偏好。
-  for (const method of ['describe', 'writeSources', 'setToken', 'unsetToken', 'localePreference']) {
+  // 多源站 face 契约：读回源站列表、整体写入、令牌增删、语言偏好、模式单字段写。
+  for (const method of ['describe', 'writeSources', 'writeReadOnly', 'setToken', 'unsetToken', 'localePreference']) {
     assert.equal(typeof face[method], 'function', `face.${method} must be a function`)
   }
 })
@@ -1274,30 +1282,128 @@ test('sources are not writable before the configuration has been read successful
   assert.deepEqual(after.sources.map((s) => s.name), ['alpha'])
 })
 
-// ── R6：只读模式在设置卡片可见 ──────────────────────────────────────────────
-test('the settings card surfaces the current read-only mode', async () => {
+// ── R6：只读模式在设置卡片可见、可切换 ──────────────────────────────────────
+test('the settings card surfaces the current read-only mode on the toggle', async () => {
   // 数据面：describe 把命名空间 value 里的 readOnly 明文带回来。
   const rw = setup({})
   assert.equal((await rw.face.describe()).readOnly, false)
   const ro = setup({ readOnly: true })
   assert.equal((await ro.face.describe()).readOnly, true)
 
-  // 展示面：卡片状态按 describe 结果落位（readOnly 是 useState 序列的最后一项，
-  // 刻意排在末尾以免打乱既有状态下标）。
-  const card = cardHarness({ readOnly: true })
+  // 展示面：卡片状态与开关按 describe 结果落位（readOnly 及其后的模式反馈状态
+  // 刻意排在 useState 序列末尾，以免打乱既有状态下标：readOnly 恒为 states[12]）。
+  const card = cardHarness({ readOnly: true, locale: 'en' })
   await card.ready()
-  assert.equal(card.states.at(-1), true)
-  const rwCard = cardHarness({})
+  assert.equal(card.states[12], true)
+  assert.equal(card.switchButton().props['aria-checked'], true)
+  const rwCard = cardHarness({ locale: 'en' })
   await rwCard.ready()
-  assert.equal(rwCard.states.at(-1), false)
+  assert.equal(rwCard.states[12], false)
+  assert.equal(rwCard.switchButton().props['aria-checked'], false)
 
   // 文案双语存在。
   const { STRINGS } = loadBrowserRuntime().internals
   for (const lang of ['zh', 'en']) {
-    for (const key of ['modeLabel', 'modeReadOnly', 'modeReadWrite']) {
+    for (const key of ['modeToggleLabel', 'stateReadOnly', 'stateReadWrite', 'modeToggleHint', 'modeReadWriteDesc', 'modeReadOnlyDesc', 'modeEffectNote', 'savedReadOnly', 'savedReadWrite']) {
       assert.equal(typeof STRINGS[lang][key], 'string', `${lang}.${key} must exist`)
       assert.ok(STRINGS[lang][key].length > 0)
     }
   }
-  assert.notEqual(STRINGS.zh.modeReadOnly, STRINGS.en.modeReadOnly)
+  assert.notEqual(STRINGS.zh.modeToggleLabel, STRINGS.en.modeToggleLabel)
+})
+
+// writeReadOnly 的 face 契约：单字段 mutate（恰一个 set op）、位置参数、arity 3、
+// 第三参未显式传时按最后一次 describe 的版本做检查（与 writeSources 同一防陈旧语义）。
+test('writeReadOnly routes a single-field mutate through the settings facade', async () => {
+  const source = { id: 'id-a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_ia' }
+  const { face, calls } = setup({ sources: [source], defaultSource: 'id-a' })
+  await face.describe()
+  await face.writeReadOnly(true, 0)
+  const mutates = calls.filter(([m]) => m === 'settings.mutate')
+  assert.equal(mutates.length, 1)
+  assert.equal(mutates[0][1].length, 3)
+  assert.equal(JSON.stringify(mutates[0][1].slice(0, 2)), JSON.stringify(['grafana', [
+    { op: 'set', path: ['readOnly'], value: true },
+  ]]))
+  assert.equal(mutates[0][1][2], 0)
+  // 载荷里没有 sources/defaultSource：模式写入不可能波及源站配置。
+  const ops = mutates[0][1][1]
+  assert.equal(ops.some((op) => op.path?.[0] !== 'readOnly'), false)
+  // 未显式传版本时同样按最后一次读取的版本做检查（调用方漏传也不能退化成无条件写）。
+  await face.describe()
+  await face.writeReadOnly(false)
+  const last = calls.filter(([m]) => m === 'settings.mutate').at(-1)
+  assert.equal(last[1].length, 3)
+  assert.equal(last[1][2], 1)
+  // 后端权威状态已翻转。
+  assert.equal((await face.describe()).readOnly, false)
+})
+
+test('writeReadOnly rejects on an unsupported host', async () => {
+  const { face } = setup({ remote: false })
+  await assert.rejects(() => face.writeReadOnly(true), /HOST_UNSUPPORTED/)
+})
+
+// 切换即写：点开关 → 单字段 mutate 写 readOnly=true，sources/defaultSource 原样
+// 保留（三源站 + 默认源站一个不动），成功反馈与开关态就近显示，回读带回新修订号。
+test('toggling into read-only writes readOnly alone and keeps sources and the default untouched', async () => {
+  const remote = buildBackend({
+    locale: 'en',
+    sources: [
+      { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' },
+      { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' },
+      { id: 'id-lab', name: 'lab', baseUrl: 'https://lab.example.com', tokenRef: 'GRAFANA_TOKEN_idlab' },
+    ],
+    defaultSource: 'id-prod',
+  })
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  await card.switchButton().props.onClick()
+  // 恰一次 mutate，只带一个 set op，且带上读取时的修订号。
+  const mutates = card.calls.filter(([m]) => m === 'settings.mutate')
+  assert.equal(mutates.length, 1)
+  assert.equal(JSON.stringify(mutates[0][1].slice(0, 2)), JSON.stringify(['grafana', [
+    { op: 'set', path: ['readOnly'], value: true },
+  ]]))
+  assert.equal(mutates[0][1][2], 0)
+  // 后端权威状态：readOnly 已翻 true；源站与默认源站一个没动。
+  assert.equal(remote.state.readOnly, true)
+  assert.deepEqual(remote.state.sources.map((s) => s.name), ['prod', 'eu', 'lab'])
+  assert.equal(remote.state.defaultSource, 'id-prod')
+  // 界面反馈：开关 ON、方向相关的「已保存」提示就在开关下方，无错误。
+  assert.equal(card.states[12], true)
+  assert.equal(card.switchButton().props['aria-checked'], true)
+  assert.match(String(card.states[13]), /Saved/)
+  assert.doesNotMatch(String(card.states[13]), /restart/i)
+  assert.equal(String(card.states[14]), '')
+  // 回读带回了新修订号：随后的源站保存不会因陈旧版本被拒。
+  assert.equal(card.states[10], 1)
+})
+
+// 从只读切回读写：保存成功，但提示重启/重载才会重新注册写入工具（以只读模式启动
+// 的插件从未注册它们）——这个事实不得隐藏。
+test('switching back to read-write saves and explains the restart requirement', async () => {
+  const remote = buildBackend({ locale: 'en', readOnly: true })
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  await card.switchButton().props.onClick()
+  assert.equal(remote.state.readOnly, false)
+  assert.equal(card.states[12], false)
+  assert.equal(card.switchButton().props['aria-checked'], false)
+  assert.match(String(card.states[13]), /Saved/)
+  assert.match(String(card.states[13]), /restart/i)
+  assert.equal(String(card.states[14]), '')
+})
+
+// 模式写入失败（宿主明确拒绝，例如版本冲突）：本地开关不翻转、不显示「已保存」，
+// 错误就近显示；重读让下一次重试拿到新修订号。
+test('a failed mode write keeps the previous mode and surfaces the error', async () => {
+  const card = cardHarness({ locale: 'en', fail: { 'settings.mutate': 'settings persistence failed' } })
+  await card.ready()
+  await card.switchButton().props.onClick()
+  assert.equal(card.state.readOnly, false)
+  assert.equal(card.states[12], false)
+  assert.equal(card.switchButton().props['aria-checked'], false)
+  assert.equal(String(card.states[13]), '')
+  assert.match(String(card.states[14]), /settings persistence failed/)
 })

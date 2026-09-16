@@ -96,7 +96,9 @@ Read-only mode is available for monitoring and troubleshooting roles that must n
 readOnly: true
 ```
 
-When enabled, `grafana_push` and `grafana_clone` are not registered at all — no dashboard write tool exists for the model to call — and the settings card shows the current mode (read-only or read-write) next to the sources heading.
+When enabled, `grafana_push` and `grafana_clone` are not registered at all — no dashboard write tool exists for the model to call. The settings card shows the current mode and lets you switch it with the **Read-only mode** toggle at the top of the card (ON = read-only, OFF = read-write). Toggling writes the plugin-level `readOnly` setting only; the configured sources and the default source are untouched.
+
+Switching to read-only takes effect immediately: even when the write tools were registered at startup, the approval gate denies them at runtime. Switching back to read-write may require restarting DSH (or reloading the plugin), depending on when the plugin was loaded: a plugin that started in read-only mode never registered the write tools, and they only come back after a restart or reload.
 
 The settings `baseUrl` is the authoritative source; a legacy `GRAFANA_BASE_URL` credential (from earlier versions) is migrated into settings on startup and then used only as a fallback. The token reference defaults to `GRAFANA_TOKEN` and can be changed with `tokenRef`.
 

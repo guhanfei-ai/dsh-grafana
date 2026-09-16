@@ -96,7 +96,9 @@ allowInsecureHttp: false
 readOnly: true
 ```
 
-启用后 `grafana_push` 与 `grafana_clone` 完全不注册——模型没有可调用的写入工具——设置卡片会在源站标题旁显示当前模式（只读或读写）。
+启用后 `grafana_push` 与 `grafana_clone` 完全不注册——模型没有可调用的写入工具。设置卡片顶部提供**只读模式**开关（开 = 只读，关 = 读写），当前模式一目了然；切换只写插件级 `readOnly` 配置，不影响已配置的源站与默认源站。
+
+切换到只读立即生效：即使写入工具在启动时已注册，审批门也会在运行时拒绝它们。从只读切回读写可能需要重启 DSH（或重新加载插件），取决于插件加载时的模式：以只读模式启动的插件从未注册写入工具，重启或重载之后才会恢复。
 
 settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL` 凭证中的 URL 会在启动时自动迁移到 settings，之后凭证值仅作兜底。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
 

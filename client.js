@@ -4,6 +4,8 @@
 // 布尔，客户端永远不会读回明文，故以星号占位。各源站令牌 ref = GRAFANA_TOKEN_<去横线的
 // id>（迁移来的默认源站保留旧 ref GRAFANA_TOKEN）。名称/URL/默认源站存 settings
 // namespace（grafana）的 sources 数组 + defaultSource（非 secret，describe 返回明文，可回显）。
+// 读写模式（readOnly）同为非 secret 配置：卡顶开关即点即写，单字段 mutate 只 set
+// readOnly 路径，不触碰 sources/defaultSource。
 window.__ModuleLoader__.load({
 	id: "dsh-grafana",
 	factory: (require) => {
@@ -134,9 +136,15 @@ window.__ModuleLoader__.load({
 				cleanupUnverified: "无法确认该凭证是否仍在生效，已保留未清理。请重新读取后再试。",
 				unconfirmedRead: "宿主返回的配置数据无法解析（不是合法的源站列表）。为避免覆盖已存源站或误删凭证，已暂停写入；请点击“重新读取”。",
 				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。",
-				modeLabel: "模式",
-				modeReadOnly: "只读（grafana_push / grafana_clone 已停用）",
-				modeReadWrite: "读写（写入需逐项审批）"
+				modeToggleLabel: "只读模式",
+				stateReadOnly: "只读",
+				stateReadWrite: "读写",
+				modeToggleHint: "停用 grafana_push 与 grafana_clone。适合生产监控与排障场景。",
+				modeReadWriteDesc: "读写：AI 可查看并修改 Grafana 资源；写入仍需通过既有审批流程。",
+				modeReadOnlyDesc: "只读：AI 可查看大盘、指标、告警与数据源，但 grafana_push、grafana_clone 等写入工具已停用。",
+				modeEffectNote: "切换到只读立即生效；若插件以只读模式启动，切回读写后需重启 DSH 或重新加载插件，写入工具才会重新注册。",
+				savedReadOnly: "已保存。只读模式已生效。",
+				savedReadWrite: "已保存。若插件以只读模式启动，需重启 DSH 或重新加载插件，写入工具才会重新注册。"
 			},
 			en: {
 				title: "Grafana assistant",
@@ -181,9 +189,15 @@ window.__ModuleLoader__.load({
 				cleanupUnverified: "Whether this credential is still in use could not be confirmed, so it was left in place. Reload and try again.",
 				unconfirmedRead: "The host returned configuration data that cannot be parsed (not a valid source list). Writing is paused to avoid overwriting stored sources or deleting credentials in use; click “Reload”.",
 				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page.",
-				modeLabel: "Mode",
-				modeReadOnly: "Read-only (grafana_push / grafana_clone disabled)",
-				modeReadWrite: "Read-write (writes need per-call approval)"
+				modeToggleLabel: "Read-only mode",
+				stateReadOnly: "Read-only",
+				stateReadWrite: "Read-write",
+				modeToggleHint: "Disable grafana_push and grafana_clone. Useful for production monitoring and troubleshooting.",
+				modeReadWriteDesc: "Read-write: the AI can inspect and modify Grafana resources; write operations still require the existing approval flow.",
+				modeReadOnlyDesc: "Read-only: the AI can inspect dashboards, metrics, alerts and data sources, but write tools such as grafana_push and grafana_clone are disabled.",
+				modeEffectNote: "Switching to read-only takes effect immediately. If the plugin started in read-only mode, switching back to read-write requires restarting DSH or reloading the plugin before the write tools are registered again.",
+				savedReadOnly: "Saved. Read-only mode is active.",
+				savedReadWrite: "Saved. If the plugin started in read-only mode, restart DSH or reload the plugin to re-enable the write tools."
 			}
 		};
 
@@ -223,6 +237,11 @@ window.__ModuleLoader__.load({
 			hint: { margin: 0, fontSize: "12px", color: "var(--dsw-alias-label-tertiary)" },
 			badge: { whiteSpace: "nowrap", borderRadius: "999px", padding: "1px 8px", fontSize: "11px", fontWeight: 500, background: "var(--dsw-alias-bg-module-platform)", color: "var(--dsw-alias-label-secondary)", display: "inline-block" },
 			badgeOk: { color: "#2f9e44" },
+			// 模式开关（role=switch）：ON=只读（复用 badgeOk 的绿），OFF=读写。
+			switchTrack: { position: "relative", flexShrink: 0, width: "36px", height: "20px", borderRadius: "999px", border: "1px solid var(--dsw-alias-border-l2)", background: "var(--dsw-alias-bg-layer-3)", cursor: "pointer", padding: "0", transition: "background .16s, border-color .16s" },
+			switchTrackOn: { background: "#2f9e44", borderColor: "#2f9e44" },
+			switchThumb: { position: "absolute", top: "1px", left: "1px", width: "16px", height: "16px", borderRadius: "50%", background: "#ffffff", boxShadow: "0 1px 2px rgba(0,0,0,.15)", transition: "transform .16s" },
+			switchThumbOn: { transform: "translateX(16px)" },
 			footer: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" },
 			button: { border: "1px solid var(--dsw-alias-border-l2)", background: "var(--dsw-alias-bg-layer-3)", color: "var(--dsw-alias-label-primary)", borderRadius: "8px", height: "32px", padding: "0 14px", fontSize: "13px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 },
 			smallButton: { border: "1px solid var(--dsw-alias-border-l2)", background: "var(--dsw-alias-bg-layer-2)", color: "var(--dsw-alias-label-secondary)", borderRadius: "8px", height: "26px", padding: "0 10px", fontSize: "12px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 },
@@ -423,6 +442,10 @@ window.__ModuleLoader__.load({
 			// 监控排障用户据此确认权限边界，不必去猜写入工具为何缺席。
 			// 刻意放在 useState 序列末尾：测试台按下标存取状态，插在中间会整体错位。
 			const [readOnly, setReadOnly] = react.useState(false);
+			// 模式切换的就地反馈：成功文案（方向相关——切回读写要提示重启/重载）与
+			// 失败原因，渲染在开关下方；同样排在 useState 序列末尾，理由同上。
+			const [modeMsg, setModeMsg] = react.useState("");
+			const [modeError, setModeError] = react.useState("");
 			const T = STRINGS[lang] ?? STRINGS.en;
 			const storedById = new Map(stored.map((s) => [s.id, s]));
 			// 任一源站卡片脏（含新增未保存）即存在待保存内容，供「保存全部源站」可用性判断。
@@ -518,7 +541,7 @@ window.__ModuleLoader__.load({
 
 			// 首次读取失败后的重新读取：不成功就一直不开放写入。
 			async function reload() {
-				setSaving(true); setSaved(false); setError("");
+				setSaving(true); setSaved(false); setError(""); setModeMsg(""); setModeError("");
 				try {
 					applyDescribed(await face.describe());
 				} catch (e) {
@@ -756,6 +779,38 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			// 模式切换即写（同「设为默认即写」的交互模式）：单字段 mutate 只 set
+			// readOnly 路径，sources/defaultSource 不进写入载荷，天然不可能被波及。
+			// 失败不翻转本地开关（界面停留在已保存的模式上），并按权威状态重读一次
+			// 让版本冲突后的重试拿到新修订号。生效语义非对称，文案必须如实：
+			// 切到只读立即生效（pre-execute 运行时兜底 deny 已注册的写入工具）；
+			// 切回读写时，以只读模式启动的插件从未注册写入工具，需重启/重载才会回来。
+			async function onToggleReadOnly() {
+				if (!loaded) { setError(T.notLoaded); return; }
+				if (saving) return;
+				const next = !readOnly;
+				setSaving(true); setSaved(false); setError(""); setModeMsg(""); setModeError("");
+				try {
+					await face.writeReadOnly(next, revision);
+				} catch (e) {
+					setModeError(messageOf(e));
+					await reread().catch(() => {});
+					setSaving(false);
+					return;
+				}
+				// 写入已生效：先按已知结果推进本地展示（不等回读），再回读同步修订号。
+				setReadOnly(next);
+				let readError = null;
+				try {
+					await reread();
+				} catch (e) {
+					readError = e;
+				}
+				if (readError === null) setModeMsg(next ? T.savedReadOnly : T.savedReadWrite);
+				else setModeError(messageOf(readError));
+				setSaving(false);
+			}
+
 			// 待清理凭证的提示文案按来源分档：移除源站的孤儿令牌、轮换后被替换的
 			// 旧令牌、保存失败后未回收的暂存令牌。三种都得给出各自的重试入口。
 			function cleanupMessage(entry) {
@@ -850,10 +905,33 @@ window.__ModuleLoader__.load({
 					]
 				}),
 				open ? hs("div", { style: S.body, children: [
+					// 模式控制（卡顶，复用源站子卡样式）：ON=只读、OFF=读写，即点即写。
+					// 权限边界常驻可见：当前模式徽标 + 开关态 + 生效语义说明；
+					// 切回读写需重启/重载的提示不隐藏，成功/失败反馈就在开关下方。
+					hs("div", { style: S.sourceCard, children: [
+						hs("div", { style: S.sourceHeader, children: [
+							h("span", { style: S.label, children: T.modeToggleLabel }),
+							h("span", { style: { ...S.badge, ...(readOnly ? {} : S.badgeOk) }, children: readOnly ? T.stateReadOnly : T.stateReadWrite }),
+							h("span", { style: S.spacer }),
+							h("button", {
+								type: "button",
+								role: "switch",
+								"aria-checked": readOnly,
+								"aria-label": T.modeToggleLabel,
+								style: { ...S.switchTrack, ...(readOnly ? S.switchTrackOn : {}) },
+								disabled: saving || hostUnsupported || !loaded,
+								onClick: onToggleReadOnly,
+								children: h("span", { style: { ...S.switchThumb, ...(readOnly ? S.switchThumbOn : {}) } })
+							})
+						] }),
+						h("p", { style: S.hint, children: T.modeToggleHint }),
+						h("p", { style: S.hint, children: readOnly ? T.modeReadOnlyDesc : T.modeReadWriteDesc }),
+						h("p", { style: S.hint, children: T.modeEffectNote }),
+						modeMsg ? h("p", { style: S.msg, children: modeMsg }) : null,
+						modeError ? h("p", { style: S.err, children: modeError }) : null
+					] }),
 					hs("div", { style: S.head, children: [
-						h("span", { style: S.title, children: T.sourcesHeading }),
-						// 权限边界常驻可见：只读模式说明写入工具根本没注册。
-						h("span", { style: { ...S.badge, ...(readOnly ? {} : S.badgeOk) }, children: `${T.modeLabel}: ${readOnly ? T.modeReadOnly : T.modeReadWrite}` })
+						h("span", { style: S.title, children: T.sourcesHeading })
 					] }),
 					hostUnsupported ? h("p", { style: S.err, children: T.hostTooOld }) : null,
 					!hostUnsupported && sources.length === 0 ? h("p", { style: S.hint, children: T.sourcesEmpty }) : null,
@@ -1010,6 +1088,16 @@ window.__ModuleLoader__.load({
 					unwrap(await settings.mutate(SETTINGS_NS, [
 						{ op: "set", path: ["sources"], value: normalized },
 						{ op: "set", path: ["defaultSource"], value: defaultSource },
+					], Number.isInteger(expectedRevision) ? expectedRevision : (Number.isInteger(describedRevision) ? describedRevision : void 0)), "settings.mutate");
+				},
+				// 只写 readOnly 一个字段：set op 只对目标路径赋值，sources/defaultSource
+				// 不在载荷里、原样不动（模式切换不可能破坏源站配置）。修订号语义与
+				// writeSources 相同——第三参 arity 上不可省，无版本时显式传 void 0。
+				writeReadOnly: async (readOnly, expectedRevision) => {
+					const settings = settingsApi();
+					if (!settings?.mutate) throw new Error(HOST_UNSUPPORTED);
+					unwrap(await settings.mutate(SETTINGS_NS, [
+						{ op: "set", path: ["readOnly"], value: readOnly === true },
 					], Number.isInteger(expectedRevision) ? expectedRevision : (Number.isInteger(describedRevision) ? describedRevision : void 0)), "settings.mutate");
 				},
 				// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
