@@ -3728,4 +3728,7 @@ test('every grafana tool presents a native generic call card from args alone', (
   assert.equal(toolByName(tools, 'grafana_metric').presentCall?.({}), undefined)
   // 显著参数进卡片标题。
   assert.match(toolByName(tools, 'grafana_metric').presentCall(VALID_ARGS.grafana_metric).title, /up\{job="api"\}/)
+  // grafana_compare 的显著参数是 query（不是 expr）：卡片标题必须带上查询文本，
+  // 不能因为参数名写错而退化成空标题。防止 presentCall 误用 args.expr 的回归。
+  assert.match(toolByName(tools, 'grafana_compare').presentCall(VALID_ARGS.grafana_compare).title, /Compare metric.*up/)
 })
