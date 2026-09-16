@@ -284,7 +284,7 @@ const TREND_FRAME = {
 test('summarizeTrendFrames renders one line per series with buckets, trend, and spark', () => {
   const lines = summarizeTrendFrames(TREND_RECORDS, { A: { frames: [TREND_FRAME] } }, { points: 24, range: 'now-3h..now' })
   assert.deepEqual(lines, [
-    'panel id=7 "RPM": query A {host="a"} buckets=4 range=now-3h..now first=1 last=4 min=1 max=4 avg=2.5 trend=rising(+133.3%) volatile spark=▁▃▆█',
+    'panel id=7 "RPM": query A {host="a"} points=4 buckets=4 range=now-3h..now first=1 last=4 min=1 max=4 avg=2.5 trend=rising(+133.3%) volatile spark=▁▃▆█',
   ])
   // points 收紧时桶数随之变化，走向按桶而非按原始点计算。
   const coarse = summarizeTrendFrames(TREND_RECORDS, { A: { frames: [TREND_FRAME] } }, { points: 2, range: 'now-3h..now' })
@@ -397,12 +397,12 @@ test('summarizeMetricResult states what was queried before listing series', () =
     summarizeMetricResult(single, { mode: 'instant', datasource: { type: 'prometheus', uid: 'prom-prod' }, expr: 'up' }),
     ['metric type=prometheus uid="prom-prod" mode=instant expr="up" series=1', 'series {job="api"} value=1'],
   )
-  // range：首行报区间，series 行带桶数、走向与火花线。
+  // range：首行报区间与实际步长，series 行带返回点数、桶数、走向与火花线。
   assert.deepEqual(
-    summarizeMetricResult(frames, { mode: 'range', datasource: { type: 'prometheus', uid: 'prom-prod' }, expr: 'up', range: 'now-1h..now', points: 24 }),
+    summarizeMetricResult(frames, { mode: 'range', datasource: { type: 'prometheus', uid: 'prom-prod' }, expr: 'up', range: 'now-1h..now', points: 24, stepMs: 150000 }),
     [
-      'metric type=prometheus uid="prom-prod" mode=range range=now-1h..now expr="up" series=1',
-      'series {host="a"} buckets=4 first=1 last=4 min=1 max=4 avg=2.5 trend=rising(+133.3%) volatile spark=▁▃▆█',
+      'metric type=prometheus uid="prom-prod" mode=range range=now-1h..now step=150000ms expr="up" series=1',
+      'series {host="a"} points=4 buckets=4 first=1 last=4 min=1 max=4 avg=2.5 trend=rising(+133.3%) volatile spark=▁▃▆█',
     ],
   )
   // 空结果：首行仍在，series=0 本身就是答案。
@@ -490,19 +490,41 @@ test('grafana_datasources lists datasources with bounded, sanitized rows', async
   }
 })
 
-test('grafana_datasources discloses how many rows it dropped past the cap', async () => {
+test('grafana_datasources pages the listing and discloses the total and how to continue', async () => {
   const originalFetch = globalThis.fetch
   const many = Array.from({ length: MAX_DATASOURCE_ROWS + 5 }, (_, i) => ({ uid: `ds${i}`, type: 'prometheus', name: `DS ${i}`, access: 'proxy' }))
   globalThis.fetch = async () => jsonResponse(many)
   try {
     const { tools } = createContext()
-    const out = await toolByName(tools, 'grafana_datasources').execute({}, execution())
+    const tool = toolByName(tools, 'grafana_datasources')
+    const out = await tool.execute({}, execution())
     const lines = out.split('\n')
     assert.equal(lines.length, MAX_DATASOURCE_ROWS + 1)
-    assert.equal(lines[MAX_DATASOURCE_ROWS], 'budget: 40 of 45 datasource(s) shown; 5 hidden (raise limit to include them)')
+    // 分页披露：页码、区间、总数与续页参数（D2）。
+    assert.equal(lines[MAX_DATASOURCE_ROWS], 'page 1 of 2: datasource(s) 1-40 of 45 shown; 5 remaining (pass page=2 to continue)')
+
+    // 第二页：末页只报页码与总数。
+    const pageTwo = await tool.execute({ page: 2 }, execution())
+    const pageTwoLines = pageTwo.split('\n')
+    assert.equal(pageTwoLines.length, 6)
+    assert.equal(pageTwoLines[0], 'uid="ds40" type=prometheus name="DS 40" default=no access=proxy url="(empty)"')
+    assert.equal(pageTwoLines[5], 'page 2 of 2: datasource(s) 41-45 of 45 shown')
+
+    // 页码越过末页：如实报总页数，不假装没有数据。
+    const past = await tool.execute({ page: 3 }, execution())
+    assert.equal(past, 'page 3 of 2: no datasource(s) on this page; 45 in total (last page is 2)')
+
+    // limit 缩小页大小：页数随之变化。
+    const small = await tool.execute({ limit: 10 }, execution())
+    assert.match(small, /page 1 of 5: datasource\(s\) 1-10 of 45 shown; 35 remaining \(pass page=2 to continue\)/)
+
     // 过滤后不超上限时披露行消失。
-    const filtered = await toolByName(tools, 'grafana_datasources').execute({ nameContains: 'DS 1' }, execution())
-    assert.doesNotMatch(filtered, /^budget: /m)
+    const filtered = await tool.execute({ nameContains: 'DS 1' }, execution())
+    assert.doesNotMatch(filtered, /^page \d+ of /m)
+
+    // 非法分页参数走有界整数校验。
+    await assert.rejects(tool.execute({ page: 0 }, execution()), /page must be an integer between 1 and 10000/)
+    await assert.rejects(tool.execute({ limit: MAX_DATASOURCE_ROWS + 1 }, execution()), new RegExp(`limit must be an integer between 1 and ${MAX_DATASOURCE_ROWS}`))
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -573,7 +595,9 @@ function stubMetricFetch(bodies, frames, datasources = METRIC_DS) {
 test('grafana_metric resolves a datasource name to its uid and shapes each request body', async () => {
   const originalFetch = globalThis.fetch
   const bodies = []
-  stubMetricFetch(bodies, [TREND_FRAME])
+  // 60 点递增序列铺满 2h 窗口：range 断言需要一条覆盖度满格的序列
+  // （时间分桶后稀疏序列会判成覆盖不足，见 liveFrame 注释）。
+  stubMetricFetch(bodies, [liveFrame(Array.from({ length: 60 }, (_, i) => i + 1), { host: 'a' }, 7_200_000)])
   try {
     const { tools, listeners } = createContext()
     const tool = toolByName(tools, 'grafana_metric')
@@ -605,9 +629,9 @@ test('grafana_metric resolves a datasource name to its uid and shapes each reque
     assert.equal(r.intervalMs, Math.ceil(7_200_000 / 60))
     // from/to 与 intervalMs 出自同一次换算，故发解析后的毫秒值（两端必须对得上）。
     assert.equal(Number(bodies[1].to) - Number(bodies[1].from), 7_200_000)
-    assert.equal(ranged.split('\n')[0], 'metric type=prometheus uid="prom-prod" mode=range range=now-2h..now expr="rate(up[5m])" series=1')
-    // 帧里只有 4 个点，不足 60 桶 → 原样渲染 4 桶，不补空桶。
-    assert.match(ranged, /buckets=4 /)
+    assert.equal(ranged.split('\n')[0], 'metric type=prometheus uid="prom-prod" mode=range range=now-2h..now step=120000ms expr="rate(up[5m])" series=1')
+    // 60 点铺满 60 桶：返回点数与桶数都披露，走向按时间分桶计算。
+    assert.match(ranged, /points=60 buckets=60 /)
     assert.match(ranged, /trend=rising\(/)
     assert.match(ranged, /spark=/)
 
@@ -795,6 +819,20 @@ const FALLING_FRAME = {
   data: { values: [[1000, 2000], [4, 2]] },
 }
 
+// 工具级用例的序列帧：时间分桶（R3）按真实窗口归桶，时间戳必须落在请求的
+// 窗口内——1970 的静态时间会被全部钳进第一桶并判成覆盖不足（这正是 R3 要的
+// 行为，静态 fixture 只是不再能冒充真实序列）。时间点取每桶中点：与工具端
+// 自行解析的 fromMs 之间存在毫秒级时钟差，中点保证每桶恰好落一个样本。
+function liveFrame(values, labels, spanMs = 3_600_000) {
+  const now = Date.now()
+  const step = spanMs / values.length
+  const times = values.map((_, i) => now - spanMs + Math.floor((i + 0.5) * step))
+  return {
+    schema: { fields: [{ name: 'time', type: 'time' }, { name: 'Value', type: 'number', ...(labels ? { labels } : {}) }] },
+    data: { values: [times, values] },
+  }
+}
+
 // 趋势工具不需要数据源索引（大盘里每个 target 的数据源引用都是完整的 {type,uid}），
 // 故只有两个路由：取盘与查询。
 function stubTrendFetch(bodies, results, dashboard = TREND_DASHBOARD) {
@@ -808,7 +846,13 @@ function stubTrendFetch(bodies, results, dashboard = TREND_DASHBOARD) {
 test('grafana_trend stamps the sampling keys on every query but server-side expressions', async () => {
   const originalFetch = globalThis.fetch
   const bodies = []
-  stubTrendFetch(bodies, { A: { frames: [TREND_FRAME] }, p2xA: { frames: [FLAT_FRAME] }, B: { frames: [FALLING_FRAME] } })
+  // 24 点铺满 1h 窗口（24 桶，每桶一个样本）：走向断言需要满覆盖的序列。
+  const rising24 = Array.from({ length: 24 }, (_, i) => i + 1)
+  stubTrendFetch(bodies, {
+    A: { frames: [liveFrame(rising24, { host: 'a' })] },
+    p2xA: { frames: [liveFrame(Array(24).fill(10))] },
+    B: { frames: [liveFrame(rising24.slice().reverse())] },
+  })
   try {
     const { tools, listeners } = createContext()
     const out = await toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, execution())
@@ -840,11 +884,11 @@ test('grafana_trend stamps the sampling keys on every query but server-side expr
     assert.match(bodies[0].from, /^\d{13}$/)
 
     const lines = out.split('\n')
-    assert.equal(lines[0], 'Trend uid=abc123, range now-1h..now, 2 panel(s), 3 queries, 24 bucket(s) each.')
-    assert.equal(lines[1], 'panel id=1 "CPU": query A {host="a"} buckets=4 range=now-1h..now first=1 last=4 min=1 max=4 avg=2.5 trend=rising(+133.3%) volatile spark=▁▃▆█')
+    assert.equal(lines[0], 'Trend uid=abc123, range now-1h..now, step=150000ms, 2 panel(s), 3 queries, 24 bucket(s) each.')
+    assert.equal(lines[1], 'panel id=1 "CPU": query A {host="a"} points=24 buckets=24 range=now-1h..now first=1 last=24 min=1 max=24 avg=12.5 trend=rising(+184.6%) volatile spark=▁▁▂▂▂▃▃▃▃▄▄▄▅▅▅▆▆▆▆▇▇▇██')
     // 全等值序列：走向 flat，火花线落中档（不除零也不假装走高）。
-    assert.equal(lines[2], 'panel id=2 "Ratio": query A "(unnamed series)" buckets=2 range=now-1h..now first=10 last=10 min=10 max=10 avg=10 trend=flat spark=▅▅')
-    assert.equal(lines[3], 'panel id=2 "Ratio": query B "(unnamed series)" buckets=2 range=now-1h..now first=4 last=2 min=2 max=4 avg=3 trend=falling(-50.0%) spark=█▁')
+    assert.equal(lines[2], 'panel id=2 "Ratio": query A "(unnamed series)" points=24 buckets=24 range=now-1h..now first=10 last=10 min=10 max=10 avg=10 trend=flat spark=▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅')
+    assert.equal(lines[3], 'panel id=2 "Ratio": query B "(unnamed series)" points=24 buckets=24 range=now-1h..now first=24 last=1 min=1 max=24 avg=12.5 trend=falling(-64.9%) volatile spark=██▇▇▇▆▆▆▆▅▅▅▄▄▄▃▃▃▃▂▂▂▁▁')
     assert.equal(lines.length, 4)
     assert.doesNotMatch(out, /^budget: /m)
 
@@ -975,14 +1019,14 @@ test('grafana_trend falls back to per-panel queries when the batch fails', async
       batchFailed = true
       return jsonResponse({ message: 'upstream exploded' }, 500)
     }
-    return jsonResponse({ results: Object.fromEntries(body.queries.map((query) => [query.refId, { frames: [FLAT_FRAME] }])) })
+    return jsonResponse({ results: Object.fromEntries(body.queries.map((query) => [query.refId, { frames: [liveFrame(Array(24).fill(10))] }])) })
   }
   try {
     const { tools } = createContext()
     const out = await toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, execution())
     assert.match(out, /Batch query failed \(Grafana API 500 POST \/api\/ds\/query: upstream exploded\); fell back to per-panel queries\./)
     // 降级后两个面板的结果都在，走向渲染照常。
-    assert.match(out, /panel id=1 "CPU": query A .*trend=flat spark=▅▅/)
+    assert.match(out, /panel id=1 "CPU": query A .*trend=flat spark=▅+/)
     assert.match(out, /panel id=2 "Ratio": query A /)
     assert.match(out, /panel id=2 "Ratio": query B /)
   } finally {
@@ -1606,4 +1650,201 @@ test('log frames pick the body column by name when the field order changes', () 
   assert.match(line, /last="msg two"/)
   assert.doesNotMatch(line, /last="error"/)
   assert.doesNotMatch(line, /1788912001000/)
+})
+
+// ── R1：宽表的第二个及后续数值指标不得被静默丢弃 ─────────────────────────────
+const WIDE_FRAME = {
+  schema: { fields: [
+    { name: 'Time', type: 'time' },
+    { name: 'cpu', type: 'number', labels: { host: 'a' } },
+    { name: 'errors', type: 'number', labels: { host: 'a' } },
+  ] },
+  data: { values: [[1000, 2000, 3000, 4000], [1, 2, 3, 4], [10, 20, 30, 999]] },
+}
+const WIDE_RECORD = { panel: { id: 7, title: 'Wide' }, refId: 'A', originalRefId: 'A' }
+
+test('wide frames summarize every numeric column instead of silently dropping the rest', () => {
+  // grafana_metric 路径：cpu 与 errors 各一行，errors=999 必须在场。
+  const metricLines = summarizeMetricResult([WIDE_FRAME], { mode: 'instant', datasource: { type: 'prometheus', uid: 'prom-prod' }, expr: 'up' })
+  assert.equal(metricLines.length, 3)
+  assert.match(metricLines[1], /cpu/)
+  assert.match(metricLines[2], /errors/)
+  assert.match(metricLines[2], /last=999/)
+
+  // grafana_panel_query 路径（summarizeFrames）：同一宽帧逐列出行。
+  const panelJoined = summarizeFrames([WIDE_RECORD], { A: { frames: [WIDE_FRAME] } }).join('\n')
+  assert.match(panelJoined, /cpu/)
+  assert.match(panelJoined, /errors/)
+  assert.match(panelJoined, /999/)
+
+  // grafana_trend 路径：两个数值列各出一条走向线。
+  const trendLines = summarizeTrendFrames([WIDE_RECORD], { A: { frames: [WIDE_FRAME] } }, { points: 24, range: 'now-1h..now' })
+  assert.equal(trendLines.length, 2)
+  assert.match(trendLines[0], /cpu .*trend=/)
+  assert.match(trendLines[1], /errors .*trend=/)
+})
+
+// ── R3：按时间区间分桶，缺测间隔保留为空位，覆盖不足不出确定结论 ─────────────
+test('bucketizeSeries buckets by time interval and keeps measurement gaps as nulls', () => {
+  // 6 个样本只落在第 1、3、4 个时段：中间的空桶保留为 null，不被相邻样本填平。
+  const buckets = bucketizeSeries(
+    [25, 25, 20, 20, 20, 20],
+    4,
+    [0, 100, 600, 700, 800, 900],
+    0,
+    1000,
+  )
+  assert.deepEqual(buckets, [25, null, 20, 20])
+  // 前后半均值 25 → 20：必须报 falling，绝不能因稀疏样本被挤桶而报出相反的 rising。
+  const verdict = classifyTrend(buckets, undefined)
+  assert.match(verdict, /^falling/)
+  assert.doesNotMatch(verdict, /rising/)
+
+  // 没有可信时间轴时退回按样本数量分桶的既有行为。
+  assert.deepEqual(bucketizeSeries([1, 2, 3, 4], 2), [1.5, 3.5])
+
+  // 样本比桶还少（最稀疏的情形）也走时间分桶：不被「点数不足桶数」短路，
+  // 空位保留下来，覆盖度检查才有机会拦住确定结论。
+  const sparse = bucketizeSeries([25, 20], 24, [450_000, 2_700_000], 0, 3_600_000)
+  assert.equal(sparse.length, 24)
+  assert.deepEqual(sparse.filter((v) => v !== null), [25, 20])
+  assert.equal(classifyTrend(sparse, undefined), 'n/a (insufficient coverage)')
+})
+
+test('classifyTrend reports insufficient coverage instead of a fabricated direction', () => {
+  // 只有前半段有数据：后半段无从比较。
+  assert.equal(classifyTrend([25, 25, null, null], undefined), 'n/a (insufficient coverage)')
+  // 前后半都有数据但覆盖率不足一半：同样不下确定结论。
+  assert.equal(classifyTrend([25, null, null, null, null, 20], undefined), 'n/a (insufficient coverage)')
+  // 覆盖达标（恰好一半）且后半段有数据：照常给出方向。
+  assert.match(classifyTrend([25, null, 20, null], undefined), /^falling/)
+})
+
+// ── R4：instant 只取 to 作为求值时刻，不被默认 from=now-1h 提前拒绝 ─────────
+test('grafana_metric instant evaluates at to even a day back; range still rejects reversed windows', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  stubMetricFetch(bodies, [TREND_FRAME])
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_metric')
+
+    // instant 查昨天同一时刻：默认 from=now-1h 构成的反向区间不得提前拒绝。
+    const out = await tool.execute({ datasource: 'prom-prod', expr: 'up', mode: 'instant', to: 'now-24h' }, execution())
+    assert.match(out, /mode=instant/)
+    // 请求体两端同值，求值时刻确实落在约 24 小时前。
+    assert.equal(bodies[0].from, bodies[0].to)
+    assert.ok(Math.abs(Date.now() - 86_400_000 - Number(bodies[0].to)) < 60_000)
+
+    // range 模式的非法起止区间仍被拒绝，且不发请求。
+    await assert.rejects(
+      tool.execute({ datasource: 'prom-prod', expr: 'up', mode: 'range', from: 'now', to: 'now-24h' }, execution()),
+      /must not be later than/,
+    )
+    assert.equal(bodies.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ── R5：Loki 趋势查询必须显式用 queryType=range，不保留 target 上的 instant ──
+test('grafana_trend sends Loki targets as queryType range, never a conflicting instant', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  const lokiDashboard = {
+    id: 7, uid: 'abc123', title: 'Logs', version: 1,
+    panels: [{
+      id: 1, type: 'timeseries', title: 'Error rate',
+      datasource: { type: 'loki', uid: 'loki-1' },
+      // 大盘里按即时查询保存的 target：趋势必须改判成 range，不能两种语义并发。
+      targets: [{ refId: 'A', expr: 'sum(rate({app="web"}[5m]))', queryType: 'instant' }],
+    }],
+  }
+  stubTrendFetch(bodies, { A: { frames: [TREND_FRAME] } }, lokiDashboard)
+  try {
+    const { tools } = createContext()
+    await toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, execution())
+    const query = bodies[0].queries[0]
+    assert.equal(query.queryType, 'range')
+    assert.equal(query.maxLines, LOKI_MAX_LINES)
+    assert.notEqual(query.instant, true)
+    assert.equal(query.intervalMs, Math.ceil(3_600_000 / TREND_DEFAULT_BUCKETS))
+    assert.equal(query.maxDataPoints, TREND_DEFAULT_BUCKETS)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ── R7：浏览器 URL 的 var-* 临时变量按「显式 > URL > 大盘保存值」生效 ─────────
+test('grafana_trend restores var-* overrides from the browser URL, below explicit variables', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  // env 是 custom 变量（可覆盖类型），保存值 prod。
+  const envDashboard = {
+    id: 7, uid: 'abc123', title: 'Overview', version: 1,
+    templating: { list: [{ name: 'env', type: 'custom', current: { value: 'prod' } }] },
+    panels: [{ id: 1, type: 'timeseries', title: 'CPU', datasource: { type: 'prometheus', uid: 'prom' }, targets: [{ refId: 'A', expr: 'rate(cpu_total{env="$env"}[$__rate_interval])' }] }],
+  }
+  stubTrendFetch(bodies, { A: { frames: [FLAT_FRAME] } }, envDashboard)
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_trend')
+
+    // 大盘保存值：env=prod（无 URL 变量、无显式覆盖）。
+    await tool.execute({ urlOrUid: 'abc123' }, execution())
+    assert.equal(bodies.at(-1).queries[0].expr, 'rate(cpu_total{env="prod"}[$__rate_interval])')
+
+    // 复制带临时变量的浏览器链接：URL 的 var-env 覆盖保存值。
+    await tool.execute({ urlOrUid: 'https://grafana.example.com/d/abc123/overview?var-env=staging' }, execution())
+    assert.equal(bodies.at(-1).queries[0].expr, 'rate(cpu_total{env="staging"}[$__rate_interval])')
+
+    // 显式 variables 参数优先于 URL。
+    await tool.execute(
+      { urlOrUid: 'https://grafana.example.com/d/abc123/overview?var-env=staging', variables: JSON.stringify({ env: 'dev' }) },
+      execution(),
+    )
+    assert.equal(bodies.at(-1).queries[0].expr, 'rate(cpu_total{env="dev"}[$__rate_interval])')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// R3 工具级闭环：一小时的窗只有两个样本时，趋势必须明说覆盖不足，不给确定走向。
+test('grafana_trend reports insufficient coverage for a sparse series instead of a verdict', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  // 两个样本落在窗口的前 1/4 与后 1/4：24 桶里只有 2 桶有数。
+  stubTrendFetch(bodies, { A: { frames: [liveFrame([25, 20])] }, p2xA: { frames: [liveFrame([25, 20])] }, B: { frames: [liveFrame([25, 20])] } })
+  try {
+    const { tools } = createContext()
+    const out = await toolByName(tools, 'grafana_trend').execute({ urlOrUid: 'abc123' }, execution())
+    assert.match(out, /trend=n\/a \(insufficient coverage\)/)
+    assert.doesNotMatch(out, /trend=(rising|falling|flat)/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// R1 预算闭环：多数值列的宽表帧每列都是一条 series，点数预算与丢弃计数都按 series 计。
+test('summarizeTrendFrames charges wide frames per numeric series against the point budget', () => {
+  const wide = (n) => ({
+    schema: { fields: [
+      { name: 'time', type: 'time' },
+      { name: 'cpu', type: 'number' },
+      { name: 'errors', type: 'number' },
+    ] },
+    data: { values: [Array.from({ length: n }, (_, i) => i * 1000), Array(n).fill(1), Array(n).fill(2)] },
+  })
+  const size = 4000
+  const budget = createBudget()
+  const lines = summarizeTrendFrames(
+    [{ panel: { id: 1, title: 'A' }, refId: 'A', originalRefId: 'A' }, { panel: { id: 2, title: 'B' }, refId: 'B', originalRefId: 'B' }],
+    { A: { frames: [wide(size)] }, B: { frames: [wide(size)] } },
+    { points: 24, budget, range: 'now-1h..now' },
+  )
+  // 每条宽帧 4000 点 × 2 列 = 8000：第二条帧整体超预算被丢弃；丢弃按 series 计（2 条），不按帧计。
+  assert.equal(lines.length, 2)
+  assert.match(lines[0], /cpu /)
+  assert.match(lines[1], /errors /)
+  assert.equal(budget.note(), 'budget: 2 of 4 series shown; 2 hidden (raise limit to include them)')
 })

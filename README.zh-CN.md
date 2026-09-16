@@ -90,6 +90,14 @@ HTTP 与 HTTPS 开箱即用，内网未配置证书的环境可直接填写 `htt
 allowInsecureHttp: false
 ```
 
+只读模式面向监控排障等不应修改大盘的角色：
+
+```yaml
+readOnly: true
+```
+
+启用后 `grafana_push` 与 `grafana_clone` 完全不注册——模型没有可调用的写入工具——设置卡片会在源站标题旁显示当前模式（只读或读写）。
+
 settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL` 凭证中的 URL 会在启动时自动迁移到 settings，之后凭证值仅作兜底。Token 凭证名默认为 `GRAFANA_TOKEN`，可通过 `tokenRef` 修改。
 
 ### 多个 Grafana 源站
@@ -130,7 +138,7 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_datasources` | `datasources:read` |
 | `grafana_metric` | `datasources:read` + `datasources:query` |
 | `grafana_trend` | `dashboards:read` + `datasources:query` |
-| `grafana_alerts` | `alert.instances:read`；`definitions: true` 另需 `alert.provisioning:read` |
+| `grafana_alerts` | `alert.instances:read`；`definitions: true` 另需 `alert.provisioning:read`；`ruleStates: true` 另需规则读取权限（被拒时就地报出缺失的 scope） |
 | `grafana_search` | `dashboards:read` |
 | `grafana_status` | `dashboards:read`（见下注） |
 | `grafana_sources` | 无（只读本机插件配置） |
@@ -172,10 +180,10 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_push` | 在审批、身份校验、版本校验和目录保持后写回最近读取的大盘。 |
 | `grafana_clone` | 把大盘复制为全新大盘（全新 UID、版本 1），默认留在源文件夹，并返回新大盘完整地址。同样需要审批，继续写入前必须先调用 `grafana_get`。 |
 | `grafana_panel_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_panel_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
-| `grafana_datasources` | 列出源站上已配置的数据源（uid、插件类型、显示名、是否默认、访问模式、以及配置的 URL——`url="(empty)"` 的行通常意味着该数据源配置有误、一查即失败，请换用其它 uid）。可按精确插件类型或大小写不敏感的名称子串过滤；最多返回 40 行，丢弃的行在末尾预算行中披露。调用 `grafana_metric` 前先用它确认要查询的 uid 或名称。只读。 |
-| `grafana_metric` | 无需大盘，直接对 Prometheus 或 Loki 数据源执行一条裸文本查询（PromQL 如 `up` 或 `rate(http_requests_total[5m])`，或 LogQL 流选择器），数据源按 uid 或精确显示名寻址。`mode: "instant"`（默认）在区间末端求值一次；`mode: "range"` 对序列采样并给出每条序列的统计、上升/下降/持平判定与火花线（对 Loki 的 range 查询返回的是日志行而非数值采样点，故这类序列只报行数与末行；Loki 的 instant 模式只接受 metric 查询，日志流选择器需用 range）。其它插件类型与服务端表达式会被拒绝并指向 `grafana_panel_query`。只读，不记录写快照。 |
-| `grafana_trend` | 一次调用回答大盘的「在涨还是在跌」：把每个可见查询目标以较粗的区间查询重跑，每条序列给出桶数、首/末/最小/最大/均值、方向判定与火花线。表格型结果报告行数与统计并标 `trend=n/a`，不伪造方向。与 `grafana_panel_query` 共用同一套面板管线（变量、adhoc 过滤、旧格式数据源引用、逐面板降级）。时间范围最长 90 天。只读，不记录写快照。 |
-| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。上游的 `active` 状态（Alertmanager v2 的活动告警状态）统一报为 `state=firing`，正常告警不会被当成未知状态漏掉。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。活跃告警按 `limit` 参数封顶（默认 30、上限 100），规则定义段封顶 100 行；丢弃的部分在末尾预算行披露。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。只读；告警文本是不可信数据。 |
+| `grafana_datasources` | 列出源站上已配置的数据源（uid、插件类型、显示名、是否默认、访问模式、以及配置的 URL——`url="(empty)"` 的行通常意味着该数据源配置有误、一查即失败，请换用其它 uid）。可按精确插件类型或大小写不敏感的名称子串过滤。结果分页返回（默认每页 40 行；`limit` 调整页大小，`page` 翻页），末尾一行披露当前页、总数与如何继续。调用 `grafana_metric` 前先用它确认要查询的 uid 或名称。只读。 |
+| `grafana_metric` | 无需大盘，直接对 Prometheus 或 Loki 数据源执行一条裸文本查询（PromQL 如 `up` 或 `rate(http_requests_total[5m])`，或 LogQL 流选择器），数据源按 uid 或精确显示名寻址。`mode: "instant"`（默认）在区间末端求值一次；`mode: "range"` 对序列采样并给出每条序列的统计、上升/下降/持平判定与火花线——首行披露实际采样步长（`step=`），每条序列披露实际返回点数（`points=`），回答的精度与覆盖范围可见（对 Loki 的 range 查询返回的是日志行而非数值采样点，故这类序列只报行数与末行；Loki 的 instant 模式只接受 metric 查询，日志流选择器需用 range）。其它插件类型与服务端表达式会被拒绝并指向 `grafana_panel_query`。只读，不记录写快照。 |
+| `grafana_trend` | 一次调用回答大盘的「在涨还是在跌」：把每个可见查询目标以较粗的区间查询重跑，每条序列给出实际返回点数、桶数、首/末/最小/最大/均值、方向判定与火花线；首行披露实际采样步长。表格型结果报告行数与统计并标 `trend=n/a`，不伪造方向。与 `grafana_panel_query` 共用同一套面板管线（变量、adhoc 过滤、旧格式数据源引用、逐面板降级）。时间范围最长 90 天。只读，不记录写快照。 |
+| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。上游的 `active` 状态（Alertmanager v2 的活动告警状态）统一报为 `state=firing`，正常告警不会被当成未知状态漏掉。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。活跃告警按 `limit` 参数封顶（默认 30、上限 100），丢弃的部分在末尾预算行披露。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。`ruleStates: true` 再追加每条规则的评估状态（`rule-state` 行：`inactive`、`pending`、`firing`、`recording`、`unknown`，来自 Prometheus 兼容规则接口）——`pending` 表示条件已满足但 `for` 时长未满，这是 Alertmanager 视角回答不了的；该段可用 `ruleState` 过滤。两个规则段共用 `rulesPage` 分页（每页 100 条），并披露总数与下一页参数。只读；告警文本是不可信数据。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_status` | 检查 Grafana 连通性与 Service Account 凭证。 |
 | `grafana_sources` | 列出已配置的 Grafana 源站：每个源站的名称、只读 UID、URL、令牌是否已配，以及哪一台是默认源站。只读，绝不返回令牌值。在向其它工具传 `source` 之前，可用它发现合法的源站名称。 |
@@ -275,7 +283,7 @@ datasource 引用了该变量的面板（`{"type":"prometheus","uid":"$datasourc
 
 - Token 不会进入工具参数、模型消息、日志或 Git。
 - 带凭证的请求拒绝 HTTP 重定向，避免凭证被转发到其他来源。
-- 默认禁止非本机明文 HTTP。
+- 非本机明文 HTTP 默认允许（可通过配置关闭）。
 - 请求支持取消、超时、响应大小限制和 Dashboard 输入大小限制。
 - API 错误只暴露有限的状态和消息。
 - Grafana 返回内容始终作为不可信数据处理，而不是模型指令。

@@ -5,10 +5,13 @@ import { apply } from '../index.js'
 import {
   alertDashboardUid,
   alertState,
+  collectRuleStates,
   filterAlertRules,
   filterAlerts,
+  filterRuleStates,
   formatAlertRows,
   formatAlertRuleRows,
+  formatRuleStateRows,
   ruleQueryText,
 } from '../lib/alerts.js'
 import { ALERT_ROWS_LIMIT, ALERT_STATES, MAX_ALERT_ROWS, MAX_ALERT_RULE_ROWS } from '../lib/constants.js'
@@ -99,6 +102,7 @@ async function assertNoWriteSnapshot(listeners) {
 
 const AM_PATH = '/api/alertmanager/grafana/api/v2/alerts'
 const RULES_PATH = '/api/v1/provisioning/alert-rules'
+const RULE_STATES_PATH = '/api/prometheus/grafana/api/v1/rules'
 
 // 状态枚举以 Alertmanager v2 契约为准（Grafana 的 GettableAlerts 直接复用它）：
 // active / suppressed / unprocessed，没有 firing。fixture 必须用真实形状，否则
@@ -259,14 +263,34 @@ test('filterAlertRules and formatAlertRuleRows render the provisioning shape', (
 // ── grafana_alerts ─────────────────────────────────────────────────────────
 
 // 两个路由：活跃态必发，规则定义只在 definitions=true 时才发第二个请求。
-function stubAlertFetch(calls, { alerts = ALERTS, rules = RULES, alertsStatus = 200, rulesStatus = 200 } = {}) {
+function stubAlertFetch(calls, { alerts = ALERTS, rules = RULES, alertsStatus = 200, rulesStatus = 200, ruleStates = RULE_STATES_PAYLOAD, ruleStatesStatus = 200 } = {}) {
   globalThis.fetch = async (url) => {
     const path = String(url).replace('https://grafana.example.com', '').split('?')[0]
     calls.push({ url: String(url), path })
     if (path === AM_PATH) return jsonResponse(alertsStatus === 200 ? alerts : { message: 'refused' }, alertsStatus)
     if (path === RULES_PATH) return jsonResponse(rulesStatus === 200 ? rules : { message: 'refused' }, rulesStatus)
+    if (path === RULE_STATES_PATH) return jsonResponse(ruleStatesStatus === 200 ? ruleStates : { message: 'refused' }, ruleStatesStatus)
     return jsonResponse({ message: 'unexpected route' }, 404)
   }
+}
+
+// Prometheus 兼容规则接口的形状假设：groups[].file 承载文件夹名，rules[] 里
+// alerting 规则带 state，recording 规则没有 state。未知状态枚举归 unknown。
+const RULE_STATES_PAYLOAD = {
+  status: 'success',
+  data: {
+    groups: [
+      { name: 'group-1', file: 'prod', rules: [
+        { name: 'HighRPM', state: 'firing', type: 'alerting', alerts: [{}, {}], labels: { severity: 'warning' }, annotations: { summary: 'RPM above 900', __dashboardUid__: 'fixture-dash-0001' } },
+        { name: 'DiskFull', state: 'pending', type: 'alerting', alerts: [], labels: { severity: 'critical' }, annotations: {} },
+      ] },
+      { name: 'group-2', file: 'infra', rules: [
+        { name: 'NodeDown', state: 'inactive', type: 'alerting', alerts: [] },
+        { name: 'RawEvents', type: 'recording' },
+        { name: 'Mystery', state: 'half-baked', type: 'alerting', alerts: [] },
+      ] },
+    ],
+  },
 }
 
 test('grafana_alerts asks for silenced and inhibited alerts so it can tell them apart', async () => {
@@ -399,17 +423,27 @@ test('grafana_alerts caps both sections and discloses each cap separately', asyn
 
     const out = await tool.execute({ definitions: true }, execution())
     const lines = out.split('\n')
-    // 30 条告警 + 100 条规则 + 一行合并披露（两个维度用 — 连接）。
-    assert.equal(lines.length, MAX_ALERT_ROWS + MAX_ALERT_RULE_ROWS + 1)
+    // 30 条告警 + 100 条规则 + 规则段分页行 + 告警段预算行。
+    assert.equal(lines.length, MAX_ALERT_ROWS + MAX_ALERT_RULE_ROWS + 2)
+    // 规则段按页披露：页码、区间、总数与翻页参数都在（D2）。
+    assert.equal(
+      lines[lines.length - 2],
+      'page 1 of 2: rule(s) 1-100 of 103 shown; 3 remaining (pass rulesPage=2 to continue)',
+    )
     assert.equal(
       lines[lines.length - 1],
-      'budget: 30 of 35 alert(s) shown; 5 hidden — 100 of 103 rule(s) shown; 3 hidden (raise limit to include them)',
+      'budget: 30 of 35 alert(s) shown; 5 hidden (raise limit to include them)',
     )
 
-    // limit 括高后告警段全量输出，规则段仍受自己的上限约束。
+    // 翻到第二页：末页只报页码与总数，不带续页指引。
+    const pageTwo = await tool.execute({ definitions: true, rulesPage: 2 }, execution())
+    assert.match(pageTwo, /page 2 of 2: rule\(s\) 101-103 of 103 shown/)
+    assert.doesNotMatch(pageTwo, /to continue/)
+
+    // limit 括高后告警段全量输出，规则段仍按页披露。
     const wider = await tool.execute({ definitions: true, limit: MAX_ALERT_ROWS + 5 }, execution())
     assert.equal(wider.split('\n').length, MAX_ALERT_ROWS + 5 + MAX_ALERT_RULE_ROWS + 1)
-    assert.match(wider, /budget: 100 of 103 rule\(s\) shown; 3 hidden \(raise limit to include them\)$/)
+    assert.match(wider, /page 1 of 2: rule\(s\) 1-100 of 103 shown; 3 remaining \(pass rulesPage=2 to continue\)$/)
     assert.doesNotMatch(wider, /alert\(s\) shown/)
 
     // 没有截断就不出披露行（上面 wider 只截了规则段，告警段已全量）。
@@ -472,6 +506,116 @@ test('grafana_alerts honors the source argument and records no write snapshot', 
     assert.ok(calls[1].startsWith(`https://prod.example.com${AM_PATH}`), calls[1])
     await assert.rejects(tool.execute({ source: 'nope' }, execution()), /Unknown Grafana source "nope"/)
     await assertNoWriteSnapshot(listeners)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ── R2：规则与大盘的关联只认结构化字段，不认查询文本里偶然出现的 uid ─────────
+test('filterAlertRules matches the standard __dashboardUid__ field and never the query text', () => {
+  const rules = [
+    // Grafana 标准关联字段：annotations.__dashboardUid__。
+    {
+      uid: 'rule-std', title: 'Std', folderUID: 'f', condition: 'C',
+      annotations: { __dashboardUid__: 'dash-std-0001' },
+      data: [{ refId: 'A', model: { expr: 'up' } }],
+    },
+    // 旧名 annotations.dashboardUid 同样认。
+    {
+      uid: 'rule-legacy', title: 'Legacy', folderUID: 'f', condition: 'C',
+      annotations: { dashboardUid: 'dash-std-0001' },
+      data: [{ refId: 'A', model: { expr: 'up' } }],
+    },
+    // data[].model 里的 __dashboardUid__ 也认（Grafana 生成查询时的另一落点）。
+    {
+      uid: 'rule-model', title: 'Model', folderUID: 'f', condition: 'C',
+      data: [{ refId: 'A', model: { expr: 'up', __dashboardUid__: 'dash-std-0001' } }],
+    },
+    // 查询文本里偶然出现 uid 子串（例如 label 值）不算关联：旧实现整体序列化
+    // data 后做子串匹配，会把这条规则误挂到不相关的大盘上。
+    {
+      uid: 'rule-incidental', title: 'Incidental', folderUID: 'f', condition: 'C',
+      data: [{ refId: 'A', model: { expr: 'up{dashboard="dash-std-0001"}' } }],
+    },
+  ]
+  assert.deepEqual(
+    filterAlertRules(rules, { dashboardUid: 'dash-std-0001' }).map((rule) => rule.uid),
+    ['rule-std', 'rule-legacy', 'rule-model'],
+  )
+})
+
+// ── D1：规则评估状态（pending/inactive/firing/recording/unknown） ─────────────
+test('collectRuleStates flattens groups and maps every state vocabulary', () => {
+  const rows = collectRuleStates(RULE_STATES_PAYLOAD)
+  assert.deepEqual(rows.map((row) => [row.name, row.state, row.folder, row.group, row.alerts]), [
+    ['HighRPM', 'firing', 'prod', 'group-1', 2],
+    ['DiskFull', 'pending', 'prod', 'group-1', 0],
+    ['NodeDown', 'inactive', 'infra', 'group-2', 0],
+    // recording 规则没有告警语义，标 recording 而不是丢弃或假装 inactive。
+    ['RawEvents', 'recording', 'infra', 'group-2', 0],
+    // 上游将来新增的状态枚举归 unknown，如实报出。
+    ['Mystery', 'unknown', 'infra', 'group-2', 0],
+  ])
+  // 畸形载荷降级为空列表，不抛错。
+  assert.deepEqual(collectRuleStates(null), [])
+  assert.deepEqual(collectRuleStates({ data: {} }), [])
+})
+
+test('filterRuleStates and formatRuleStateRows cover state, folder, label, and dashboard', () => {
+  const rows = collectRuleStates(RULE_STATES_PAYLOAD)
+  // 默认 all 全量；按状态过滤只留目标档。
+  assert.equal(filterRuleStates(rows).length, 5)
+  assert.deepEqual(filterRuleStates(rows, { state: 'pending' }).map((row) => row.name), ['DiskFull'])
+  // folderContains 匹配文件夹名（该接口给的是名字，与 provisioning 段的 uid 不同）。
+  assert.deepEqual(filterRuleStates(rows, { folderContains: 'INFRA' }).map((row) => row.name), ['NodeDown', 'RawEvents', 'Mystery'])
+  // labelContains 的匹配面含规则名：按名字找规则是这段的主路径。
+  assert.deepEqual(filterRuleStates(rows, { labelContains: 'diskfull' }).map((row) => row.name), ['DiskFull'])
+  assert.deepEqual(filterRuleStates(rows, { labelContains: 'severity=warning' }).map((row) => row.name), ['HighRPM'])
+  // 大盘过滤只认 annotations 里的结构化字段。
+  assert.deepEqual(filterRuleStates(rows, { dashboardUid: 'fixture-dash-0001' }).map((row) => row.name), ['HighRPM'])
+
+  assert.equal(
+    formatRuleStateRows(rows)[0],
+    'rule-state "HighRPM" state=firing folder="prod" group="group-1" alerts=2',
+  )
+})
+
+test('grafana_alerts appends rule states only when asked, and isolates its failure', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  stubAlertFetch(calls)
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_alerts')
+
+    const out = await tool.execute({ ruleStates: true }, execution())
+    assert.deepEqual(calls.map((call) => call.path), [AM_PATH, RULE_STATES_PATH])
+    // 活跃告警段在前，规则状态段在后，行前缀把两个视角区分开。
+    assert.match(out, /^alert "HighRPM" /m)
+    assert.match(out, /^rule-state "DiskFull" state=pending folder="prod" group="group-1" alerts=0$/m)
+    assert.match(out, /^rule-state "Mystery" state=unknown /m)
+
+    // 规则状态过滤：哪些规则正在等待触发（pending）是这段的主问题。
+    const pending = await tool.execute({ ruleStates: true, ruleState: 'pending' }, execution())
+    assert.match(pending, /^rule-state "DiskFull" /m)
+    assert.doesNotMatch(pending, /^rule-state "HighRPM" /m)
+    await assert.rejects(tool.execute({ ruleStates: true, ruleState: 'weird' }, execution()), /ruleState must be one of/)
+
+    // 没要规则状态就不发第三个请求（之前的调用各发一次，这里是第 3 次 execute）。
+    const statesCalls = calls.filter((call) => call.path === RULE_STATES_PATH).length
+    await tool.execute({}, execution())
+    assert.equal(calls.filter((call) => call.path === RULE_STATES_PATH).length, statesCalls)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // 状态段失败就地报一行，活跃告警段不受牵连。
+  stubAlertFetch([], { ruleStatesStatus: 500 })
+  try {
+    const { tools } = createContext()
+    const out = await toolByName(tools, 'grafana_alerts').execute({ ruleStates: true }, execution())
+    assert.match(out, /^alert "HighRPM" /m)
+    assert.match(out, /^\(rule states unavailable: Grafana API 500 GET \/api\/prometheus\/grafana\/api\/v1\/rules: refused\)$/m)
   } finally {
     globalThis.fetch = originalFetch
   }

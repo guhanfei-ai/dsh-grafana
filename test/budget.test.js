@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { budgetLine, createBudget } from '../lib/budget.js'
+import { budgetLine, createBudget, paginate } from '../lib/budget.js'
 
 test('budget produces no line at all when nothing was dropped', () => {
   const budget = createBudget()
@@ -78,4 +78,30 @@ test('budget caps the dimension name and the whole note length', () => {
   assert.ok(!/[\r\n\t]/.test(note))
   assert.ok(note.startsWith('budget: '))
   assert.ok(!note.includes('x'.repeat(41)), 'dimension name must be capped at 40 characters')
+})
+
+// ── D2：本地分页的边界语义 ───────────────────────────────────────────────────
+test('paginate slices pages and discloses position, total, and how to continue', () => {
+  const rows = Array.from({ length: 45 }, (_, i) => i)
+  // 单页放得下：无披露行。
+  assert.deepEqual(paginate([1, 2], { page: 1, limit: 40, label: 'item(s)', pageParam: 'page' }).line, null)
+  // 首页：报区间、总数、剩余与续页参数。
+  const first = paginate(rows, { page: 1, limit: 40, label: 'datasource(s)', pageParam: 'page' })
+  assert.equal(first.shown.length, 40)
+  assert.equal(first.pages, 2)
+  assert.equal(first.line, 'page 1 of 2: datasource(s) 1-40 of 45 shown; 5 remaining (pass page=2 to continue)')
+  // 末页：只报页码与总数，不带续页指引。
+  const last = paginate(rows, { page: 2, limit: 40, label: 'datasource(s)', pageParam: 'page' })
+  assert.deepEqual(last.shown, [40, 41, 42, 43, 44])
+  assert.equal(last.line, 'page 2 of 2: datasource(s) 41-45 of 45 shown')
+  // 越过末页：如实报总页数与总条数，不假装「没有数据」。
+  const past = paginate(rows, { page: 5, limit: 40, label: 'datasource(s)', pageParam: 'page' })
+  assert.deepEqual(past.shown, [])
+  assert.equal(past.line, 'page 5 of 2: no datasource(s) on this page; 45 in total (last page is 2)')
+  // 空表多页请求：pages 至少为 1。
+  assert.equal(paginate([], { page: 3, limit: 10, label: 'x', pageParam: 'page' }).line, 'page 3 of 1: no x on this page; 0 in total (last page is 1)')
+  // 披露行恒单行且有长度上限。
+  const hostile = paginate(rows, { page: 1, limit: 40, label: `a\nb${'x'.repeat(300)}`, pageParam: 'page\nforged' })
+  assert.ok(!/[\r\n\t]/.test(hostile.line))
+  assert.ok(hostile.line.length <= 240)
 })

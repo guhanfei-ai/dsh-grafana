@@ -6,8 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Read-only mode: the `readOnly` configuration option keeps `grafana_push` and `grafana_clone` out of the tool registry entirely, and the approval gate still denies them if the mode is enabled after startup. The settings card shows the current mode (read-only or read-write) next to the sources heading.
+- `grafana_alerts` gains a rule evaluation-state section (`ruleStates: true`, filtered by `ruleState`) backed by the Prometheus-compatible rules API: `rule-state` lines report `inactive`/`pending`/`firing`/`recording`/`unknown` per rule with its folder, evaluation group, and live alert count — answering "which rules are waiting to fire", which the Alertmanager instance view cannot.
+- `grafana_datasources` and the rule sections of `grafana_alerts` are paged (`page`/`limit`, and `rulesPage` respectively); a disclosure line reports the page position, the total, and the exact argument for the next page.
+- Range results disclose their precision: `grafana_metric` and `grafana_trend` report the actual sampling step (`step=`) on the header line and the returned point count per series (`points=`) alongside the bucket count.
+- Read-only tools without shared write state (`grafana_panel_query`, `grafana_datasources`, `grafana_metric`, `grafana_trend`, `grafana_alerts`, `grafana_search`, `grafana_status`, `grafana_sources`) declare themselves concurrency-safe for parallel dispatch, and every tool presents a native call card via `presentCall`.
+- Browser dashboard URLs carrying `var-*` parameters are honored as variable overrides, between explicit `variables` and the dashboard's saved values.
+
 ### Fixed
 
+- Wide frames no longer drop every numeric column past the first: each numeric field gets its own summary line with its field name, in panel query, metric, and trend outputs alike.
+- Alert-rule/dashboard matching now reads the standard `__dashboardUid__` annotation (and its legacy spelling, plus `data[].model` fields) instead of substring-matching the serialized query text, which misattributed rules whose query text happened to contain a dashboard uid.
+- Trend verdicts bucket by time interval rather than sample count, keep measurement gaps as empty buckets, and report `n/a (insufficient coverage)` instead of a fabricated direction when the data covers too little of the range.
+- `grafana_metric` in instant mode evaluates at `to` without rejecting it against the default `from=now-1h`, so querying a moment yesterday works; reversed ranges are still rejected in range mode.
+- Loki trend queries are sent with `queryType: "range"` instead of inheriting a conflicting `queryType: "instant"` from the saved panel target.
+- The HTTP security note in the READMEs matches the implementation (plain HTTP allowed by default, configurable), and the `grafana_search` truncation hint no longer points at a non-existent `limit` argument.
 - `grafana_alerts` recognises Alertmanager v2 `active` alerts as `firing`, so the default filter includes normally firing alerts while preserving silence and inhibition handling.
 - Dashboard expression queries keep references within their own panel, including batched requests and per-panel fallback. Math, reduce, resample, threshold and condition references are rewritten according to their syntax; hidden dependencies are included transitively, and queries with missing or invalid dependencies are skipped with an explanation.
 - Settings writes use the last available configuration revision to reject stale-page overwrites. Failed or malformed reads keep the card read-only until a valid reload; unsupported hosts show upgrade guidance, and failed post-save reads report a synchronization error.

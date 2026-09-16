@@ -133,7 +133,10 @@ window.__ModuleLoader__.load({
 				unconfirmedWrite: "保存结果未能确认，该凭证暂不自动清除。",
 				cleanupUnverified: "无法确认该凭证是否仍在生效，已保留未清理。请重新读取后再试。",
 				unconfirmedRead: "宿主返回的配置数据无法解析（不是合法的源站列表）。为避免覆盖已存源站或误删凭证，已暂停写入；请点击“重新读取”。",
-				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。"
+				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。",
+				modeLabel: "模式",
+				modeReadOnly: "只读（grafana_push / grafana_clone 已停用）",
+				modeReadWrite: "读写（写入需逐项审批）"
 			},
 			en: {
 				title: "Grafana assistant",
@@ -177,7 +180,10 @@ window.__ModuleLoader__.load({
 				unconfirmedWrite: "The save result could not be confirmed, so this credential is not cleared automatically.",
 				cleanupUnverified: "Whether this credential is still in use could not be confirmed, so it was left in place. Reload and try again.",
 				unconfirmedRead: "The host returned configuration data that cannot be parsed (not a valid source list). Writing is paused to avoid overwriting stored sources or deleting credentials in use; click “Reload”.",
-				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page."
+				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page.",
+				modeLabel: "Mode",
+				modeReadOnly: "Read-only (grafana_push / grafana_clone disabled)",
+				modeReadWrite: "Read-write (writes need per-call approval)"
 			}
 		};
 
@@ -413,6 +419,10 @@ window.__ModuleLoader__.load({
 			const [revision, setRevision] = react.useState(null);
 			// 展开状态是卡片本地的阅读手势，Host 与设置页都不参与（同官方 PluginCard）。
 			const [open, setOpen] = react.useState(false);
+			// 当前模式（只读/读写）：随 describe 读回的 value.readOnly 展示，
+			// 监控排障用户据此确认权限边界，不必去猜写入工具为何缺席。
+			// 刻意放在 useState 序列末尾：测试台按下标存取状态，插在中间会整体错位。
+			const [readOnly, setReadOnly] = react.useState(false);
 			const T = STRINGS[lang] ?? STRINGS.en;
 			const storedById = new Map(stored.map((s) => [s.id, s]));
 			// 任一源站卡片脏（含新增未保存）即存在待保存内容，供「保存全部源站」可用性判断。
@@ -450,6 +460,7 @@ window.__ModuleLoader__.load({
 				setSources(described.map((s) => ({ ...s, tokenDraft: "", tokenFocus: false })));
 				setStored(described);
 				setDefaultSource(r.defaultSource ?? "");
+				setReadOnly(r.readOnly === true);
 				setRevision(Number.isInteger(r.revision) ? r.revision : null);
 				setLoaded(true);
 			}
@@ -501,6 +512,7 @@ window.__ModuleLoader__.load({
 				setSources((prev) => mergeDrafts(described, prev, committed));
 				setStored(described);
 				setDefaultSource(r.defaultSource ?? "");
+				setReadOnly(r.readOnly === true);
 				setRevision(Number.isInteger(r.revision) ? r.revision : null);
 			}
 
@@ -838,7 +850,11 @@ window.__ModuleLoader__.load({
 					]
 				}),
 				open ? hs("div", { style: S.body, children: [
-					h("span", { style: S.title, children: T.sourcesHeading }),
+					hs("div", { style: S.head, children: [
+						h("span", { style: S.title, children: T.sourcesHeading }),
+						// 权限边界常驻可见：只读模式说明写入工具根本没注册。
+						h("span", { style: { ...S.badge, ...(readOnly ? {} : S.badgeOk) }, children: `${T.modeLabel}: ${readOnly ? T.modeReadOnly : T.modeReadWrite}` })
+					] }),
 					hostUnsupported ? h("p", { style: S.err, children: T.hostTooOld }) : null,
 					!hostUnsupported && sources.length === 0 ? h("p", { style: S.hint, children: T.sourcesEmpty }) : null,
 					hostUnsupported ? null : hs("div", { style: S.list, children: sources.map(renderSource) }),
@@ -917,7 +933,7 @@ window.__ModuleLoader__.load({
 				// 宿主没有 remote.settings 时返回 hostUnsupported:true，让卡片显式提示升级。
 				describe: async () => {
 					const settings = settingsApi();
-					if (!settings?.describe) return { hostUnsupported: true, sources: [], defaultSource: "", unconfirmed: true };
+					if (!settings?.describe) return { hostUnsupported: true, sources: [], defaultSource: "", readOnly: false, unconfirmed: true };
 					const described = unwrap(await settings.describe(), "settings.describe");
 					const namespaces = settingsNamespacesOf(described);
 					const grafanaNs = namespaces.find((n) => n?.ns === SETTINGS_NS);
@@ -954,6 +970,8 @@ window.__ModuleLoader__.load({
 						unconfirmed,
 						sources: sources.map((s) => ({ ...s, tokenConfigured: Boolean(creds[s.tokenRef]?.configured) })),
 						defaultSource,
+						// 只读模式是非 secret 的普通配置项，随 value 明文返回，卡片据此展示权限边界。
+						readOnly: value.readOnly === true,
 						revision
 					};
 				},

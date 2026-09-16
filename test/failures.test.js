@@ -16,7 +16,7 @@ const GRAFANA_400 = JSON.stringify({ message: 'no expression found in input' })
 
 test('ENDPOINT_SCOPES is an ordered table of [prefix, method, scope] triples', () => {
   assert.ok(Array.isArray(ENDPOINT_SCOPES))
-  assert.equal(ENDPOINT_SCOPES.length, 8)
+  assert.equal(ENDPOINT_SCOPES.length, 9)
   for (const entry of ENDPOINT_SCOPES) {
     assert.equal(entry.length, 3)
     assert.equal(typeof entry[0], 'string')
@@ -34,6 +34,7 @@ test('scopeForEndpoint names the permission every endpoint this plugin calls nee
   assert.equal(scopeForEndpoint('/api/search', 'GET'), 'dashboards:read')
   assert.equal(scopeForEndpoint('/api/alertmanager/grafana/api/v2/alerts', 'GET'), 'alert.instances:read')
   assert.equal(scopeForEndpoint('/api/v1/provisioning/alert-rules', 'GET'), 'alert.provisioning:read')
+  assert.equal(scopeForEndpoint('/api/prometheus/grafana/api/v1/rules', 'GET'), 'alert.rule:read')
   // /api/health 无需鉴权：命中表项但 scope 为 null，403 时不指名权限。
   assert.equal(scopeForEndpoint('/api/health', 'GET'), null)
 })

@@ -518,10 +518,10 @@ test('diffDashboards sanitizes injected newlines and caps the number of lines', 
 })
 
 test('parseDashboardUrl extracts uid, viewPanel, and time range from browser URLs', () => {
-  assert.deepEqual(internals.parseDashboardUrl('abc123'), { uid: 'abc123', viewPanel: null, from: '', to: '' })
+  assert.deepEqual(internals.parseDashboardUrl('abc123'), { uid: 'abc123', viewPanel: null, from: '', to: '', varOverrides: null })
   assert.deepEqual(
     internals.parseDashboardUrl('https://grafana.example.com/d/abc123/overview?orgId=1&from=now-6h&to=now'),
-    { uid: 'abc123', viewPanel: null, from: 'now-6h', to: 'now' },
+    { uid: 'abc123', viewPanel: null, from: 'now-6h', to: 'now', varOverrides: null },
   )
   const panelView = internals.parseDashboardUrl('https://grafana.example.com/d/abc123/overview?viewPanel=4&from=1693430400000&to=1693434000000')
   assert.equal(panelView.viewPanel, 4)
@@ -1106,7 +1106,7 @@ test('grafana_get summary and grafana_search disclose truncation on a budget lin
     const search = await toolByName(tools, 'grafana_search').execute({}, execution())
     const searchLines = search.split('\n')
     assert.equal(searchLines.length, 51)
-    assert.equal(searchLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (raise limit to include them)')
+    assert.equal(searchLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (narrow the query or tag to reduce the result set)')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -1155,7 +1155,7 @@ test('grafana_search pages past a full first page to disclose its real cap', asy
     assert.equal(calls.length, 2)
     const overLines = over.split('\n')
     assert.equal(overLines.length, 51)
-    assert.equal(overLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (raise limit to include them)')
+    assert.equal(overLines[50], 'budget: 50 of 53 dashboard(s) shown; 3 hidden (narrow the query or tag to reduce the result set)')
 
     // 两整页（120 条）：第二页也满页，披露为下界而非假装精确。
     calls = []
@@ -1164,7 +1164,7 @@ test('grafana_search pages past a full first page to disclose its real cap', asy
     assert.equal(calls.length, 2)
     const twoPagesLines = twoPages.split('\n')
     assert.equal(twoPagesLines.length, 51)
-    assert.equal(twoPagesLines[50], 'budget: 50 of 100+ dashboard(s) shown; 50+ hidden (raise limit to include them)')
+    assert.equal(twoPagesLines[50], 'budget: 50 of 100+ dashboard(s) shown; 50+ hidden (narrow the query or tag to reduce the result set)')
 
     // 探测失败：第一页正常返回，第二页网络错误（GET 重试一次仍失败）——
     // 主结果照常显示，披露行如实说「未能确认」，不猜「恰好一页」。
@@ -1180,7 +1180,7 @@ test('grafana_search pages past a full first page to disclose its real cap', asy
     assert.equal(calls.filter((c) => c.includes('page=2')).length, 2)
     const unverifiedLines = unverified.split('\n')
     assert.equal(unverifiedLines.length, 51)
-    assert.equal(unverifiedLines[50], 'budget: 50 of 50+ dashboard(s) shown; more may be hidden — the follow-up page could not be fetched (raise limit to include them)')
+    assert.equal(unverifiedLines[50], 'budget: 50 of 50+ dashboard(s) shown; more may be hidden — the follow-up page could not be fetched (narrow the query or tag to reduce the result set)')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -3638,4 +3638,92 @@ test('grafana_push accepts only a save response that confirms status, uid and ve
       globalThis.fetch = originalFetch
     }
   }
+})
+
+// ── R7：浏览器 URL 的 var-* 临时变量还原（多值经重复参数传递） ────────────────
+test('parseDashboardUrl restores var-* variable overrides from browser URLs', () => {
+  const parsed = internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x?var-env=staging&var-hosts=a&var-hosts=b&from=now-6h')
+  assert.deepEqual(parsed.varOverrides, { env: 'staging', hosts: ['a', 'b'] })
+  assert.equal(parsed.from, 'now-6h')
+  // 无 var-* 参数与裸 uid：varOverrides 为 null（调用方据此跳过合并）。
+  assert.equal(internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x').varOverrides, null)
+  assert.equal(internals.parseDashboardUrl('abc123').varOverrides, null)
+  // 键名恰好是 "var-"（空变量名）不产生覆盖项。
+  assert.equal(internals.parseDashboardUrl('https://grafana.example.com/d/abc123/x?var-=x').varOverrides, null)
+})
+
+// ── R6：只读模式不注册写入工具，运行期再由审批门兜底 deny ────────────────────
+test('read-only mode keeps write tools out of the registry and denies them at runtime', async () => {
+  const { tools, listeners } = createSettingsContext({ readOnly: true })
+  const names = tools.map((tool) => tool.name)
+  assert.equal(names.includes('grafana_push'), false)
+  assert.equal(names.includes('grafana_clone'), false)
+  // 只读工具照常注册。
+  for (const name of ['grafana_get', 'grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
+    assert.ok(names.includes(name), `missing read-only tool ${name}`)
+  }
+  // 运行时兜底：哪怕写入工具已注册（例如启动后才打开只读），审批门也直接 deny。
+  const decision = await listeners.get('tools/pre-execute')(
+    { name: 'grafana_push', arguments: {} },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(decision.kind, 'deny')
+  assert.match(decision.reason, /[Rr]ead-only/)
+
+  // 默认（读写）配置：写入工具注册，审批门保持 ask 语义而不是误伤。
+  const rw = createSettingsContext({})
+  const rwNames = rw.tools.map((tool) => tool.name)
+  assert.ok(rwNames.includes('grafana_push'))
+  assert.ok(rwNames.includes('grafana_clone'))
+})
+
+// ── D4：受控并行与原生调用卡片 ───────────────────────────────────────────────
+// defineTool 会给 presentCall/isConcurrencySafe 套参数校验：非法参数返回
+// undefined/false 而不是抛错（卡片在回放路径上必须全函数）。故测试用合法参数。
+const VALID_ARGS = {
+  grafana_get: { urlOrUid: 'abc123' },
+  grafana_push: { dashboardJson: '{"panels":[]}', changeSummary: 's', message: 'm' },
+  grafana_clone: { sourceUrlOrUid: 'abc123' },
+  grafana_panel_query: { urlOrUid: 'abc123' },
+  grafana_datasources: {},
+  grafana_metric: { datasource: 'prom-prod', expr: 'up{job="api"}' },
+  grafana_trend: { urlOrUid: 'abc123' },
+  grafana_alerts: {},
+  grafana_search: {},
+  grafana_status: {},
+  grafana_sources: {},
+}
+
+test('read-only tools without shared write state opt into parallel dispatch', () => {
+  const { tools } = createContext()
+  // 无共享写状态的只读工具：允许并行。
+  for (const name of ['grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
+    const tool = toolByName(tools, name)
+    assert.equal(typeof tool.isConcurrencySafe, 'function', `${name} must declare isConcurrencySafe`)
+    assert.equal(tool.isConcurrencySafe(VALID_ARGS[name]), true)
+  }
+  // grafana_get 要记写快照（共享写状态），push/clone 是写入：三者保持独占调度。
+  for (const name of ['grafana_get', 'grafana_push', 'grafana_clone']) {
+    assert.notEqual(toolByName(tools, name).isConcurrencySafe?.(VALID_ARGS[name]), true, `${name} must stay exclusive`)
+  }
+})
+
+test('every grafana tool presents a native generic call card from args alone', () => {
+  const { tools } = createContext()
+  const kinds = { grafana_push: 'edit', grafana_clone: 'edit', grafana_search: 'search' }
+  for (const tool of tools) {
+    // 旧名转发 stub 不参展：它们只报错指路，没有可展示的调用内容。
+    if (tool.name === 'grafana_query' || tool.name === 'grafana_health') continue
+    const view = tool.presentCall?.(VALID_ARGS[tool.name])
+    assert.equal(view?.card, 'generic', `${tool.name} must present a generic call card`)
+    assert.equal(typeof view.title, 'string')
+    assert.ok(view.title.length > 0)
+    if (kinds[tool.name]) assert.equal(view.kind, kinds[tool.name])
+    // 纯函数契约：异常参数不抛错；带必填参数的工具由注册层兜底返回 undefined。
+    tool.presentCall?.(null)
+    tool.presentCall?.({ source: 42, query: 7, expr: {} })
+  }
+  assert.equal(toolByName(tools, 'grafana_metric').presentCall?.({}), undefined)
+  // 显著参数进卡片标题。
+  assert.match(toolByName(tools, 'grafana_metric').presentCall(VALID_ARGS.grafana_metric).title, /up\{job="api"\}/)
 })

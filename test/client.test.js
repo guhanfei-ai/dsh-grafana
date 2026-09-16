@@ -45,11 +45,11 @@ function loadBrowserRuntime(react) {
 //   · settings.describe 的 value 是聚合格 { writable, hasDocument, namespaces[] }。
 // remote:false 模拟没有 remote.* 命名空间服务的旧宿主；fail 按方法名注入 { ok:false }
 // 应答（例如 { 'credentials.describe': '...' }），用于验证失败不会被静默吞掉。
-function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = 'zh', fail = {} } = {}) {
+function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = 'zh', fail = {}, readOnly = false } = {}) {
   const calls = []
   // state 是后端的可变权威：多个卡片（多个设置页）可以共享同一份，用来复现并发保存。
   const credState = { ...creds }
-  const state = { sources: sources.map((s) => ({ ...s })), defaultSource, revision: 0, creds: credState, writes: [] }
+  const state = { sources: sources.map((s) => ({ ...s })), defaultSource, readOnly, revision: 0, creds: credState, writes: [] }
   // 可变副本：用例可以在运行期摘掉某条失败注入，模拟「故障恢复」。
   const failState = { ...fail }
   const rejected = (what) => (failState[what] ? { ok: false, error: { message: failState[what] } } : null)
@@ -88,7 +88,7 @@ function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = '
       const bad = rejected('settings.describe')
       if (bad) return bad
       return { ok: true, value: { writable: true, hasDocument: true, namespaces: [
-        descriptor('grafana', { sources: state.sources.map((s) => ({ ...s })), defaultSource: state.defaultSource }),
+        descriptor('grafana', { sources: state.sources.map((s) => ({ ...s })), defaultSource: state.defaultSource, readOnly: state.readOnly }),
         descriptor('locale', { preference: locale }),
       ] } }
     },
@@ -262,6 +262,8 @@ test('describe reads back every source with its token status and the default sou
       { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: false },
     ],
     defaultSource: 'id-eu',
+    // 只读模式随命名空间 value 明文返回，卡片据此展示权限边界。
+    readOnly: false,
     // 配置版本随 describe 一起取回：写入时回传，用于拒绝基于陈旧基线的覆盖。
     revision: 0,
   }))
@@ -310,7 +312,7 @@ test('every remote call passes exactly the declared number of arguments', async 
 test('describe returns an empty list without touching credentials when no source is configured', async () => {
   const { face, calls } = setup()
   const r = await face.describe()
-  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: false, unconfirmed: false, sources: [], defaultSource: '', revision: 0 }))
+  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: false, unconfirmed: false, sources: [], defaultSource: '', readOnly: false, revision: 0 }))
   // 无源站 → 无 tokenRef 可查，不应调用 credentials.describe。
   assert.equal(calls.some(([m]) => m === 'credentials.describe'), false)
 })
@@ -435,7 +437,7 @@ test('describe reports an unsupported host instead of rendering an empty source 
   // 而不是渲染成“尚未配置源站”的空白态（这就是本缺陷的原始症状）。
   const { face, calls } = setup({ remote: false })
   const r = await face.describe()
-  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: true, sources: [], defaultSource: '', unconfirmed: true }))
+  assert.equal(JSON.stringify(r), JSON.stringify({ hostUnsupported: true, sources: [], defaultSource: '', readOnly: false, unconfirmed: true }))
   // 未命中远端门面时不应发出任何远端调用。
   assert.equal(calls.length, 0)
   // 语言偏好在旧宿主上退回浏览器语言（空串），不抛错。
@@ -1270,4 +1272,32 @@ test('sources are not writable before the configuration has been read successful
   assert.equal(card.calls.some(([m]) => m === 'settings.mutate'), false)
   const after = await card.face.describe()
   assert.deepEqual(after.sources.map((s) => s.name), ['alpha'])
+})
+
+// ── R6：只读模式在设置卡片可见 ──────────────────────────────────────────────
+test('the settings card surfaces the current read-only mode', async () => {
+  // 数据面：describe 把命名空间 value 里的 readOnly 明文带回来。
+  const rw = setup({})
+  assert.equal((await rw.face.describe()).readOnly, false)
+  const ro = setup({ readOnly: true })
+  assert.equal((await ro.face.describe()).readOnly, true)
+
+  // 展示面：卡片状态按 describe 结果落位（readOnly 是 useState 序列的最后一项，
+  // 刻意排在末尾以免打乱既有状态下标）。
+  const card = cardHarness({ readOnly: true })
+  await card.ready()
+  assert.equal(card.states.at(-1), true)
+  const rwCard = cardHarness({})
+  await rwCard.ready()
+  assert.equal(rwCard.states.at(-1), false)
+
+  // 文案双语存在。
+  const { STRINGS } = loadBrowserRuntime().internals
+  for (const lang of ['zh', 'en']) {
+    for (const key of ['modeLabel', 'modeReadOnly', 'modeReadWrite']) {
+      assert.equal(typeof STRINGS[lang][key], 'string', `${lang}.${key} must exist`)
+      assert.ok(STRINGS[lang][key].length > 0)
+    }
+  }
+  assert.notEqual(STRINGS.zh.modeReadOnly, STRINGS.en.modeReadOnly)
 })
