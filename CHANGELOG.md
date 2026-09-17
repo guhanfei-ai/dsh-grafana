@@ -4,13 +4,22 @@ All notable changes to this project are documented here. Release-specific notes 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Up to and including `0.11.0` the entries accumulated under a single `[Unreleased]` heading; they have been retro-fitted into per-release sections using the release tags as the attribution evidence, and their wording is unchanged.
 
-## [Unreleased]
+## [0.14.1] - 2026-09-17
+
+### Added
+
+- The settings card gains a read-only / read-write toggle at the top of the card. Toggling writes the plugin-level `readOnly` setting through a single-field settings mutation that leaves `sources` and `defaultSource` untouched, and shows direction-specific feedback: entering read-only mode is confirmed as active immediately, while returning to read-write explains that restarting DSH (or reloading the plugin) is required to re-register the write tools when the plugin was loaded in read-only mode.
+
+### Fixed
+
+- Dashboard expression queries keep references within their own panel, including batched requests and per-panel fallback. Math, reduce, resample, threshold and condition references are rewritten according to their syntax; hidden dependencies are included transitively, and queries with missing or invalid dependencies are skipped with an explanation.
+
+## [0.14.0] - 2026-09-17
 
 ### Added
 
 - `grafana_compare`, a read-only tool that runs the same Prometheus query across 2-10 configured Grafana sources concurrently and returns a compact side-by-side comparison. The datasource argument is interpreted as a display name or uid and resolved independently per source — two Grafana instances with different UIDs for the same logical datasource still line up. Each source is treated independently: a timeout, 4xx, or upstream query error on one source never drops the others, and every error is sanitized and bounded (no credentials, no upstream paths). When every successful source returns a single numeric value, the output ends with a small numeric summary (highest / lowest / average / max-min ratio); when any source returns multiple series, fails, or returns no data, the summary is omitted and each source is listed with its per-series breakdown or sanitized status instead, so a high-cardinality query cannot be misread as a direct scalar comparison. Read-only; records no write snapshot and triggers no approval. The tool shares a `runBareMetricQuery` primitive with `grafana_metric` — a small, safe extraction that keeps both tools' request shape, datasource resolution, whitelist and error translation in lockstep.
 - Read-only mode: the `readOnly` configuration option keeps `grafana_push` and `grafana_clone` out of the tool registry entirely, and the approval gate still denies them if the mode is enabled after startup.
-- The settings card gains a read-only / read-write toggle at the top of the card. Toggling writes the plugin-level `readOnly` setting through a single-field settings mutation that leaves `sources` and `defaultSource` untouched, and shows direction-specific feedback: entering read-only mode is confirmed as active immediately, while returning to read-write explains that restarting DSH (or reloading the plugin) is required to re-register the write tools when the plugin was loaded in read-only mode.
 - `grafana_alerts` gains a rule evaluation-state section (`ruleStates: true`, filtered by `ruleState`) backed by the Prometheus-compatible rules API: `rule-state` lines report `inactive`/`pending`/`firing`/`recording`/`unknown` per rule with its folder, evaluation group, and live alert count — answering "which rules are waiting to fire", which the Alertmanager instance view cannot.
 - `grafana_datasources` and the rule sections of `grafana_alerts` are paged (`page`/`limit`, and `rulesPage` respectively); a disclosure line reports the page position, the total, and the exact argument for the next page.
 - Range results disclose their precision: `grafana_metric` and `grafana_trend` report the actual sampling step (`step=`) on the header line and the returned point count per series (`points=`) alongside the bucket count.
@@ -26,7 +35,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Loki trend queries are sent with `queryType: "range"` instead of inheriting a conflicting `queryType: "instant"` from the saved panel target.
 - The HTTP security note in the READMEs matches the implementation (plain HTTP allowed by default, configurable), and the `grafana_search` truncation hint no longer points at a non-existent `limit` argument.
 - `grafana_alerts` recognises Alertmanager v2 `active` alerts as `firing`, so the default filter includes normally firing alerts while preserving silence and inhibition handling.
-- Dashboard expression queries keep references within their own panel, including batched requests and per-panel fallback. Math, reduce, resample, threshold and condition references are rewritten according to their syntax; hidden dependencies are included transitively, and queries with missing or invalid dependencies are skipped with an explanation.
 - Settings writes use the last available configuration revision to reject stale-page overwrites. Failed or malformed reads keep the card read-only until a valid reload; unsupported hosts show upgrade guidance, and failed post-save reads report a synchronization error.
 - Every token change on a saved source uses a unique staged credential reference. The settings write switches the URL and reference together; definite rejections allow cleanup, while lost or malformed replies preserve credentials whose activation cannot be ruled out. Rotation, removal and cleanup retries retain references still in use or whose reference state cannot be confirmed.
 - Successfully saved token drafts are cleared, including drafts with surrounding whitespace, while edits made during the save and other cards' unsaved drafts are preserved.
@@ -277,6 +285,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Treat Grafana content as untrusted model data and document model-provider data boundaries.
 
 [Unreleased]: https://github.com/guhanfei-ai/dsh-grafana/commits/main
+[0.14.1]: https://github.com/guhanfei-ai/dsh-grafana/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/guhanfei-ai/dsh-grafana/compare/v0.13.2...v0.14.0
 [0.11.0]: https://github.com/guhanfei-ai/dsh-grafana/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/guhanfei-ai/dsh-grafana/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/guhanfei-ai/dsh-grafana/compare/v0.9.0...v0.10.0

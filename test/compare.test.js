@@ -513,11 +513,9 @@ test('grafana_compare keeps successful results when one source fails (401/403 sa
     // tokyo 与 us 行正常
     assert.ok(lines.some((l) => l.startsWith('tokyo') && !l.includes('ERROR')))
     assert.ok(lines.some((l) => l.startsWith('us') && !l.includes('ERROR')))
-    // summary 仍出：基于 2 of 3
-    const summaryIdx = lines.findIndex((l) => l.startsWith('summary ('))
-    assert.notEqual(summaryIdx, -1)
-    assert.match(lines[summaryIdx], /based on 2 of 3 source\(s\)/)
-    assert.match(lines[summaryIdx], /, 1 failed/)
+    // summary 不再出：部分失败即省略（避免部分证据被读成完整比较）。
+    assert.equal(lines.find((l) => l.startsWith('summary (')), undefined)
+    assert.match(out, /Comparison summary omitted/)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -588,12 +586,9 @@ test('grafana_compare distinguishes query success with no data from query failur
     const usLine = lines.find((l) => l.startsWith('us'))
     assert.match(sgLine, /NO DATA/)
     assert.match(usLine, /ERROR:/)
-    // summary 只基于真正有值的源站：基于 1 of 3，附注「1 returned no data, 1 failed」。
-    const summaryIdx = lines.findIndex((l) => l.startsWith('summary ('))
-    assert.notEqual(summaryIdx, -1)
-    assert.match(lines[summaryIdx], /based on 1 of 3/)
-    assert.match(lines[summaryIdx], /1 returned no data/)
-    assert.match(lines[summaryIdx], /1 failed/)
+    // summary 不再出：部分无数据/部分失败即省略（避免部分证据被读成完整比较）。
+    assert.equal(lines.find((l) => l.startsWith('summary (')), undefined)
+    assert.match(out, /Comparison summary omitted/)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -778,8 +773,10 @@ test('summarizeCompareSeries covers instant single/multi-point, range, log, and 
   assert.equal(multiSeries[0].avg, (1 + 5 + 10) / 3)
   assert.equal(multiSeries[0].rows, 3)
 
-  // range 单 series
-  const rangeSeries = summarizeCompareSeries(liveFrame([10, 20, 30]), { mode: 'range', points: 3, fromMs: 0, toMs: RANGE_SPAN })
+  // range 单 series：窗口必须包住 liveFrame 的真实时间戳（基于 Date.now()），
+  // 否则窗口过滤会把全部点排除、落入 empty 分支。
+  const rangeFrame = liveFrame([10, 20, 30])
+  const rangeSeries = summarizeCompareSeries(rangeFrame, { mode: 'range', points: 3, fromMs: rangeFrame.data.values[0][0], toMs: rangeFrame.data.values[0][2] })
   assert.equal(rangeSeries[0].kind, 'range')
   assert.equal(rangeSeries[0].first, 10)
   assert.equal(rangeSeries[0].last, 30)
