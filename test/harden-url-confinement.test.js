@@ -7,7 +7,7 @@ import test from 'node:test'
 
 import { resolveDashboardUrl } from '../lib/util.js'
 import { createRuntime } from '../lib/runtime.js'
-import { defineGrafanaGetTool, defineGrafanaPushTool } from '../lib/tools/dashboard.js'
+import { defineGrafanaCloneTool, defineGrafanaGetTool, defineGrafanaPushTool } from '../lib/tools/dashboard.js'
 
 // C1 — 相对路径（根部署）。
 test('C1 relative URL on root deployment resolves against base origin', () => {
@@ -86,5 +86,56 @@ test('grafana_push omits a cross-origin dashboard URL instead of presenting it a
 test('grafana_push keeps a same-origin absolute dashboard URL', async () => {
   const out = await pushWithUrl('https://grafana.example.com/d/fixture-dash')
   assert.match(out, /url=https:\/\/grafana\.example\.com\/d\/fixture-dash/)
+  assert.doesNotMatch(out, /omitted/)
+})
+
+// 端到端：grafana_clone 拿到跨源 URL 时省略它，且绝不把恶意主机名写进输出。
+// clone 流：先 GET 源 dashboard（取 meta/folder/title），再 POST /api/dashboards/db 建副本。
+async function cloneWithUrl(resultUrl) {
+  const originalFetch = globalThis.fetch
+  const sourceDashboard = { id: 7, uid: 'fixture-dash', version: 3, title: 'Example', panels: [] }
+  const input = { sourceUrlOrUid: 'fixture-dash' }
+  const config = {
+    sources: [{ id: 'alpha', name: 'alpha', baseUrl: 'https://grafana.example.com', tokenRef: 'TOKEN_alpha' }],
+    defaultSource: 'alpha',
+    allowInsecureHttp: true,
+  }
+  const rt = createRuntime({ credentials: { resolve: async () => ({ value: 'fixture-token' }) } }, () => config)
+  const exec = { signal: new AbortController().signal }
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(init.method ?? 'GET').toUpperCase() === 'POST') {
+      return new Response(JSON.stringify({ uid: 'new-clone-uid', status: 'success', version: 1, url: resultUrl }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify({ dashboard: sourceDashboard, meta: { folderUid: 'fixture-folder' } }), {
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  try {
+    // 必须 await clone 完成后再让 finally 还原 fetch，否则源 dashboard 的 GET 会落到真实网络。
+    return await defineGrafanaCloneTool(rt).execute(input, exec)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+test('grafana_clone omits a cross-origin dashboard URL instead of presenting it as trusted', async () => {
+  const out = await cloneWithUrl('https://evil.example.com/d/new-clone-uid')
+  assert.match(out, /^Dashboard cloned:/)
+  assert.match(out, /uid=new-clone-uid/)
+  assert.match(out, /url=omitted/)
+  assert.doesNotMatch(out, /evil\.example\.com/)
+})
+
+test('grafana_clone keeps a same-origin absolute dashboard URL', async () => {
+  const out = await cloneWithUrl('https://grafana.example.com/d/new-clone-uid')
+  assert.match(out, /url=https:\/\/grafana\.example\.com\/d\/new-clone-uid/)
+  assert.doesNotMatch(out, /omitted/)
+})
+
+test('grafana_clone keeps a relative dashboard URL on root deployment', async () => {
+  const out = await cloneWithUrl('/d/new-clone-uid')
+  assert.match(out, /url=https:\/\/grafana\.example\.com\/d\/new-clone-uid/)
   assert.doesNotMatch(out, /omitted/)
 })
