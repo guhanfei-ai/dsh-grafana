@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Release-specific notes 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Up to and including `0.11.0` the entries accumulated under a single `[Unreleased]` heading; they have been retro-fitted into per-release sections using the release tags as the attribution evidence, and their wording is unchanged.
 
+## [Unreleased]
+
+### Fixed
+
+- `grafana_compare` in `range` mode no longer fails the whole call when a source returns a numeric table frame with no time axis. Such a frame can only be summarized as a single value, while the compact comparison row renders first/last/min/max/avg — reading the absent fields threw a `TypeError` and lost the other sources' results. Comparability is now judged per mode: `range` requires a series with complete range stats, and anything else (table, log, or empty result) is listed in the per-source breakdown with the reason direct comparison is unavailable. Non-finite stats reaching the renderer are printed as `n/a` rather than crashing or showing `NaN`.
+- `grafana_metric`, `grafana_trend` and `grafana_compare` reject a zero-length `range` window (`from` equal to `to`) instead of deriving `intervalMs: 0` and sending it upstream, where it can only produce a 400 or a meaningless single-bucket result that the header line would then disclose as a valid `step=0ms`. `instant` mode still evaluates at a single instant, where `from === to` is the normal shape.
+- READMEs and the `grafana_compare` tool description state the current summary gate ("every requested source succeeded and returned one comparable scalar") instead of the older "all successful sources" wording.
+
+### Security
+
+- Dashboard URLs returned by `grafana_push` and `grafana_clone` are confined to root-relative paths or absolute HTTP(S) URLs that share the configured origin and carry no userinfo. Previously any other form — `javascript:`, `data:`, `ftp:`, a `user:password@` URL, a non-root-relative path — was passed through verbatim, so untrusted upstream text could become a clickable link or leak embedded credentials; such values are now omitted with a warning line.
+
 ## [0.14.1] - 2026-09-17
 
 ### Added

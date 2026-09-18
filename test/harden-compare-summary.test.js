@@ -81,3 +81,58 @@ test('A5 single-source input still emits a summary (2-source minimum is enforced
   }).join('\n')
   assert.match(out, /summary \(based on 1 of 1 source/)
 })
+
+// Case A6 — 可比性按 mode 判定：range 紧凑表要渲染 first/last/min/max/avg 一整行，
+// 无时间轴的表格帧在 range 下只能给出 instant 形状（value/min/max/avg/rows）。
+// 修复前它被当成可比值、无条件读取 first/last，formatNumber(undefined) 直接抛错，
+// 整次 grafana_compare 调用失败。
+const rangeOpt = (extra = {}) => ({ mode: 'range', query: 'up', range: 'now-1h..now', totalSources: 2, datasourceWanted: 'Prometheus', stepMs: 60_000, ...extra })
+const tableSeries = () => [{ kind: 'instant', label: '"(unnamed series)"', value: 2, min: 1, max: 2, avg: 1.5, rows: 2 }]
+
+test('A6 range mode with a no-time-axis table frame → per-source detail instead of a crash', () => {
+  const lines = summarizeCompareResult([
+    { name: 'a', ok: true, datasource: { type: 'prometheus', uid: 'x' }, series: tableSeries() },
+    { name: 'b', ok: true, datasource: { type: 'prometheus', uid: 'y' }, series: tableSeries() },
+  ], rangeOpt())
+  const out = lines.join('\n')
+  assert.doesNotMatch(out, /first    last/, 'must not render the range compact table')
+  assert.match(out, /Comparison summary omitted/)
+  // 值本身不丢：per-source 行仍给出 instant 形状的统计与行数。
+  assert.match(out, /a:.*value=2/)
+  assert.match(out, /b:.*value=2/)
+  assert.match(out, /rows=2/)
+  // 不可直接比较的原因必须写出来，否则模型只看到「omitted」无从判断该怎么办。
+  assert.match(out, /time axis|not comparable/i)
+})
+
+// Case A7 — 正例：真正的 range 形状（带完整区间统计）仍走紧凑表 + summary，
+// 收紧闸门不能把正常的 range 比较一起挡掉。
+test('A7 range mode with complete range series still renders the compact table and summary', () => {
+  const ranged = (name, uid, first, last) => ({
+    name,
+    ok: true,
+    datasource: { type: 'prometheus', uid },
+    series: [{ kind: 'range', label: '{a}', points: 4, buckets: 4, first, last, min: first, max: last, avg: (first + last) / 2, trend: 'rising', spark: '▁▂▄█' }],
+  })
+  const lines = summarizeCompareResult([
+    ranged('a', 'x', 100, 200),
+    ranged('b', 'y', 10, 20),
+  ], rangeOpt())
+  const out = lines.join('\n')
+  assert.match(out, /first    last     min      max      avg      trend/)
+  assert.match(out, /summary \(based on 2 of 2 source/)
+  assert.match(out, /highest=a/)
+})
+
+// Case A8 — range 形状缺字段（直接构造入参的兜底）：字段不全等同不可比，
+// 不能渲染出一行 undefined/NaN。
+test('A8 range series missing stats fields is treated as non-comparable', () => {
+  const lines = summarizeCompareResult([
+    { name: 'a', ok: true, datasource: { type: 'prometheus', uid: 'x' }, series: [{ kind: 'range', label: '{a}', trend: 'flat' }] },
+    { name: 'b', ok: true, datasource: { type: 'prometheus', uid: 'y' }, series: [{ kind: 'range', label: '{a}', first: 1, last: 2, min: 1, max: 2, avg: 1.5, trend: 'flat' }] },
+  ], rangeOpt())
+  const out = lines.join('\n')
+  assert.doesNotMatch(out, /first    last/)
+  assert.match(out, /Comparison summary omitted/)
+  assert.equal(out.includes('NaN'), false)
+})

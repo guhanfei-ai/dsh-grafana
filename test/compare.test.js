@@ -225,6 +225,9 @@ test('grafana_compare rejects bad input shapes and oversized expr without issuin
     await assert.rejects(tool.execute({ sources: [1, 'a'], datasource: 'Prometheus', query: 'up' }, execution()), /must be strings/)
     // range 模式：非法起止区间仍被拒；正向超 90 天窗口也拒。
     await assert.rejects(tool.execute({ sources: ['a', 'b'], datasource: 'Prometheus', query: 'up', mode: 'range', from: 'now', to: 'now-1h' }, execution()), /must not be later than/)
+    // 零长度区间：intervalMs 会算成 0，发给上游只能得到 400 或无意义结果，本地拒。
+    await assert.rejects(tool.execute({ sources: ['a', 'b'], datasource: 'Prometheus', query: 'up', mode: 'range', from: 'now', to: 'now' }, execution()), /positive time span/)
+    await assert.rejects(tool.execute({ sources: ['a', 'b'], datasource: 'Prometheus', query: 'up', mode: 'range', from: '1700000000000', to: '1700000000000' }, execution()), /positive time span/)
     await assert.rejects(
       tool.execute({ sources: ['a', 'b'], datasource: 'Prometheus', query: 'up', mode: 'range', from: `now-${TREND_WINDOW_DAYS + 30}d`, to: 'now' }, execution()),
       new RegExp(`exceeds the ${TREND_WINDOW_DAYS}-day limit`),
@@ -403,6 +406,46 @@ test('grafana_compare renders per-source first/last/min/max/avg/trend for range 
     const summaryIdx = lines.findIndex((l) => l.startsWith('summary ('))
     assert.match(lines[summaryIdx + 1], /highest=us \(avg=557\.5\)/)
     assert.match(lines[summaryIdx + 2], /lowest=tokyo \(avg=100\)/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ── range 下的无时间轴表格帧：不可比较，不得崩溃 ────────────────────────────
+
+test('grafana_compare in range mode reports a no-time-axis table frame instead of crashing', async () => {
+  // Grafana 对无时间轴的数值表格（如 instant 形状落在 range 响应里、或 mysql 这类
+  // 表格型结果）返回只有 number 列的帧。summarizeCompareSeries 给它 instant 形状，
+  // 而 range 紧凑表要读 first/last——修复前 formatNumber(undefined) 抛错，整次调用失败。
+  const originalFetch = globalThis.fetch
+  const tableFrame = { schema: { fields: [{ name: 'Value', type: 'number' }] }, data: { values: [[1, 2]] } }
+  globalThis.fetch = async (url, init) => {
+    const match = /^https:\/\/([^.]+)\.example\.com/.exec(String(url))
+    const shortName = match[1]
+    if (String(init?.method ?? 'GET').toUpperCase() === 'POST') return jsonResponse({ results: { A: { frames: [tableFrame] } } })
+    return jsonResponse([{ uid: `${shortName[0]}p`, type: 'prometheus', name: 'Prometheus' }])
+  }
+  try {
+    const { tools } = createSettingsContext({
+      sources: [
+        { id: 'id-tokyo', name: 'tokyo', baseUrl: 'https://tokyo.example.com', tokenRef: 'GRAFANA_TOKEN_idtokyo' },
+        { id: 'id-sg', name: 'singapore', baseUrl: 'https://singapore.example.com', tokenRef: 'GRAFANA_TOKEN_idsg' },
+      ],
+      defaultSource: 'id-tokyo',
+    }, { GRAFANA_TOKEN_idtokyo: 't', GRAFANA_TOKEN_idsg: 's' })
+    const out = await toolByName(tools, 'grafana_compare')
+      .execute({ sources: ['tokyo', 'singapore'], datasource: 'Prometheus', query: 'up', mode: 'range', from: 'now-1h', to: 'now', points: 60 }, execution())
+    const lines = out.split('\n')
+
+    assert.equal(lines[1], 'sources=2 succeeded=2 no_data=0 failed=0', 'both sources still counted as succeeded')
+    assert.match(out, /Comparison summary omitted/)
+    assert.match(out, /no time axis/)
+    assert.doesNotMatch(out, /first    last/, 'range compact table must not be rendered')
+    // 表格值不丢：每台源站各报一行 instant 形状的统计。
+    const tokyoLine = lines.find((l) => l.startsWith('tokyo:'))
+    const sgLine = lines.find((l) => l.startsWith('singapore:'))
+    assert.match(tokyoLine, /value=2 .*min=1 max=2 avg=1\.5 rows=2/)
+    assert.match(sgLine, /value=2 /)
   } finally {
     globalThis.fetch = originalFetch
   }

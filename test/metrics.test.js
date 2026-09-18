@@ -712,10 +712,23 @@ test('grafana_metric rejects unsupported datasources, bad numbers, and oversized
       tool.execute({ datasource: 'prom-prod', expr: 'up', mode: 'range', from: `now-${TREND_WINDOW_DAYS + 30}d`, to: 'now' }, execution()),
       new RegExp(`exceeds the ${TREND_WINDOW_DAYS}-day limit`),
     )
+    // 零长度区间同样不发请求：intervalMs = ceil(0 / points) = 0，上游只能给 400 或
+    // 一个无意义的单点，而首行会把它当成有效采样步长报出来。
+    await assert.rejects(
+      tool.execute({ datasource: 'prom-prod', expr: 'up', mode: 'range', from: 'now', to: 'now' }, execution()),
+      /positive time span/,
+    )
+    await assert.rejects(
+      tool.execute({ datasource: 'prom-prod', expr: 'up', mode: 'range', from: '1700000000000', to: '1700000000000' }, execution()),
+      /positive time span/,
+    )
+    // instant 不看区间，from 与 to 同值是合法的「就在此刻求值」。
+    await tool.execute({ datasource: 'prom-prod', expr: 'up', from: 'now', to: 'now' }, execution())
     // instant 不看区间，同样的 from 不报错。
     await tool.execute({ datasource: 'prom-prod', expr: 'up', from: `now-${TREND_WINDOW_DAYS + 30}d`, to: 'now' }, execution())
-    // 十余次调用里只有最后这一条合法的走到了 POST /api/ds/query：参数不对就绝不带病发请求。
-    assert.equal(bodies.length, 1)
+    // 这串调用里只有最后两条合法的（都是 instant）走到了 POST /api/ds/query：
+    // 参数不对就绝不带病发请求。
+    assert.equal(bodies.length, 2)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -939,6 +952,12 @@ test('grafana_trend keeps variable overrides, adhoc filters, and maxPanels worki
     await assert.rejects(
       tool.execute({ urlOrUid: 'abc123', from: `now-${TREND_WINDOW_DAYS + 30}d`, to: 'now' }, execution()),
       new RegExp(`exceeds the ${TREND_WINDOW_DAYS}-day limit`),
+    )
+    // 零长度区间：step 会算成 0ms，每个桶覆盖零时间，报出来的趋势与火花线都没有
+    // 依据，故在换算处直接拒。
+    await assert.rejects(
+      tool.execute({ urlOrUid: 'abc123', from: 'now', to: 'now' }, execution()),
+      /positive time span/,
     )
   } finally {
     globalThis.fetch = originalFetch
