@@ -1115,6 +1115,11 @@ window.__ModuleLoader__.load({
 					}
 				}
 			};
+			// 双代兼容：旧槽（0.1.5 及更早）+ 新槽（0.1.7+）各 inject、各自静默。
+			// slots 系统对未知 key 无硬校验、无报错串——旧宿主上新槽 inject 注册成功
+			// 但永不渲染，新宿主上旧槽同理，双方互不干扰（与 023 双路径方法论一致）。
+
+			// 旧槽：settings.plugin.item（keyed slot，设置页内嵌条目）
 			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
 				// keyed slot：设置页按 Host 端 settings namespace（见 index.js 的
 				// SETTINGS_NAMESPACE）派发卡片，没有 key 的注册永远不会被渲染。
@@ -1122,6 +1127,14 @@ window.__ModuleLoader__.load({
 				key: "grafana",
 				inject: () => ({ grafanaCard: face })
 			}, GrafanaCard));
+
+			// 新槽：settings.plugins.tab（root scope，Plugins 区整页 tab）
+			// registerOptions 从 {key, inject} 变为 {id, order, label}；
+			// render 回调直接返回 React element，不再通过 inject props 传 face。
+			ctx.slots.inject("settings.plugins.tab", () => ctx.slots.register(
+				{ name: "settings.plugins.tab", id: "grafana", order: 100, label: "Grafana" },
+				() => react.createElement(GrafanaCard, { grafanaCard: face })
+			));
 		}
 
 		exports.apply = apply;

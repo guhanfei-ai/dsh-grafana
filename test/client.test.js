@@ -140,14 +140,26 @@ function setup({ backend = null, react = null, remote = true, ...backendOptions 
     // 刻意不提供 connection —— 任何回退到 connection.api 的实现都会当场失败。
     get(name) { return services[name] },
     slots: {
-      inject(name, callback) { assert.equal(name, 'settings.plugin.item'); callback() },
+      inject(name, callback) {
+        // 双代兼容：旧槽 settings.plugin.item + 新槽 settings.plugins.tab
+        assert.ok(name === 'settings.plugin.item' || name === 'settings.plugins.tab', `unexpected slot: ${name}`)
+        callback()
+      },
       register(specification, card) {
-        // keyed slot：key 必须与 index.js 的 SETTINGS_NAMESPACE 一致，且不带 id/order。
-        assert.equal(specification.key, 'grafana')
-        assert.equal('id' in specification, false)
-        assert.equal('order' in specification, false)
-        face = specification.inject().grafanaCard
-        component = card
+        if (specification.name === 'settings.plugin.item') {
+          // 旧槽（keyed slot）：key 必须与 index.js 的 SETTINGS_NAMESPACE 一致，且不带 id/order。
+          assert.equal(specification.key, 'grafana')
+          assert.equal('id' in specification, false)
+          assert.equal('order' in specification, false)
+          face = specification.inject().grafanaCard
+          component = card
+        } else {
+          // 新槽（tab slot）：registerOptions 为 id/order/label，render 回调返回 React element。
+          assert.equal(specification.id, 'grafana')
+          assert.equal(typeof specification.order, 'number')
+          assert.equal(typeof specification.label, 'string')
+          assert.equal(typeof card, 'function')
+        }
         return () => {}
       },
     },
@@ -225,7 +237,7 @@ function cardHarness(options = {}) {
   }
 }
 
-test('browser module declares the dsh-grafana id, the slots-only inject, and the keyed grafana slot', () => {
+test('browser module declares the dsh-grafana id, the slots-only inject, and both grafana slots (legacy + 0.1.7 tab)', () => {
   const { definition, runtime } = loadBrowserModule()
   assert.equal(definition.id, 'dsh-grafana')
   // 只 inject slots：卡片必须在没有 remote.* 的旧宿主上也能加载，才能显示升级提示。
@@ -233,17 +245,29 @@ test('browser module declares the dsh-grafana id, the slots-only inject, and the
   // 而 ctx.get 可以在运行期读到未声明的服务，故远端门面一律用 ctx.get 延迟解析。
   assert.deepEqual(Array.from(runtime.inject), ['slots'])
   let face
+  const injected = []
   runtime.apply({
     get: () => undefined,
     slots: {
-      inject: (_name, callback) => callback(),
-      register: (specification) => {
-        assert.equal(specification.key, 'grafana')
-        face = specification.inject().grafanaCard
+      inject: (name, callback) => { injected.push(name); callback() },
+      register: (specification, card) => {
+        if (specification.name === 'settings.plugin.item') {
+          // 旧槽 keyed slot：key = grafana，通过 inject 传 face。
+          assert.equal(specification.key, 'grafana')
+          face = specification.inject().grafanaCard
+        } else if (specification.name === 'settings.plugins.tab') {
+          // 新槽 tab slot：id/order/label，render 回调返回 React element。
+          assert.equal(specification.id, 'grafana')
+          assert.equal(typeof specification.order, 'number')
+          assert.equal(typeof specification.label, 'string')
+          assert.equal(typeof card, 'function')
+        }
         return () => {}
       },
     },
   })
+  // 双 inject：旧槽 + 新槽都注入（双代兼容）。
+  assert.deepEqual(injected.sort(), ['settings.plugin.item', 'settings.plugins.tab'])
   // 多源站 face 契约：读回源站列表、整体写入、令牌增删、语言偏好、模式单字段写。
   for (const method of ['describe', 'writeSources', 'writeReadOnly', 'setToken', 'unsetToken', 'localePreference']) {
     assert.equal(typeof face[method], 'function', `face.${method} must be a function`)

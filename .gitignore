@@ -16,3 +16,16 @@ _plans/
 _prompts
 AGENTS.md
 audit
+
+# General Ignorance
+.agents
+AGENT*.md
+SELF2*.md
+.kilo
+.mindmaps
+.video_agent
+.zcode-plugin
+out
+node_modules
+__pycache__/
+**/__pycache__/

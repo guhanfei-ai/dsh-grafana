@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Compatibility with DeepSeek Harness `0.1.7` prereleases: the `@deepseek-ai/dsh-tools` peer range is now `^0.1.0-rc.6 || ^0.1.1-rc.0 || ^0.1.2-alpha.0 || ^0.1.3-alpha.0 || ^0.1.5-alpha.0 || ^0.1.7-alpha.0`, and devDependencies develop against `dsh-tools@0.1.7-rc.2`. Under node-semver's prerelease matching rules, `0.1.7-rc.2` requires a comparator carrying the `[0,1,7]` tuple, which the previous range did not cover — installing this plugin into a host carrying dsh-tools `0.1.7-rc.2` was blocked with npm ERESOLVE.
+
+### Changed
+
+- **Settings card slot migration (breaking UI change on 0.1.7+ hosts):** the `settings.plugin.item` keyed slot was removed from the upstream slot catalog in `0.1.7` and replaced by `settings.plugins.tab` (a root-scope tab in the Plugins settings section). The card now injects both slots for dual-generation compatibility: on `0.1.5` and earlier hosts the legacy keyed slot renders the card as before; on `0.1.7+` hosts the new tab slot renders it as a full-page tab with `id: "grafana"`, `order: 100`, `label: "Grafana"`. The slots system does not warn on unknown keys, so without the new injection the card would silently disappear from the settings UI on `0.1.7` hosts with no console trace. The `GrafanaCard` component itself is unchanged — it receives the same `grafanaCard` face props through both slots. Users on `0.1.7` will see the Grafana configuration as a dedicated tab rather than an embedded card in the settings page.
+
 ### Fixed
 
 - `grafana_compare` in `range` mode no longer fails the whole call when a source returns a numeric table frame with no time axis. Such a frame can only be summarized as a single value, while the compact comparison row renders first/last/min/max/avg — reading the absent fields threw a `TypeError` and lost the other sources' results. Comparability is now judged per mode: `range` requires a series with complete range stats, and anything else (table, log, or empty result) is listed in the per-source breakdown with the reason direct comparison is unavailable. Non-finite stats reaching the renderer are printed as `n/a` rather than crashing or showing `NaN`.
