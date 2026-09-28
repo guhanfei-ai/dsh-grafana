@@ -3105,6 +3105,7 @@ test('internals exports the stable debug surface across the lib/ split', () => {
     'interpolateVariables',
     'normalizeBaseUrl',
     'parseDashboardUrl',
+    'parseGrafanaSectionSimple',
     'parseUid',
     'readLimitedText',
     'redactSecrets',
@@ -3852,4 +3853,81 @@ test('every grafana tool presents a native generic call card from args alone', (
   // grafana_compare 的显著参数是 query（不是 expr）：卡片标题必须带上查询文本，
   // 不能因为参数名写错而退化成空标题。防止 presentCall 误用 args.expr 的回归。
   assert.match(toolByName(tools, 'grafana_compare').presentCall(VALID_ARGS.grafana_compare).title, /Compare metric.*up/)
+})
+
+// ── parseGrafanaSectionSimple：fallback 解析器不泄漏数组项字段 ─────────────────
+// 真机 .imported 文件是多段大文件（30+ 顶层 key），grafana 段含两源站 + 顶层 baseUrl。
+// 旧版 bug：sources 数组项的 baseUrl（缩进 6）泄漏覆盖了顶层 baseUrl（缩进 2），
+// 导致迁移产物 legacy baseUrl 值错误。此用例用真机同构结构验证不泄漏。
+test('parseGrafanaSectionSimple does not leak source array fields into top level', () => {
+  const yaml = [
+    'ui-onboarding:',
+    '  welcomeNoticeVersion: 1',
+    'agent-default-model:',
+    '  provider: openai',
+    'grafana:',
+    '  baseUrl: http://grafana.example.com',
+    '  defaultSource: src-aaa',
+    '  readOnly: false',
+    '  tokenRef: GRAFANA_TOKEN',
+    '  sources:',
+    '    - id: src-aaa',
+    '      name: default',
+    '      baseUrl: http://grafana.example.com',
+    '      tokenRef: GRAFANA_TOKEN_srcaaa',
+    '    - id: src-bbb',
+    '      name: localhost',
+    '      baseUrl: http://localhost:3000',
+    '      tokenRef: GRAFANA_TOKEN_srcbbb',
+    'other-plugin:',
+    '  someKey: someValue',
+  ].join('\n')
+
+  const parsed = internals.parseGrafanaSectionSimple(yaml)
+  const g = parsed.grafana
+
+  // 顶层 baseUrl 必须是 grafana 段的顶层值，不能被 sources 数组项的值覆盖。
+  assert.equal(g.baseUrl, 'http://grafana.example.com',
+    'top-level baseUrl must not be overwritten by source array item baseUrl')
+  assert.equal(g.defaultSource, 'src-aaa')
+  assert.equal(g.readOnly, false)
+  assert.equal(g.tokenRef, 'GRAFANA_TOKEN')
+
+  // sources 数组本身解析正确：两源站 id/name/baseUrl/tokenRef 全对。
+  assert.ok(Array.isArray(g.sources), 'sources must be an array')
+  assert.equal(g.sources.length, 2)
+  assert.equal(g.sources[0].id, 'src-aaa')
+  assert.equal(g.sources[0].name, 'default')
+  assert.equal(g.sources[0].baseUrl, 'http://grafana.example.com')
+  assert.equal(g.sources[0].tokenRef, 'GRAFANA_TOKEN_srcaaa')
+  assert.equal(g.sources[1].id, 'src-bbb')
+  assert.equal(g.sources[1].name, 'localhost')
+  assert.equal(g.sources[1].baseUrl, 'http://localhost:3000')
+  assert.equal(g.sources[1].tokenRef, 'GRAFANA_TOKEN_srcbbb')
+
+  // 相邻无关段不泄漏进 grafana。
+  assert.equal(parsed['other-plugin'], undefined)
+  assert.equal(parsed['ui-onboarding'], undefined)
+})
+
+// ── parseGrafanaSectionSimple：顶层 baseUrl 与数组项不同时更严格的验证 ──────
+// 真机场景：顶层 baseUrl=grafana.ttpai.work，数组项 localhost 的 baseUrl=localhost:3000。
+// 修复前：顶层被解析成 localhost:3000（数组项泄漏）。
+test('parseGrafanaSectionSimple top-level baseUrl differs from source array item', () => {
+  const yaml = [
+    'grafana:',
+    '  baseUrl: http://grafana.example.com',
+    '  sources:',
+    '    - id: src-a',
+    '      name: main',
+    '      baseUrl: http://grafana.example.com',
+    '    - id: src-b',
+    '      name: local',
+    '      baseUrl: http://localhost:3000',
+  ].join('\n')
+
+  const parsed = internals.parseGrafanaSectionSimple(yaml)
+  // 顶层 baseUrl 必须保持 grafana.example.com，不能被 localhost:3000 覆盖。
+  assert.equal(parsed.grafana.baseUrl, 'http://grafana.example.com')
+  assert.equal(parsed.grafana.sources[1].baseUrl, 'http://localhost:3000')
 })

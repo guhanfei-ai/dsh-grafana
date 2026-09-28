@@ -171,6 +171,10 @@ function parseGrafanaSectionSimple(text) {
         }
       }
       if (sources.length > 0) result.sources = sources
+      // 内层 while 已消费到 j，外层 for 的 i 必须跳过去（i++ 后落到 j），
+      // 否则数组项的字段（baseUrl/tokenRef 等）会被外层 else if 重新捕获，
+      // 用数组项的值覆盖顶层同名字段——这就是"字段泄漏"的根因。
+      i = j - 1
     } else if (key === 'defaultSource' || key === 'baseUrl' || key === 'tokenRef' || key === 'readOnly') {
       if (value) {
         if (key === 'readOnly') result[key] = value === 'true'
@@ -261,23 +265,30 @@ export function apply(ctx, config = {}) {
     //    因 volatile 缺失而失败，配置滞留在 .imported 文件里，需插件自行恢复
     // 三步都失败静默兜底，不阻断插件加载。
     ;(async () => {
+      // 三步各自独立 try/catch：任一步抛异常不阻断后续。
+      // 原来共享一个 try/catch，步骤 1 若在真机上因凭证服务行为差异抛出，
+      // 步骤 2/3 静默跳过——.imported 文件迁移就不跑了。
+
+      // ── 步骤 1：URL 从凭证库迁移到 settings ──────────────────────────
+      let storedBaseUrl = null
       try {
-        // ── 步骤 1：URL 从凭证库迁移到 settings ──────────────────────────
-        const stored = await sctx.credentials.resolve(BASE_URL_REF)
-        if (stored?.value && !unwrapVolatile(scope.get()).baseUrl) {
-          await scope.update({ baseUrl: stored.value })
+        storedBaseUrl = await sctx.credentials.resolve(BASE_URL_REF)
+        if (storedBaseUrl?.value && !unwrapVolatile(scope.get()).baseUrl) {
+          await scope.update({ baseUrl: storedBaseUrl.value })
           await sctx.credentials.unset(BASE_URL_REF)
         }
+      } catch { /* 凭证服务不可用或写入失败，不阻断后续迁移。 */ }
 
-        // ── 步骤 2：sources 物化 ──────────────────────────────────────
-        // sources 为空且存在可迁移的 legacy 配置（settings.baseUrl 或
-        // GRAFANA_TOKEN 凭证）时，物化出一个默认源站，让既有单源配置在设置卡片里
-        // 可见可编辑。令牌沿用 GRAFANA_TOKEN（不搬运明文密钥）；生成只读 UID 作稳定主键。
-        // describe 同时取 value 与 revision：tokenPresent 的 await 间隔里用户若在设置
-        // 卡片保存了自己的源站（revision 前进），带 expectedRevision 的写入会被宿主
-        // 以 SettingsConflictError 拒绝——外层 catch 吞掉并放弃本次迁移，用户刚写的
-        // 配置得以保留，而不是被物化的默认源站覆盖。revision 不可得（旧宿主）时
-        // 退化为无条件写，与既有行为一致。
+      // ── 步骤 2：sources 物化 ──────────────────────────────────────
+      // sources 为空且存在可迁移的 legacy 配置（settings.baseUrl 或
+      // GRAFANA_TOKEN 凭证）时，物化出一个默认源站，让既有单源配置在设置卡片里
+      // 可见可编辑。令牌沿用 GRAFANA_TOKEN（不搬运明文密钥）；生成只读 UID 作稳定主键。
+      // describe 同时取 value 与 revision：tokenPresent 的 await 间隔里用户若在设置
+      // 卡片保存了自己的源站（revision 前进），带 expectedRevision 的写入会被宿主
+      // 以 SettingsConflictError 拒绝——catch 吞掉并放弃本次迁移，用户刚写的
+      // 配置得以保留，而不是被物化的默认源站覆盖。revision 不可得（旧宿主）时
+      // 退化为无条件写，与既有行为一致。
+      try {
         const descriptor = sctx.settings.describe?.().find?.((entry) => entry?.ns === SETTINGS_NAMESPACE) ?? null
         const current = unwrapVolatile(descriptor?.value ?? scope.get())
         const hasSources = Array.isArray(current?.sources) && current.sources.length > 0
@@ -289,7 +300,7 @@ export function apply(ctx, config = {}) {
             ? current.tokenRef.trim()
             : TOKEN_REF
           const tokenPresent = Boolean((await sctx.credentials.resolve(legacyTokenRef))?.value)
-          const legacyUrl = current.baseUrl || stored?.value || ''
+          const legacyUrl = current.baseUrl || storedBaseUrl?.value || ''
           if (legacyUrl || tokenPresent) {
             const id = generateSourceId()
             await sctx.settings.update(
@@ -302,16 +313,18 @@ export function apply(ctx, config = {}) {
             )
           }
         }
+      } catch { /* sources 物化失败不阻断后续 .imported 迁移。 */ }
 
-        // ── 步骤 3：0.1.7 .imported 文件迁移 ──────────────────────────
-        // 宿主把 ~/.dsh/settings.yaml 改名为 settings.yaml.imported，内容迁往
-        // profile 层 cordis.patch.yml。但 importLegacyDocument 要求 schema 有
-        // volatile 字段，本插件此前未声明 → grafana 段导入直接抛错被 warn 吞掉，
-        // 配置只留在 .imported 文件里。volatile 声明后宿主不会重跑导入
-        // （importLegacyDocument 只执行一次），需要插件启动时自查：
-        // settings value 无 sources 且 legacy 字段也无值
-        // → 读 ~/.dsh/settings.yaml.imported 的 grafana 段 → 校验 → 一次性写入新存储。
-        // 文件不存在或解析失败静默跳过；写入成功后不删除 .imported（宿主管理的文件）。
+      // ── 步骤 3：0.1.7 .imported 文件迁移 ──────────────────────────
+      // 宿主把 ~/.dsh/settings.yaml 改名为 settings.yaml.imported，内容迁往
+      // profile 层 cordis.patch.yml。但 importLegacyDocument 要求 schema 有
+      // volatile 字段，本插件此前未声明 → grafana 段导入直接抛错被 warn 吞掉，
+      // 配置只留在 .imported 文件里。volatile 声明后宿主不会重跑导入
+      // （importLegacyDocument 只执行一次），需要插件启动时自查：
+      // settings value 无 sources 且 legacy 字段也无值
+      // → 读 ~/.dsh/settings.yaml.imported 的 grafana 段 → 校验 → 一次性写入新存储。
+      // 文件不存在或解析失败静默跳过；写入成功后不删除 .imported（宿主管理的文件）。
+      try {
         const currentAfterMigration = unwrapVolatile(scope.get())
         const hasSourcesAfterMigration = Array.isArray(currentAfterMigration?.sources) && currentAfterMigration.sources.length > 0
         const hasLegacyUrlAfterMigration = typeof currentAfterMigration?.baseUrl === 'string' && currentAfterMigration.baseUrl.trim()
@@ -378,7 +391,7 @@ export function apply(ctx, config = {}) {
             Number.isInteger(descriptorForImport?.revision) ? descriptorForImport.revision : undefined,
           )
         }
-      } catch { /* 迁移失败不阻断插件加载，下次仍可重试。 */ }
+      } catch { /* .imported 迁移失败不阻断插件加载，下次仍可重试。 */ }
     })()
   })
 
@@ -466,6 +479,7 @@ export const internals = Object.freeze({
   interpolateVariables,
   normalizeBaseUrl,
   parseDashboardUrl,
+  parseGrafanaSectionSimple,
   parseUid,
   readLimitedText,
   redactSecrets,
