@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createRequire } from 'node:module'
 
-import { apply, Config, internals, SETTINGS_NAMESPACE } from '../index.js'
+import { apply, Config, internals, SETTINGS_NAMESPACE, unwrapVolatile } from '../index.js'
 import {
   ALERT_TOOL_TIMEOUT_MS,
   METRIC_REQUEST_TIMEOUT_MS,
@@ -1647,7 +1648,8 @@ test('apply migrates a legacy credential-stored URL into the settings namespace 
   await new Promise((resolve) => setImmediate(resolve))
 
   // URL 已搬到 settings namespace，凭证条目已清空。
-  assert.equal(scope.get().baseUrl, 'https://grafana.legacy.example.com')
+  // volatile 字段在 schema 解析后是 Volatile 引用，用 unwrapVolatile 拆包后断言。
+  assert.equal(unwrapVolatile(scope.get()).baseUrl, 'https://grafana.legacy.example.com')
   assert.equal(creds.GRAFANA_BASE_URL, undefined)
 
   // 迁移后 resolveBaseUrl 从 settings 解析（settings 优先，凭证兜底已空）。
@@ -3109,6 +3111,8 @@ test('internals exports the stable debug surface across the lib/ split', () => {
     'safeApiErrorDetail',
     'summarizeFrames',
     'translateApiFailure',
+    'unwrapVolatile',
+    'validateConfig',
   ])
   for (const key of Object.keys(internals)) {
     assert.equal(typeof internals[key], 'function', `internals.${key} must stay a function`)
@@ -3258,7 +3262,7 @@ test('apply migrates legacy single-source config into a materialized default sou
   const [{ scope }] = registrations
   // 迁移 IIFE 是 fire-and-forget，flush 一次宏任务让其全部微任务跑完。
   await new Promise((resolve) => setImmediate(resolve))
-  const cfg = scope.get()
+  const cfg = unwrapVolatile(scope.get())
   assert.equal(Array.isArray(cfg.sources), true)
   assert.equal(cfg.sources.length, 1)
   const src = cfg.sources[0]
@@ -3334,7 +3338,7 @@ test('startup migration yields to a concurrent user save instead of overwriting 
   releaseToken()
   await new Promise((resolve) => setImmediate(resolve))
 
-  const cfg = scope.get()
+  const cfg = unwrapVolatile(scope.get())
   assert.equal(cfg.sources.length, 1)
   assert.equal(cfg.sources[0].id, 'user-1', 'the user save must survive the racing migration')
   assert.equal(cfg.sources[0].name, 'mine')
@@ -3349,10 +3353,127 @@ test('startup migration keeps a custom legacy tokenRef instead of resetting it',
   })
   const [{ scope }] = registrations
   await new Promise((resolve) => setImmediate(resolve))
-  const [source] = scope.get().sources
+  const [source] = unwrapVolatile(scope.get()).sources
   assert.equal(source.tokenRef, 'CUSTOM_GRAFANA_TOKEN')
   // 原凭证原样留着，没有被搬走也没有被清掉。
   assert.equal(creds.CUSTOM_GRAFANA_TOKEN, 'custom-token')
+})
+
+// 0.1.7 volatile 机制：Config schema 的字段标了 .volatile() 后，schemastery 解析
+// 把每个字段值包成 Volatile<T> 引用。unwrapVolatile 递归拆包，使既有代码拿到普通值。
+test('unwrapVolatile unwraps Volatile references from schema-parsed Config', () => {
+  // 非 volatile 值原样返回
+  assert.equal(unwrapVolatile('hello'), 'hello')
+  assert.equal(unwrapVolatile(42), 42)
+  assert.equal(unwrapVolatile(null), null)
+  assert.equal(unwrapVolatile(undefined), undefined)
+  assert.deepEqual(unwrapVolatile({ a: 1, b: 'x' }), { a: 1, b: 'x' })
+  assert.deepEqual(unwrapVolatile([1, 2, 3]), [1, 2, 3])
+
+  // 模拟 schemastery 的 volatile 包装：用 cosmokit 的 createVolatile 创建引用
+  const require = createRequire(import.meta.url)
+  const { createVolatile } = require('@deepseek-ai/cosmokit')
+  const wrapped = {
+    sources: createVolatile([{ id: 'src-1', name: 'prod' }]),
+    baseUrl: createVolatile('https://grafana.example.com'),
+    readOnly: createVolatile(false),
+  }
+  const unwrapped = unwrapVolatile(wrapped)
+  assert.deepEqual(unwrapped.sources, [{ id: 'src-1', name: 'prod' }])
+  assert.equal(unwrapped.baseUrl, 'https://grafana.example.com')
+  assert.equal(unwrapped.readOnly, false)
+})
+
+// 0.1.7 .imported 文件迁移：当 settings 无 sources 且 legacy 字段为空时，
+// 插件从 ~/.dsh/settings.yaml.imported 的 grafana 段恢复配置。
+// 测试通过创建临时目录和真实文件来隔离真实文件系统。
+test('imported file migration restores sources from settings.yaml.imported', async () => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+
+  // 创建临时 HOME 目录与 .dsh 子目录
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-grafana-test-'))
+  fs.mkdirSync(path.join(tmpHome, '.dsh'), { recursive: true })
+  const importedPath = path.join(tmpHome, '.dsh', 'settings.yaml.imported')
+  fs.writeFileSync(importedPath, [
+    'ui-onboarding:',
+    '  welcomeNoticeVersion: 1',
+    'grafana:',
+    '  baseUrl: https://grafana.restored.example.com',
+    '  defaultSource: src-aaa',
+    '  sources:',
+    '    - id: src-aaa',
+    '      name: restored-default',
+    '      baseUrl: https://grafana.restored.example.com',
+    '      tokenRef: GRAFANA_TOKEN',
+    '    - id: src-bbb',
+    '      name: restored-local',
+    '      baseUrl: http://localhost:3000',
+    '      tokenRef: GRAFANA_TOKEN_srcbbb',
+    '  readOnly: false',
+    'agent-default-model:',
+    '  provider: test',
+  ].join('\n'), 'utf8')
+
+  const tools = []
+  const listeners = new Map()
+  let section = {}
+  let revision = 0
+  const registrations = []
+  const settingsService = {
+    register(ns, schema, options = {}) {
+      const scope = {
+        get: () => schema({ ...options.base, ...section }),
+        async update(patch) { await settingsService.update(ns, patch) },
+        async mutate() {},
+      }
+      options.validate?.(scope.get())
+      registrations.push({ ns, options, scope })
+      return scope
+    },
+    describe() { return registrations.map(({ ns, scope }) => ({ ns, revision, value: scope.get() })) },
+    async update(ns, patch, expectedRevision) {
+      if (expectedRevision !== undefined && expectedRevision !== revision) {
+        throw new Error(`settings namespace "${ns}" changed since it was read`)
+      }
+      revision += 1
+      section = { ...section, ...patch }
+    },
+  }
+  const ctx = {
+    credentials: {
+      async resolve() { return undefined },
+      async unset() {},
+    },
+    inject(services, callback) {
+      if (!services.includes('settings')) return
+      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
+    },
+    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
+    systemPrompt: { section() {} },
+    tools: { register(tool) { tools.push(tool); return () => {} } },
+  }
+
+  const originalHome = process.env.HOME
+  process.env.HOME = tmpHome
+
+  try {
+    apply(ctx, {})
+    await new Promise((resolve) => setImmediate(resolve))
+    const [{ scope }] = registrations
+    const cfg = unwrapVolatile(scope.get())
+    assert.equal(cfg.sources.length, 2)
+    assert.equal(cfg.sources[0].id, 'src-aaa')
+    assert.equal(cfg.sources[0].name, 'restored-default')
+    assert.equal(cfg.sources[0].baseUrl, 'https://grafana.restored.example.com')
+    assert.equal(cfg.sources[1].id, 'src-bbb')
+    assert.equal(cfg.sources[1].name, 'restored-local')
+    assert.equal(cfg.defaultSource, 'src-aaa')
+  } finally {
+    process.env.HOME = originalHome
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
 })
 
 // ── 写入目标绑定：审批的是哪一台就只能写哪一台 ────────────────────────────────
