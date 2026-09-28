@@ -23,6 +23,9 @@ set -Eeuo pipefail
 # 全局配置
 ######################################
 RELEASE_BRANCH="${RELEASE_BRANCH:-main}"
+# 发布相关写操作与凭证校验一律走官方 registry，不受本机 .npmrc 镜像源影响
+# （本机可能为加速下载将 registry 指向国内只读镜像，但 publish/whoami/view 必须打到官方源）
+NPM_REGISTRY="https://registry.npmjs.org"
 NPM_CACHE="${TMPDIR:-/tmp}/dsh-grafana-deploy-npm-cache"
 NPM_PKG="$(node -p 'require("./package.json").name')"
 VERSION="$(node -p 'require("./package.json").version')"
@@ -68,7 +71,7 @@ guard_tag() {
 guard_credentials() {
   need_cmd gh npm
   gh auth status >/dev/null 2>&1 || die "未登录 GitHub CLI，请先执行 gh auth login"
-  npm whoami >/dev/null 2>&1 || die "未登录 npm，请先执行 npm login（账号需为写操作开启2FA）"
+  npm --registry "$NPM_REGISTRY" whoami >/dev/null 2>&1 || die "未登录 npm，请先执行 npm login（账号需为写操作开启2FA）"
 }
 
 verify_and_install() {
@@ -225,7 +228,7 @@ cmd_publish() {
 
   # npm 版本不可变：已发布过的版本直接跳过 npm 步骤，保证失败后可安全重跑
   local npm_done="false"
-  if npm view "${NPM_PKG}@${VERSION}" version >/dev/null 2>&1; then
+  if npm --registry "$NPM_REGISTRY" view "${NPM_PKG}@${VERSION}" version >/dev/null 2>&1; then
     npm_done="true"
     printf '>> npm 上已存在 %s@%s，本次仅创建 GitHub Release\n' "$NPM_PKG" "$VERSION"
   fi
@@ -243,7 +246,7 @@ cmd_publish() {
   # 先发 npm（不可变），再建 GitHub Release：任一步失败后重跑都不会重复发布
   if [[ "$npm_done" == "false" ]]; then
     printf '>> 发布 %s 到 npm（开启写操作2FA时会交互提示输入OTP）\n' "$(basename "$asset")"
-    npm --cache "$NPM_CACHE" publish "$asset" --access public --ignore-scripts ${NPM_OTP:+--otp="$NPM_OTP"}
+    npm --cache "$NPM_CACHE" --registry "$NPM_REGISTRY" publish "$asset" --access public --ignore-scripts ${NPM_OTP:+--otp="$NPM_OTP"}
   fi
 
   printf '>> 创建 GitHub Release %s 并上传 %s\n' "$GIT_TAG" "$(basename "$asset")"
