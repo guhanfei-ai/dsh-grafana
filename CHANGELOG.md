@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Startup migration resolves the pre-upgrade settings file through `DSH_HOME` or the platform home, restores imported multi-source configuration before considering legacy single-source credentials, and repairs an invalid imported default-source reference. Each migration step emits a bounded, redacted diagnostic without logging URLs, credential references, tokens, or source names.
+- Added repository-text and pre-publish archive checks for unexpected infrastructure identifiers. The optional `js-yaml` dependency makes the full YAML importer explicit; the restricted fallback remains available when it is absent. The READMEs now describe the `0.2.0-rc.2` compatibility baseline.
+
+## [0.17.0] - 2026-09-30
+
 ### Added
 
 - Compatibility with DeepSeek Harness `0.2.0` prereleases: the `@deepseek-ai/dsh-tools` peer range now includes `^0.2.0-alpha.0`, and development uses `dsh-tools@0.2.0-rc.2`. The host now skips plugins with incompatible peers rather than loading them with a warning; the previous range did not match the `[0,2,0]` prerelease tuple.

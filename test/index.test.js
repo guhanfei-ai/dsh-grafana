@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createRequire } from 'node:module'
+import { homedir, tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
-import { apply, Config, internals, SETTINGS_NAMESPACE, unwrapVolatile } from '../index.js'
+import { apply, Config, importedSettingsPath, internals, SETTINGS_NAMESPACE, unwrapVolatile } from '../index.js'
 import {
   ALERT_TOOL_TIMEOUT_MS,
   METRIC_REQUEST_TIMEOUT_MS,
@@ -1538,7 +1540,7 @@ test('grafana_status reports the database field from the real /api/health shape'
   }
 })
 
-function createSettingsContext(userSection = {}, credentialState = {}) {
+function createSettingsContext(userSection = {}, credentialState = {}, { importedHome } = {}) {
   const tools = []
   let section = { ...userSection }
   // 与宿主 dsh-settings 一致的乐观并发语义：每次落地写前进 revision，
@@ -1580,9 +1582,29 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
       register(tool) { tools.push(tool); return () => {} },
     },
   }
-  apply(ctx, {})
+  // 大多数用例不应读到开发机的 .imported 文件；仅显式的迁移用例指定目录。
+  const previousHome = process.env.DSH_HOME
+  if (importedHome === null) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = importedHome ?? join(tmpdir(), `dsh-grafana-test-empty-${process.pid}`)
+  try {
+    apply(ctx, {})
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
   return { settingsService, getConfig: () => unwrapVolatile(Config(section)), tools, creds, listeners }
 }
+
+test('importedSettingsPath follows DSH_HOME before the platform home', () => {
+  const home = join(tmpdir(), 'example-home')
+  const override = join(tmpdir(), 'example-dsh-home')
+  assert.equal(importedSettingsPath({ DSH_HOME: override, HOME: home }, home), join(override, 'settings.yaml.imported'))
+  assert.equal(importedSettingsPath({ DSH_HOME: override }, home), join(override, 'settings.yaml.imported'))
+  assert.equal(importedSettingsPath({ DSH_HOME: '   ' }, home), join(home, '.dsh', 'settings.yaml.imported'))
+  assert.equal(importedSettingsPath({}, home), join(home, '.dsh', 'settings.yaml.imported'))
+  assert.equal(importedSettingsPath({ DSH_HOME: '~/custom-dsh' }, home), join(home, 'custom-dsh', 'settings.yaml.imported'))
+  assert.equal(importedSettingsPath({}, homedir()), join(resolve(homedir(), '.dsh'), 'settings.yaml.imported'))
+})
 
 test('apply reads the declarative grafana settings namespace without register', async () => {
   const { settingsService, getConfig, tools } = createSettingsContext()
@@ -1599,6 +1621,9 @@ test('apply reads the declarative grafana settings namespace without register', 
       { id: 'id-2', name: 'prod', baseUrl: '', tokenRef: '' },
     ],
   }), /Duplicate Grafana source name/)
+  assert.throws(() => internals.validateConfig({
+    ...getConfig(), sources: [{ id: 'id-1', name: 'prod' }], defaultSource: 'missing-id',
+  }), /default source must refer/)
 
   // 用户设置层的值优先于组合层 base，健康检查按其解析 base URL。
   await settingsService.update(SETTINGS_NAMESPACE, { baseUrl: 'https://grafana.example.com' })
@@ -2377,7 +2402,7 @@ test('grafana_panel_query adhoc sql: conditions replace the ${__adhoc} placehold
         name: 'Filters',
         type: 'adhoc',
         // 未绑定 → 通配所有数据源（含 MySQL 面板）。
-        current: { value: [{ key: 'host', operator: '=', value: "www.exam'ple.com" }] },
+        current: { value: [{ key: 'host', operator: '=', value: "www.example.com'OR" }] },
       }],
     },
     panels: [
@@ -2408,12 +2433,12 @@ test('grafana_panel_query adhoc sql: conditions replace the ${__adhoc} placehold
     // = 映射为带转义的字符串字面量；${__adhoc} 与 $__adhoc 两种占位符都替换。
     await tool.execute({
       urlOrUid: 'abc123',
-      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=', value: "www.exam'ple.com" }] }),
+      variables: JSON.stringify({ Filters: [{ key: 'host', operator: '=', value: "www.example.com'OR" }] }),
     }, execution())
     const body = queryBodies[0]
     // 值内单引号翻倍转义，防注入。
-    assert.equal(body.queries.find((query) => query.refId === 'A').rawSql, "SELECT * FROM logs WHERE host = 'www.exam''ple.com' AND level > 1")
-    assert.equal(body.queries.find((query) => query.refId === 'B').rawSql, "SELECT count(*) FROM t WHERE host = 'www.exam''ple.com'")
+    assert.equal(body.queries.find((query) => query.refId === 'A').rawSql, "SELECT * FROM logs WHERE host = 'www.example.com''OR' AND level > 1")
+    assert.equal(body.queries.find((query) => query.refId === 'B').rawSql, "SELECT count(*) FROM t WHERE host = 'www.example.com''OR'")
 
     // != → <>；=~ → LIKE；> 数字 → 裸数字比较。
     queryBodies.length = 0
@@ -3389,7 +3414,7 @@ test('imported file migration restores sources from settings.yaml.imported', asy
   process.env.HOME = tmpHome
 
   try {
-    const { getConfig } = createSettingsContext()
+    const { getConfig } = createSettingsContext({}, {}, { importedHome: null })
     await new Promise((resolve) => setImmediate(resolve))
     const cfg = getConfig()
     assert.equal(cfg.sources.length, 2)
@@ -3404,6 +3429,200 @@ test('imported file migration restores sources from settings.yaml.imported', asy
   } finally {
     process.env.HOME = originalHome
     fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('imported multi-source configuration wins over legacy URL and token credentials', async () => {
+  const fs = await import('node:fs')
+  const tmpHome = fs.mkdtempSync(join(tmpdir(), 'dsh-grafana-import-'))
+  fs.writeFileSync(join(tmpHome, 'settings.yaml.imported'), [
+    'grafana:',
+    '  defaultSource: missing-id',
+    '  sources:',
+    '    - id: src-first',
+    '      name: first',
+    '      baseUrl: https://first.example.com',
+    '      tokenRef: GRAFANA_TOKEN_first',
+    '    - id: src-second',
+    '      name: second',
+    '      baseUrl: https://second.example.com',
+    '      tokenRef: GRAFANA_TOKEN_second',
+  ].join('\n'))
+  const originalLog = console.error
+  const logs = []
+  console.error = (line) => logs.push(line)
+  try {
+    const { getConfig, creds } = createSettingsContext({}, {
+      GRAFANA_BASE_URL: 'https://legacy.example.com',
+      GRAFANA_TOKEN: 'legacy-token',
+    }, { importedHome: tmpHome })
+    await new Promise((resolve) => setImmediate(resolve))
+    const cfg = getConfig()
+    assert.deepEqual(cfg.sources.map((source) => source.id), ['src-first', 'src-second'])
+    assert.equal(cfg.defaultSource, 'src-first', 'an unknown imported default must fall back to the first source')
+    assert.equal(creds.GRAFANA_BASE_URL, 'https://legacy.example.com', 'unused legacy credentials remain untouched')
+    assert.ok(logs.some((line) => line.includes('step3 imported sources=2 default=fallback')))
+    assert.ok(logs.some((line) => line.includes('step2 skipped reason=imported-sources')))
+    assert.ok(logs.every((line) => !line.includes('legacy.example.com') && !line.includes('GRAFANA_TOKEN_first')))
+  } finally {
+    console.error = originalLog
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('imported sources yield to a concurrent user save instead of replacing it', async () => {
+  const fs = await import('node:fs')
+  const tmpHome = fs.mkdtempSync(join(tmpdir(), 'dsh-grafana-import-'))
+  fs.writeFileSync(join(tmpHome, 'settings.yaml.imported'), [
+    'grafana:',
+    '  sources:',
+    '    - id: imported',
+    '      name: imported',
+    '      baseUrl: https://imported.example.com',
+  ].join('\n'))
+  let section = {}
+  let revision = 0
+  let releaseWrite
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve })
+  const writes = []
+  const settings = {
+    describe() { return [{ ns: SETTINGS_NAMESPACE, value: Config(section), revision }] },
+    async update(ns, patch, expectedRevision) {
+      writes.push({ ns, expectedRevision })
+      await writeGate
+      if (expectedRevision !== revision) throw new Error('settings revision changed since it was read')
+      section = { ...section, ...patch }
+      revision++
+    },
+  }
+  const ctx = {
+    credentials: { async resolve() { return undefined }, async unset() {} },
+    inject(services, callback) {
+      if (services.includes('settings')) callback({ settings, credentials: ctx.credentials, effect(setup) { setup() } })
+    },
+    on() {},
+    systemPrompt: { section() {} },
+    tools: { register() {} },
+  }
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = tmpHome
+  try {
+    apply(ctx, {})
+    assert.deepEqual(writes, [{ ns: SETTINGS_NAMESPACE, expectedRevision: 0 }])
+    section = { sources: [{ id: 'user', name: 'mine', baseUrl: 'https://mine.example.com', tokenRef: 'GRAFANA_TOKEN_user' }], defaultSource: 'user' }
+    revision = 1
+    releaseWrite()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(section.sources[0].id, 'user')
+    assert.equal(writes.length, 1, 'legacy migration must not retry after an imported-source conflict')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('DSH_HOME imports sources even when HOME is absent', async () => {
+  const fs = await import('node:fs')
+  const tmpHome = fs.mkdtempSync(join(tmpdir(), 'dsh-grafana-import-'))
+  fs.writeFileSync(join(tmpHome, 'settings.yaml.imported'), [
+    'grafana:',
+    '  defaultSource: main',
+    '  sources:',
+    '    - id: main',
+    '      name: main',
+    '      baseUrl: https://grafana.example.com',
+  ].join('\n'))
+  const previousHome = process.env.HOME
+  delete process.env.HOME
+  try {
+    const { getConfig } = createSettingsContext({}, {}, { importedHome: tmpHome })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(getConfig().sources[0].baseUrl, 'https://grafana.example.com')
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME
+    else process.env.HOME = previousHome
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('legacy register scope can migrate a credential URL without settings.update', async () => {
+  let section = {}
+  const writes = []
+  const settings = {
+    register(ns, schema, { base, validate }) {
+      assert.equal(ns, SETTINGS_NAMESPACE)
+      const scope = {
+        get: () => schema({ ...base, ...section }),
+        async update(patch) {
+          validate({ ...unwrapVolatile(scope.get()), ...patch })
+          section = { ...section, ...patch }
+          writes.push(patch)
+        },
+      }
+      return scope
+    },
+  }
+  const creds = { GRAFANA_BASE_URL: 'https://legacy.example.com', GRAFANA_TOKEN: 'legacy-token' }
+  const ctx = {
+    credentials: {
+      async resolve(ref) { return creds[ref] ? { value: creds[ref] } : undefined },
+      async unset(ref) { delete creds[ref] },
+    },
+    inject(services, callback) {
+      if (services.includes('settings')) callback({ settings, credentials: ctx.credentials, effect(setup) { setup() } })
+    },
+    on() {},
+    systemPrompt: { section() {} },
+    tools: { register() {} },
+  }
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(tmpdir(), `dsh-grafana-test-empty-${process.pid}`)
+  try {
+    apply(ctx, {})
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(writes[0], { baseUrl: 'https://legacy.example.com' })
+    assert.equal(writes[1].sources[0].tokenRef, 'GRAFANA_TOKEN')
+    assert.equal(section.defaultSource, section.sources[0].id)
+    assert.equal(creds.GRAFANA_BASE_URL, undefined)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('missing settings.update reports a safe diagnostic instead of a bare TypeError or secret', async () => {
+  const logs = []
+  const originalLog = console.error
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(tmpdir(), `dsh-grafana-test-empty-${process.pid}`)
+  console.error = (line) => logs.push(line)
+  const ctx = {
+    credentials: {
+      async resolve(ref) {
+        if (ref === 'GRAFANA_BASE_URL') return { value: 'https://legacy.example.com' }
+        if (ref === 'GRAFANA_TOKEN') return { value: 'example-token' }
+        return undefined
+      },
+    },
+    inject(services, callback) {
+      if (services.includes('settings')) callback({
+        credentials: ctx.credentials, settings: { describe: () => [{ ns: SETTINGS_NAMESPACE, revision: 0, value: Config({}) }] },
+        effect(setup) { setup() },
+      })
+    },
+    on() {}, systemPrompt: { section() {} }, tools: { register() {} },
+  }
+  try {
+    apply(ctx, {})
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.ok(logs.some((line) => line.includes('step1 failed reason=settings-error')))
+    assert.ok(logs.some((line) => line.includes('step2 failed reason=settings-error')))
+    assert.ok(logs.every((line) => !line.includes('legacy.example.com') && !line.includes('example-token') && !line.includes('GRAFANA_TOKEN')))
+  } finally {
+    console.error = originalLog
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
   }
 })
 

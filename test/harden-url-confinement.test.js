@@ -36,9 +36,9 @@ test('C4 absolute cross-origin URL is omitted', () => {
   assert.equal(resolveDashboardUrl('https://grafana.example.com', 'https://evil.example.com/d/abc'), null)
 })
 
-// C5 — hostname 前缀伪装（grafana.example.com.evil.com）必须被 origin 比较拒绝。
+// C5 — hostname 前缀伪装（grafana.example.com.evil.invalid）必须被 origin 比较拒绝。
 test('C5 hostname-prefix trick does not bypass the origin check', () => {
-  assert.equal(resolveDashboardUrl('https://grafana.example.com', 'https://grafana.example.com.evil.com/d/abc'), null)
+  assert.equal(resolveDashboardUrl('https://grafana.example.com', 'https://grafana.example.com.evil.invalid/d/abc'), null)
 })
 
 // C6 — 自定义端口构成不同 origin。

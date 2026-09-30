@@ -24,7 +24,7 @@ A DeepSeek Harness plugin for agent-native Grafana observability — dashboards,
 | Component | Supported baseline |
 | --- | --- |
 | Node.js | 20.11 or newer |
-| DeepSeek Harness | `0.1.0-rc.6` through `0.1.3` prereleases (verified: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.3-alpha.2`) |
+| DeepSeek Harness | Prerelease peers from `0.1.0-rc.6` through `0.2.0-rc.2` (verified baselines: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.7-rc.2`, `0.2.0-rc.2`; prerelease matching depends on the supported version tuple) |
 | Grafana | Legacy Dashboard HTTP API as documented for Grafana 10/11 |
 
 Grafana 12 introduced a new dashboard API. The legacy endpoints used by this plugin may remain available, but Grafana 12+ is not part of the certified matrix yet.
@@ -69,13 +69,13 @@ The old names stay registered as error-only stubs: calling `grafana_query` or `g
 
 **The browser settings card requires DSH 0.1.2 or newer.** On older hosts (0.1.0–0.1.1) the card shows an explicit "host too old" notice instead of the source list — that is a version gate, not lost configuration. All host-side tools keep working on those hosts, and the plugin still installs on `0.1.0-rc.6` and newer.
 
-**Configuration migrates automatically.** A single-source configuration from earlier versions is materialized into a named `default` source on startup (same base URL, same stored token). No manual step is required, and the migration never overwrites a configuration you saved while it was running.
+**Configuration migrates automatically.** Existing named sources in the pre-upgrade `settings.yaml.imported` take priority over a legacy single-source credential; otherwise a single-source configuration is materialized as a named `default` source (same base URL, same stored token). The importer reads `$DSH_HOME/settings.yaml.imported`, or `~/.dsh/settings.yaml.imported` when `DSH_HOME` is unset. The optional `js-yaml` dependency handles full YAML; if unavailable, a built-in parser handles the known Grafana section shape. Migration does not overwrite a configuration saved concurrently.
 
 ## Configuration
 
 In DSH Web, open **Settings → Plugins → Grafana assistant**.
 
-> Note: the settings page dispatches plugin cards by the settings namespace registered on the Host (`grafana`). The served-namespace list is re-read only on settings-document commits or connection resets, so if the card does not appear right after upgrading the plugin, refresh the page (or reconnect the Web UI).
+> Note: the settings page dispatches plugin cards by the Host settings namespace (`grafana`). The served-namespace list is re-read only on settings-document commits or connection resets, so if the card does not appear right after upgrading the plugin, refresh the page (or reconnect the Web UI).
 
 Configure:
 

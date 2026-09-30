@@ -2,7 +2,10 @@
 // 装配入口：插件元信息、系统提示、配置 schema 与 apply() 装配（settings 接入、
 // 凭证迁移、审批门、工具注册）；实现拆分在 lib/ 下按层组织。
 import Schema from '@deepseek-ai/schemastery'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { approvalReason, approvalUid, cloneApprovalReason } from './lib/approval.js'
 import { createBudget } from './lib/budget.js'
@@ -17,7 +20,7 @@ import { defineGrafanaPanelQueryTool, defineGrafanaQueryAliasTool } from './lib/
 import { defineGrafanaHealthAliasTool, defineGrafanaSearchTool, defineGrafanaSourcesTool, defineGrafanaStatusTool } from './lib/tools/misc.js'
 import { defineGrafanaCompareTool } from './lib/tools/compare.js'
 import { defineGrafanaDatasourcesTool, defineGrafanaMetricTool, defineGrafanaTrendTool } from './lib/tools/metrics.js'
-import { generateSourceId, normalizeBaseUrl, normalizeSourceName, parseUid, readLimitedText, redactSecrets, safeApiErrorDetail, tokenRefForId, validateCredentialRef } from './lib/util.js'
+import { generateSourceId, normalizeBaseUrl, normalizeSourceName, oneLine, parseUid, readLimitedText, redactSecrets, safeApiErrorDetail, tokenRefForId, validateCredentialRef } from './lib/util.js'
 
 export const name = 'grafana'
 export const inject = ['tools', 'systemPrompt', 'credentials']
@@ -85,10 +88,17 @@ export function unwrapVolatile(value) {
   return value
 }
 
-// 解析 ~/.dsh/settings.yaml.imported 的 grafana 段。
-// js-yaml 不在本插件的 dependencies 中，但宿主环境通常安装了它（dsh 自身依赖）。
-// 用 createRequire 从本文件路径出发尝试加载，失败则放弃迁移（静默）。
-// 只提取 grafana 顶层 key 下的内容，不需要完整 YAML 解析。
+// 宿主解析目录优先使用 DSH_HOME，空白覆盖视为未设；否则由 os.homedir()
+// 按所在系统解析默认用户目录，不依赖 Windows 上可能不存在的 HOME。
+export function importedSettingsPath(env = process.env, home = homedir()) {
+  const override = env.DSH_HOME?.trim()
+  const expanded = override === '~' ? home
+    : override?.startsWith('~/') || override?.startsWith('~\\') ? join(home, override.slice(2))
+      : override || join(home, '.dsh')
+  return join(resolve(expanded), 'settings.yaml.imported')
+}
+
+// js-yaml 是可选依赖：缺失时使用只处理已知 grafana 段形状的简易解析器。
 function parseImportedYaml(text) {
   try {
     const yaml = require('js-yaml')
@@ -228,7 +238,25 @@ function validateConfig(value) {
     names.add(name)
     if (source?.tokenRef) validateCredentialRef(source.tokenRef)
   }
+  if (sources.length && v.defaultSource && !sources.some((source) => source.id === v.defaultSource)) {
+    throw new Error('Grafana default source must refer to a configured source.')
+  }
   return v
+}
+
+// 启动迁移需要留痕，但宿主错误信息可能含 URL、凭证引用或源站名称；只将
+// oneLine + redactSecrets 清洗后的消息归类，绝不把原文或配置值写入 stderr。
+function migrationFailure(step, error) {
+  const message = oneLine(redactSecrets(error?.message ?? String(error)), 180)
+  const reason = /conflict|revision|changed since/i.test(message) ? 'revision-conflict'
+    : /invalid|duplicate|too many|must refer/i.test(message) ? 'invalid-config'
+      : /ENOENT|EACCES|EPERM|read/i.test(message) ? 'read-error'
+        : 'settings-error'
+  console.error(`[grafana-migrate] ${step} failed reason=${reason}`)
+}
+
+function migrationStatus(step, status) {
+  console.error(`[grafana-migrate] ${step} ${status}`)
 }
 
 export function apply(ctx, config = {}) {
@@ -256,25 +284,81 @@ export function apply(ctx, config = {}) {
     const updateConfig = (patch, descriptor) => {
       validateConfig({ ...currentConfig(descriptor), ...patch })
       const revision = Number.isInteger(descriptor?.revision) ? descriptor.revision : undefined
-      return typeof settings.update === 'function'
-        ? settings.update(SETTINGS_NAMESPACE, patch, revision)
-        : scope.update(patch)
+      if (typeof settings.update === 'function') return settings.update(SETTINGS_NAMESPACE, patch, revision)
+      if (typeof scope?.update === 'function') return scope.update(patch)
+      throw new Error('Settings service does not support update or legacy scope.update.')
     }
     activeConfig = () => currentConfig()
     sctx.effect(() => () => {
       activeConfig = () => unwrapVolatile(entryConfig)
     })
 
-    // 一次性迁移（按顺序执行三步，确保后一步看到前一步的结果）：
-    // 1. URL 从凭证库搬到 settings namespace（早期版本错误地把 URL 存进了凭证库）
-    // 2. sources 物化：sources 为空但有 legacy 配置时，物化出一个默认源站
-    // 3. 0.1.7 .imported 文件迁移：宿主升级后 settings.yaml 被改名、legacy 导入
-    //    因 volatile 缺失而失败，配置滞留在 .imported 文件里，需插件自行恢复
-    // 三步都失败静默兜底，不阻断插件加载。
+    // 优先恢复 .imported 的原始多源配置；仅在缺少有效 sources 时才从 legacy
+    // 单源凭证推断配置。三步独立报状态/失败但不阻断插件加载；静默 catch 会让
+    // 真机验收无法区分「没执行」「读错目录」与「revision 冲突」。
     ;(async () => {
-      // 三步各自独立 try/catch：任一步抛异常不阻断后续。
-      // 原来共享一个 try/catch，步骤 1 若在真机上因凭证服务行为差异抛出，
-      // 步骤 2/3 静默跳过——.imported 文件迁移就不跑了。
+      // ── 步骤 3：优先恢复 0.1.7 升级前的原始多源配置 ──────────────────
+      let importedSection = null
+      let importStatus = 'skipped reason=no-imported-file'
+      let importedHasSources = false
+      try {
+        const descriptor = descriptorOf()
+        if (currentConfig(descriptor).sources?.length) {
+          importStatus = 'skipped reason=configured-sources'
+        } else {
+          let raw
+          try {
+            raw = readFileSync(importedSettingsPath(), 'utf8')
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error
+          }
+          if (raw !== undefined) {
+            importedSection = parseImportedYaml(raw)?.grafana
+            if (!importedSection || typeof importedSection !== 'object') {
+              importedSection = null
+              importStatus = 'skipped reason=no-grafana-section'
+            } else {
+              const importedSources = Array.isArray(importedSection.sources) ? importedSection.sources : []
+              const validSources = importedSources
+                .map((source) => {
+                  if (!source || typeof source !== 'object') return null
+                  const id = typeof source.id === 'string' ? source.id.trim() : ''
+                  const name = typeof source.name === 'string' ? source.name.trim() : ''
+                  if (!SOURCE_ID_PATTERN.test(id) || !name) return null
+                  return {
+                    id, name,
+                    baseUrl: typeof source.baseUrl === 'string' ? source.baseUrl : '',
+                    tokenRef: typeof source.tokenRef === 'string' && source.tokenRef ? source.tokenRef : tokenRefForId(id),
+                  }
+                })
+                .filter(Boolean)
+              if (validSources.length) {
+                importedHasSources = true
+                const requestedDefault = typeof importedSection.defaultSource === 'string' ? importedSection.defaultSource : ''
+                const validDefault = validSources.some((source) => source.id === requestedDefault)
+                const defaultSource = validDefault ? requestedDefault : validSources[0].id
+                await updateConfig({ sources: validSources, defaultSource }, descriptor)
+                migrationStatus('step3', `imported sources=${validSources.length} default=${validDefault ? 'ok' : 'fallback'}`)
+                migrationStatus('step1', 'skipped reason=imported-sources')
+                migrationStatus('step2', 'skipped reason=imported-sources')
+                return
+              }
+              importStatus = 'skipped reason=no-imported-sources'
+            }
+          }
+        }
+      } catch (error) {
+        migrationFailure('step3', error)
+        // 原始 sources 已存在却写入失败（包括并发冲突）时，不得以推断出的
+        // 单源配置再次写入，尤其不能覆盖刚刚保存的用户源站。
+        if (importedHasSources) {
+          migrationStatus('step1', 'skipped reason=import-failed')
+          migrationStatus('step2', 'skipped reason=import-failed')
+          return
+        }
+        importedSection = null
+        importStatus = null
+      }
 
       // ── 步骤 1：URL 从凭证库迁移到 settings ──────────────────────────
       let storedBaseUrl = null
@@ -284,8 +368,11 @@ export function apply(ctx, config = {}) {
         if (storedBaseUrl?.value && !currentConfig(descriptor).baseUrl) {
           await updateConfig({ baseUrl: storedBaseUrl.value }, descriptor)
           await sctx.credentials.unset(BASE_URL_REF)
+          migrationStatus('step1', 'url-moved')
+        } else {
+          migrationStatus('step1', `skipped reason=${storedBaseUrl?.value ? 'already-configured' : 'no-legacy-url'}`)
         }
-      } catch { /* 凭证服务不可用或写入失败，不阻断后续迁移。 */ }
+      } catch (error) { migrationFailure('step1', error) }
 
       // ── 步骤 2：sources 物化 ──────────────────────────────────────
       // sources 为空且存在可迁移的 legacy 配置（settings.baseUrl 或
@@ -315,83 +402,41 @@ export function apply(ctx, config = {}) {
               sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }],
               defaultSource: id,
             }, descriptor)
+            migrationStatus('step2', 'materialized sources=1')
+          } else {
+            migrationStatus('step2', 'skipped reason=no-legacy-config')
           }
+        } else {
+          migrationStatus('step2', 'skipped reason=configured-sources')
         }
-      } catch { /* sources 物化失败不阻断后续 .imported 迁移。 */ }
+      } catch (error) { migrationFailure('step2', error) }
 
-      // ── 步骤 3：0.1.7 .imported 文件迁移 ──────────────────────────
-      // 宿主把 ~/.dsh/settings.yaml 改名为 settings.yaml.imported，内容迁往
-      // profile 层 cordis.patch.yml。但 importLegacyDocument 要求 schema 有
-      // volatile 字段，本插件此前未声明 → grafana 段导入直接抛错被 warn 吞掉，
-      // 配置只留在 .imported 文件里。volatile 声明后宿主不会重跑导入
-      // （importLegacyDocument 只执行一次），需要插件启动时自查：
-      // settings value 无 sources 且 legacy 字段也无值
-      // → 读 ~/.dsh/settings.yaml.imported 的 grafana 段 → 校验 → 一次性写入新存储。
-      // 文件不存在或解析失败静默跳过；写入成功后不删除 .imported（宿主管理的文件）。
+      // .imported 仅存 legacy 单源配置时，仍保留旧版的最后兜底恢复路径。
+      if (!importedSection) {
+        if (importStatus) migrationStatus('step3', importStatus)
+        return
+      }
       try {
         const currentAfterMigration = currentConfig()
         const hasSourcesAfterMigration = Array.isArray(currentAfterMigration?.sources) && currentAfterMigration.sources.length > 0
         const hasLegacyUrlAfterMigration = typeof currentAfterMigration?.baseUrl === 'string' && currentAfterMigration.baseUrl.trim()
         if (!hasSourcesAfterMigration && !hasLegacyUrlAfterMigration) {
-          const importedPath = `${process.env.HOME || ''}/.dsh/settings.yaml.imported`
-          const { readFileSync } = await import('node:fs')
-          let raw
-          try {
-            raw = readFileSync(importedPath, 'utf8')
-          } catch { /* 文件不存在或不可读，静默跳过。 */ return }
-
-          const imported = parseImportedYaml(raw)
-          const grafanaSection = imported?.grafana
-          if (!grafanaSection || typeof grafanaSection !== 'object') return
-
-          const importedSources = Array.isArray(grafanaSection.sources) ? grafanaSection.sources : []
-          const validSources = importedSources
-            .map((s) => {
-              if (!s || typeof s !== 'object') return null
-              const id = typeof s.id === 'string' ? s.id.trim() : ''
-              const name = typeof s.name === 'string' ? s.name.trim() : ''
-              if (!id || !name) return null
-              if (!SOURCE_ID_PATTERN.test(id)) return null
-              return {
-                id,
-                name,
-                baseUrl: typeof s.baseUrl === 'string' ? s.baseUrl : '',
-                tokenRef: typeof s.tokenRef === 'string' && s.tokenRef ? s.tokenRef : undefined,
-              }
-            })
-            .filter(Boolean)
-
-          if (validSources.length === 0 && !grafanaSection.baseUrl && !grafanaSection.defaultSource) return
-
-          // 构造迁移载荷：有合法 sources 直接用；否则用 legacy baseUrl 物化默认源站。
-          let sourcesToWrite
-          let defaultToWrite
-          if (validSources.length > 0) {
-            sourcesToWrite = validSources.map((s) => ({
-              id: s.id,
-              name: s.name,
-              baseUrl: s.baseUrl,
-              tokenRef: s.tokenRef || tokenRefForId(s.id),
-            }))
-            defaultToWrite = typeof grafanaSection.defaultSource === 'string'
-              ? grafanaSection.defaultSource
-              : sourcesToWrite[0].id
-          } else {
-            const legacyUrl = typeof grafanaSection.baseUrl === 'string' ? grafanaSection.baseUrl.trim() : ''
-            const legacyTokenRef = typeof grafanaSection.tokenRef === 'string' && grafanaSection.tokenRef.trim()
-              ? grafanaSection.tokenRef.trim()
-              : TOKEN_REF
-            const tokenPresent = Boolean((await sctx.credentials.resolve(legacyTokenRef))?.value)
-            if (!legacyUrl && !tokenPresent) return
-            const id = generateSourceId()
-            sourcesToWrite = [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }]
-            defaultToWrite = id
-          }
-
+          const legacyUrl = typeof importedSection.baseUrl === 'string' ? importedSection.baseUrl.trim() : ''
+          const legacyTokenRef = typeof importedSection.tokenRef === 'string' && importedSection.tokenRef.trim()
+            ? importedSection.tokenRef.trim() : TOKEN_REF
           const descriptorForImport = descriptorOf()
-          await updateConfig({ sources: sourcesToWrite, defaultSource: defaultToWrite }, descriptorForImport)
+          const tokenPresent = Boolean((await sctx.credentials.resolve(legacyTokenRef))?.value)
+          if (!legacyUrl && !tokenPresent) {
+            migrationStatus('step3', importStatus)
+            return
+          }
+          const id = generateSourceId()
+          await updateConfig({ sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }], defaultSource: id }, descriptorForImport)
+          migrationStatus('step3', 'imported sources=1 default=ok')
+        } else {
+          migrationStatus('step3', 'skipped reason=legacy-config-present')
         }
-      } catch { /* .imported 迁移失败不阻断插件加载，下次仍可重试。 */ }
+      } catch (error) { migrationFailure('step3', error) }
     })()
   })
 

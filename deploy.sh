@@ -79,6 +79,11 @@ verify_and_install() {
   npm --cache "$NPM_CACHE" run verify
 }
 
+# 不执行 tar 解包到磁盘；扫描包内所有 UTF-8 文本成员，失败只报告成员:行号。
+check_archive() {
+  node scripts/identifier-check.js --archive "$1" || die '安装包标识检查未通过，停止分发'
+}
+
 ######################################
 # 帮助
 ######################################
@@ -204,6 +209,10 @@ cmd_build() {
   rm -rf dist
   mkdir -p dist
   npm --cache "$NPM_CACHE" pack --pack-destination dist --ignore-scripts
+  for asset in dist/*.tgz; do
+    [[ -f "$asset" ]] || die '缺少打包产物 dist/*.tgz'
+    check_archive "$asset"
+  done
 
   banner "打包完成：$GIT_TAG"
   ls -alh dist/*.tgz
@@ -216,7 +225,7 @@ cmd_build() {
 ######################################
 cmd_publish() {
   banner '开始分发'
-  need_cmd gh npm
+  need_cmd gh npm node
   guard_main
   guard_tag
   guard_credentials
@@ -242,6 +251,12 @@ cmd_publish() {
   else
     confirm "确认发布 ${NPM_PKG}@${VERSION} 到 npm，并创建 GitHub Release $GIT_TAG 上传同一产物？[y/N] " || { printf '已取消\n'; exit 0; }
   fi
+
+  # 确认后、第一次发布写操作前重新检查全部现存安装包。
+  for candidate in ./dist/*.tgz; do
+    [[ -f "$candidate" ]] || die '缺少打包产物 dist/*.tgz'
+    check_archive "$candidate"
+  done
 
   # 先发 npm（不可变），再建 GitHub Release：任一步失败后重跑都不会重复发布
   if [[ "$npm_done" == "false" ]]; then
