@@ -210,7 +210,7 @@ export const Config = Schema.object({
 })
 
 // 配置校验：legacy tokenRef 仍校验（向后兼容），再校验 sources——id 只读、
-// 名称必填且唯一、数量受限、每源站 tokenRef（若有）合法。settings.register 与入口配置共用。
+// 名称必填且唯一、数量受限、每源站 tokenRef（若有）合法。入口配置和迁移写入共用。
 // volatile 字段在 0.1.7 宿主上会被包成 Volatile 引用，先拆包再校验。
 function validateConfig(value) {
   const v = unwrapVolatile(value)
@@ -242,20 +242,27 @@ export function apply(ctx, config = {}) {
   }
   validateConfig(entryConfig)
 
-  // 当前生效配置：settings 服务可用时以 settings 命名空间的解析值为准
-  // （schema 默认值 → 组合层 base → 用户设置层），否则回退为入口配置。
-  // 与官方插件的 installSettingsSection 同一模式（见 packages/settings/settings）。
-  // 0.1.7 宿主把 volatile 字段包成 Volatile 引用，activeConfig 统一拆包后返回普通值，
-  // 使 runtime 层与全部既有代码不感知 volatile。
-  let activeConfig = () => entryConfig
+  // 0.1.7+ 的 loader 从平铺导出的 Config 发现 schema；settings 服务不再提供
+  // register/scope。describe 的 value 是宿主解析后的实时配置，入口值仅作尚未
+  // 出现在 describe 时的兜底；旧宿主仍按原有 register 路径建立 namespace。
+  let activeConfig = () => unwrapVolatile(entryConfig)
   ctx.inject(['settings'], (sctx) => {
-    const scope = sctx.settings.register(SETTINGS_NAMESPACE, Config, {
-      base: entryConfig,
-      validate: validateConfig,
-    })
-    activeConfig = () => unwrapVolatile(scope.get())
+    const settings = sctx.settings
+    const scope = typeof settings.register === 'function'
+      ? settings.register(SETTINGS_NAMESPACE, Config, { base: entryConfig, validate: validateConfig })
+      : null
+    const descriptorOf = () => settings.describe?.()?.find?.((entry) => entry?.ns === SETTINGS_NAMESPACE)
+    const currentConfig = (descriptor = scope ? undefined : descriptorOf()) => unwrapVolatile(scope?.get() ?? descriptor?.value ?? entryConfig)
+    const updateConfig = (patch, descriptor) => {
+      validateConfig({ ...currentConfig(descriptor), ...patch })
+      const revision = Number.isInteger(descriptor?.revision) ? descriptor.revision : undefined
+      return typeof settings.update === 'function'
+        ? settings.update(SETTINGS_NAMESPACE, patch, revision)
+        : scope.update(patch)
+    }
+    activeConfig = () => currentConfig()
     sctx.effect(() => () => {
-      activeConfig = () => entryConfig
+      activeConfig = () => unwrapVolatile(entryConfig)
     })
 
     // 一次性迁移（按顺序执行三步，确保后一步看到前一步的结果）：
@@ -273,8 +280,9 @@ export function apply(ctx, config = {}) {
       let storedBaseUrl = null
       try {
         storedBaseUrl = await sctx.credentials.resolve(BASE_URL_REF)
-        if (storedBaseUrl?.value && !unwrapVolatile(scope.get()).baseUrl) {
-          await scope.update({ baseUrl: storedBaseUrl.value })
+        const descriptor = descriptorOf()
+        if (storedBaseUrl?.value && !currentConfig(descriptor).baseUrl) {
+          await updateConfig({ baseUrl: storedBaseUrl.value }, descriptor)
           await sctx.credentials.unset(BASE_URL_REF)
         }
       } catch { /* 凭证服务不可用或写入失败，不阻断后续迁移。 */ }
@@ -289,8 +297,8 @@ export function apply(ctx, config = {}) {
       // 配置得以保留，而不是被物化的默认源站覆盖。revision 不可得（旧宿主）时
       // 退化为无条件写，与既有行为一致。
       try {
-        const descriptor = sctx.settings.describe?.().find?.((entry) => entry?.ns === SETTINGS_NAMESPACE) ?? null
-        const current = unwrapVolatile(descriptor?.value ?? scope.get())
+        const descriptor = descriptorOf()
+        const current = currentConfig(descriptor)
         const hasSources = Array.isArray(current?.sources) && current.sources.length > 0
         if (!hasSources) {
           // 沿用解析后的单源 tokenRef：旧版允许自定义引用（凭证库里存的也是那个
@@ -303,14 +311,10 @@ export function apply(ctx, config = {}) {
           const legacyUrl = current.baseUrl || storedBaseUrl?.value || ''
           if (legacyUrl || tokenPresent) {
             const id = generateSourceId()
-            await sctx.settings.update(
-              SETTINGS_NAMESPACE,
-              {
-                sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }],
-                defaultSource: id,
-              },
-              Number.isInteger(descriptor?.revision) ? descriptor.revision : undefined,
-            )
+            await updateConfig({
+              sources: [{ id, name: DEFAULT_SOURCE_NAME, baseUrl: legacyUrl, tokenRef: legacyTokenRef }],
+              defaultSource: id,
+            }, descriptor)
           }
         }
       } catch { /* sources 物化失败不阻断后续 .imported 迁移。 */ }
@@ -325,7 +329,7 @@ export function apply(ctx, config = {}) {
       // → 读 ~/.dsh/settings.yaml.imported 的 grafana 段 → 校验 → 一次性写入新存储。
       // 文件不存在或解析失败静默跳过；写入成功后不删除 .imported（宿主管理的文件）。
       try {
-        const currentAfterMigration = unwrapVolatile(scope.get())
+        const currentAfterMigration = currentConfig()
         const hasSourcesAfterMigration = Array.isArray(currentAfterMigration?.sources) && currentAfterMigration.sources.length > 0
         const hasLegacyUrlAfterMigration = typeof currentAfterMigration?.baseUrl === 'string' && currentAfterMigration.baseUrl.trim()
         if (!hasSourcesAfterMigration && !hasLegacyUrlAfterMigration) {
@@ -384,12 +388,8 @@ export function apply(ctx, config = {}) {
             defaultToWrite = id
           }
 
-          const descriptorForImport = sctx.settings.describe?.().find?.((entry) => entry?.ns === SETTINGS_NAMESPACE) ?? null
-          await sctx.settings.update(
-            SETTINGS_NAMESPACE,
-            { sources: sourcesToWrite, defaultSource: defaultToWrite },
-            Number.isInteger(descriptorForImport?.revision) ? descriptorForImport.revision : undefined,
-          )
+          const descriptorForImport = descriptorOf()
+          await updateConfig({ sources: sourcesToWrite, defaultSource: defaultToWrite }, descriptorForImport)
         }
       } catch { /* .imported 迁移失败不阻断插件加载，下次仍可重试。 */ }
     })()

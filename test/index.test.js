@@ -1544,38 +1544,21 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
   // 与宿主 dsh-settings 一致的乐观并发语义：每次落地写前进 revision，
   // update 带过期 expectedRevision 时以冲突拒绝。
   let revision = 0
-  const registrations = []
   const listeners = new Map()
   // 可变的凭证状态：resolve 返回 { value }，unset 清空对应 ref。
   const creds = { ...credentialState }
   const settingsService = {
-    register(ns, schema, options = {}) {
-      const scope = {
-        get: () => schema({ ...options.base, ...section }),
-        async update(patch) { await settingsService.update(ns, patch) },
-        async mutate(ops) {
-          for (const op of ops ?? []) {
-            if (op.op === 'unset' && op.path?.[0] === 'baseUrl') {
-              const { baseUrl, ...rest } = section
-              section = rest
-            }
-          }
-        },
-      }
-      options.validate?.(scope.get())
-      registrations.push({ ns, options, scope, creds })
-      return scope
-    },
     describe() {
-      // 单 namespace mock：与宿主 Settings.describe 同形（ns/revision/value）。
-      return registrations.map(({ ns, scope }) => ({ ns, revision, value: scope.get() }))
+      // schema 由 loader 从插件的平铺 Config 导出发现，不经 settings.register。
+      return [{ ns: SETTINGS_NAMESPACE, revision, value: Config(section) }]
     },
     async update(ns, patch, expectedRevision) {
+      assert.equal(ns, SETTINGS_NAMESPACE)
       if (expectedRevision !== undefined && expectedRevision !== revision) {
         throw new Error(`settings namespace "${ns}" changed since it was read (expected revision ${expectedRevision}, now ${String(revision)})`)
       }
-      revision += 1
       section = { ...section, ...patch }
+      revision += 1
     },
   }
   const ctx = {
@@ -1586,8 +1569,8 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
     inject(services, callback) {
       if (!services.includes('settings')) return
       callback({
-        ...ctx,
         effect(setup) { setup() },
+        credentials: ctx.credentials,
         settings: settingsService,
       })
     },
@@ -1598,21 +1581,19 @@ function createSettingsContext(userSection = {}, credentialState = {}) {
     },
   }
   apply(ctx, {})
-  return { registrations, tools, creds, listeners }
+  return { settingsService, getConfig: () => unwrapVolatile(Config(section)), tools, creds, listeners }
 }
 
-test('apply registers a grafana settings namespace and resolves config through it', async () => {
-  const { registrations, tools } = createSettingsContext()
-  assert.equal(registrations.length, 1)
-  const [{ ns, options, scope }] = registrations
-  assert.equal(ns, SETTINGS_NAMESPACE)
-  assert.equal(typeof options.validate, 'function')
-  assert.throws(() => options.validate({ ...scope.get(), tokenRef: 'bad ref' }), /Invalid credential reference/)
-  // 多源站写入口校验：源站 id 系统生成、只读，手改或缺失直接拒绝；名称必须唯一。
-  assert.throws(() => options.validate({ ...scope.get(), sources: [{ id: 'bad id!', name: 'prod' }] }), /Invalid Grafana source id/)
-  assert.throws(() => options.validate({ ...scope.get(), sources: [{ id: '', name: 'prod' }] }), /Invalid Grafana source id/)
-  assert.throws(() => options.validate({
-    ...scope.get(),
+test('apply reads the declarative grafana settings namespace without register', async () => {
+  const { settingsService, getConfig, tools } = createSettingsContext()
+  assert.equal(settingsService.register, undefined)
+  assert.equal(settingsService.describe()[0].ns, SETTINGS_NAMESPACE)
+  assert.throws(() => internals.validateConfig({ ...getConfig(), tokenRef: 'bad ref' }), /Invalid credential reference/)
+  // 迁移写入口校验：源站 id 系统生成、只读，手改或缺失直接拒绝；名称必须唯一。
+  assert.throws(() => internals.validateConfig({ ...getConfig(), sources: [{ id: 'bad id!', name: 'prod' }] }), /Invalid Grafana source id/)
+  assert.throws(() => internals.validateConfig({ ...getConfig(), sources: [{ id: '', name: 'prod' }] }), /Invalid Grafana source id/)
+  assert.throws(() => internals.validateConfig({
+    ...getConfig(),
     sources: [
       { id: 'id-1', name: 'prod', baseUrl: '', tokenRef: '' },
       { id: 'id-2', name: 'prod', baseUrl: '', tokenRef: '' },
@@ -1620,7 +1601,7 @@ test('apply registers a grafana settings namespace and resolves config through i
   }), /Duplicate Grafana source name/)
 
   // 用户设置层的值优先于组合层 base，健康检查按其解析 base URL。
-  await scope.update({ baseUrl: 'https://grafana.example.com' })
+  await settingsService.update(SETTINGS_NAMESPACE, { baseUrl: 'https://grafana.example.com' })
   const originalFetch = globalThis.fetch
   const calls = []
   globalThis.fetch = async (url) => {
@@ -1639,17 +1620,16 @@ test('apply registers a grafana settings namespace and resolves config through i
 
 test('apply migrates a legacy credential-stored URL into the settings namespace on startup', async () => {
   // 旧版本把 URL 存在 GRAFANA_BASE_URL 凭证里；settings.baseUrl 为空。
-  const { registrations, tools, creds } = createSettingsContext(
+  const { getConfig, tools, creds } = createSettingsContext(
     {},
     { GRAFANA_BASE_URL: 'https://grafana.legacy.example.com' },
   )
-  const [{ scope }] = registrations
   // 迁移 IIFE 是 fire-and-forget，flush 一次微任务让它跑完。
   await new Promise((resolve) => setImmediate(resolve))
 
   // URL 已搬到 settings namespace，凭证条目已清空。
   // volatile 字段在 schema 解析后是 Volatile 引用，用 unwrapVolatile 拆包后断言。
-  assert.equal(unwrapVolatile(scope.get()).baseUrl, 'https://grafana.legacy.example.com')
+  assert.equal(getConfig().baseUrl, 'https://grafana.legacy.example.com')
   assert.equal(creds.GRAFANA_BASE_URL, undefined)
 
   // 迁移后 resolveBaseUrl 从 settings 解析（settings 优先，凭证兜底已空）。
@@ -3256,14 +3236,13 @@ test('clone approval states the target Grafana source name and URL on the first 
 // 迁移：sources 为空且存在 legacy 单源配置（GRAFANA_TOKEN 凭证 + URL）时，
 // 启动迁移物化出一个 name="default" 的源站，沿用旧 GRAFANA_TOKEN ref，生成只读 UID。
 test('apply migrates legacy single-source config into a materialized default source', async () => {
-  const { registrations } = createSettingsContext({}, {
+  const { getConfig } = createSettingsContext({}, {
     GRAFANA_TOKEN: 'legacy-token',
     GRAFANA_BASE_URL: 'https://grafana.legacy.example.com',
   })
-  const [{ scope }] = registrations
   // 迁移 IIFE 是 fire-and-forget，flush 一次宏任务让其全部微任务跑完。
   await new Promise((resolve) => setImmediate(resolve))
-  const cfg = unwrapVolatile(scope.get())
+  const cfg = getConfig()
   assert.equal(Array.isArray(cfg.sources), true)
   assert.equal(cfg.sources.length, 1)
   const src = cfg.sources[0]
@@ -3288,18 +3267,8 @@ test('startup migration yields to a concurrent user save instead of overwriting 
   // 此刻测试模拟用户保存（revision 前进），再放行。
   const tokenGate = new Promise((resolve) => { releaseToken = resolve })
   const creds = { GRAFANA_TOKEN: 'legacy-token' }
-  let scope = null
   const settingsService = {
-    register(ns, schema, options = {}) {
-      scope = {
-        get: () => schema({ ...options.base, ...section }),
-        async update(patch) { await settingsService.update(ns, patch) },
-        async mutate() {},
-      }
-      options.validate?.(scope.get())
-      return scope
-    },
-    describe() { return [{ ns: SETTINGS_NAMESPACE, revision, value: scope?.get() }] },
+    describe() { return [{ ns: SETTINGS_NAMESPACE, revision, value: Config(section) }] },
     async update(ns, patch, expectedRevision) {
       if (expectedRevision !== undefined && expectedRevision !== revision) {
         throw new Error(`settings namespace "${ns}" changed since it was read`)
@@ -3318,7 +3287,7 @@ test('startup migration yields to a concurrent user save instead of overwriting 
     },
     inject(services, callback) {
       if (!services.includes('settings')) return
-      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
+      callback({ effect(setup) { setup() }, credentials: ctx.credentials, settings: settingsService })
     },
     on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
     systemPrompt: { section() {} },
@@ -3339,7 +3308,7 @@ test('startup migration yields to a concurrent user save instead of overwriting 
   releaseToken()
   await new Promise((resolve) => setImmediate(resolve))
 
-  const cfg = unwrapVolatile(scope.get())
+  const cfg = unwrapVolatile(settingsService.describe()[0].value)
   assert.equal(cfg.sources.length, 1)
   assert.equal(cfg.sources[0].id, 'user-1', 'the user save must survive the racing migration')
   assert.equal(cfg.sources[0].name, 'mine')
@@ -3349,12 +3318,11 @@ test('startup migration yields to a concurrent user save instead of overwriting 
 // 迁移必须沿用解析后的单源 tokenRef：旧版允许自定义引用，凭证库里存的也是那个
 // ref。改回默认 GRAFANA_TOKEN 会让物化出的源站指向不存在的凭证，全部鉴权失败。
 test('startup migration keeps a custom legacy tokenRef instead of resetting it', async () => {
-  const { registrations, creds } = createSettingsContext({ tokenRef: 'CUSTOM_GRAFANA_TOKEN' }, {
+  const { getConfig, creds } = createSettingsContext({ tokenRef: 'CUSTOM_GRAFANA_TOKEN' }, {
     CUSTOM_GRAFANA_TOKEN: 'custom-token',
   })
-  const [{ scope }] = registrations
   await new Promise((resolve) => setImmediate(resolve))
-  const [source] = unwrapVolatile(scope.get()).sources
+  const [source] = getConfig().sources
   assert.equal(source.tokenRef, 'CUSTOM_GRAFANA_TOKEN')
   // 原凭证原样留着，没有被搬走也没有被清掉。
   assert.equal(creds.CUSTOM_GRAFANA_TOKEN, 'custom-token')
@@ -3417,59 +3385,21 @@ test('imported file migration restores sources from settings.yaml.imported', asy
     '  provider: test',
   ].join('\n'), 'utf8')
 
-  const tools = []
-  const listeners = new Map()
-  let section = {}
-  let revision = 0
-  const registrations = []
-  const settingsService = {
-    register(ns, schema, options = {}) {
-      const scope = {
-        get: () => schema({ ...options.base, ...section }),
-        async update(patch) { await settingsService.update(ns, patch) },
-        async mutate() {},
-      }
-      options.validate?.(scope.get())
-      registrations.push({ ns, options, scope })
-      return scope
-    },
-    describe() { return registrations.map(({ ns, scope }) => ({ ns, revision, value: scope.get() })) },
-    async update(ns, patch, expectedRevision) {
-      if (expectedRevision !== undefined && expectedRevision !== revision) {
-        throw new Error(`settings namespace "${ns}" changed since it was read`)
-      }
-      revision += 1
-      section = { ...section, ...patch }
-    },
-  }
-  const ctx = {
-    credentials: {
-      async resolve() { return undefined },
-      async unset() {},
-    },
-    inject(services, callback) {
-      if (!services.includes('settings')) return
-      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
-    },
-    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
-    systemPrompt: { section() {} },
-    tools: { register(tool) { tools.push(tool); return () => {} } },
-  }
-
   const originalHome = process.env.HOME
   process.env.HOME = tmpHome
 
   try {
-    apply(ctx, {})
+    const { getConfig } = createSettingsContext()
     await new Promise((resolve) => setImmediate(resolve))
-    const [{ scope }] = registrations
-    const cfg = unwrapVolatile(scope.get())
+    const cfg = getConfig()
     assert.equal(cfg.sources.length, 2)
     assert.equal(cfg.sources[0].id, 'src-aaa')
     assert.equal(cfg.sources[0].name, 'restored-default')
     assert.equal(cfg.sources[0].baseUrl, 'https://grafana.restored.example.com')
+    assert.equal(cfg.sources[0].tokenRef, 'GRAFANA_TOKEN')
     assert.equal(cfg.sources[1].id, 'src-bbb')
     assert.equal(cfg.sources[1].name, 'restored-local')
+    assert.equal(cfg.sources[1].tokenRef, 'GRAFANA_TOKEN_srcbbb')
     assert.equal(cfg.defaultSource, 'src-aaa')
   } finally {
     process.env.HOME = originalHome
@@ -3486,13 +3416,8 @@ function mutableSourcesContext(sources, creds = {}) {
   let section = { sources, defaultSource: sources[0].id }
   const credentialState = { ...creds }
   const settingsService = {
-    register(ns, schema, options = {}) {
-      const scope = { get: () => schema({ ...options.base, ...section }) }
-      options.validate?.(scope.get())
-      return scope
-    },
     // sources 非空：迁移不参与本用例。
-    describe() { return [] },
+    describe() { return [{ ns: SETTINGS_NAMESPACE, revision: 0, value: Config(section) }] },
     async update(ns, patch) { section = { ...section, ...patch } },
   }
   const ctx = {
@@ -3502,7 +3427,7 @@ function mutableSourcesContext(sources, creds = {}) {
     },
     inject(services, callback) {
       if (!services.includes('settings')) return
-      callback({ ...ctx, effect(setup) { setup() }, settings: settingsService })
+      callback({ effect(setup) { setup() }, credentials: ctx.credentials, settings: settingsService })
     },
     on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name) },
     systemPrompt: { section() {} },
@@ -3911,7 +3836,7 @@ test('parseGrafanaSectionSimple does not leak source array fields into top level
 })
 
 // ── parseGrafanaSectionSimple：顶层 baseUrl 与数组项不同时更严格的验证 ──────
-// 真机场景：顶层 baseUrl=grafana.ttpai.work，数组项 localhost 的 baseUrl=localhost:3000。
+// 回归场景：顶层 baseUrl=grafana.example.com，数组项 localhost 的 baseUrl=localhost:3000。
 // 修复前：顶层被解析成 localhost:3000（数组项泄漏）。
 test('parseGrafanaSectionSimple top-level baseUrl differs from source array item', () => {
   const yaml = [

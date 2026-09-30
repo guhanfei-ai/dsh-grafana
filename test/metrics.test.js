@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { apply } from '../index.js'
+import { apply, Config } from '../index.js'
 import { createBudget } from '../lib/budget.js'
 import {
   LOKI_MAX_LINES,
@@ -86,14 +86,11 @@ function createSettingsContext(userSection, credentialState) {
     inject(services, callback) {
       if (!services.includes('settings')) return
       callback({
-        ...ctx,
         effect(setup) { setup() },
+        credentials: ctx.credentials,
         settings: {
-          register(ns, schema, options = {}) {
-            const scope = { get: () => schema({ ...options.base, ...userSection }) }
-            options.validate?.(scope.get())
-            return scope
-          },
+          describe() { return [{ ns: 'grafana', revision: 0, value: Config(userSection) }] },
+          async update() {},
         },
       })
     },
