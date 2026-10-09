@@ -24,10 +24,12 @@
 | 组件 | 已支持基线 |
 | --- | --- |
 | Node.js | 20.11 或更高版本 |
-| DeepSeek Harness | `0.1.0-rc.6` 至 `0.2.0-rc.2` 的预发布 peer（验证基线：`0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1`、`0.1.7-rc.2`、`0.2.0-rc.2`；预发布匹配取决于受支持的版本元组） |
+| DeepSeek Harness | 默认开发依赖为 `dsh-tools@0.2.0-rc.2`；另覆盖 `0.2.1-alpha.1` 的自动化依赖兼容检查。历史基线：`0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1`、`0.1.7-rc.2`。真实宿主与浏览器验收另见 `INTEGRATION.md`。 |
 | Grafana | Grafana 10/11 文档中的传统 Dashboard HTTP API |
 
 Grafana 12 引入了新 Dashboard API。旧接口可能仍然可用，但 Grafana 12+ 暂未进入本插件的正式兼容矩阵。
+
+标准 npm 依赖解析与 DSH 宿主预检采用不同的预发布匹配方式：宿主 `0.2.0-rc.2` 和 `0.2.1-alpha.1` 的预检启用 `includePrerelease`。插件仍显式声明 `0.2.1` 元组，供标准依赖解析使用；这不表示已完成 alpha 宿主、桌面端或浏览器认证。
 
 本插件无构建步骤：纯 ESM JavaScript，安装即可加载，无需编译或打包。
 
@@ -56,7 +58,9 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-grafana
 
 Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台；`deploy.sh` 需要 Git Bash、WSL、macOS 或 Linux。
 
-## 升级到 0.12.0
+## 升级说明
+
+### 0.12.0：工具改名与旧宿主界面
 
 **两个工具改名。** `grafana_query` 改为 `grafana_panel_query`，`grafana_health` 改为 `grafana_status`。参数、输出、超时与审批行为均不变。
 
@@ -69,13 +73,19 @@ Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件�
 
 **浏览器设置卡片需要 DSH 0.1.2 及以上。** 在更旧的宿主（0.1.0–0.1.1）上，卡片会显示明确的「宿主过旧」提示而非源站列表——这是版本门槛，不是配置丢失。宿主侧全部工具在这些版本上照常可用，插件本身也仍可安装在 `0.1.0-rc.6` 及以上。
 
-**配置自动迁移。** 升级前 `settings.yaml.imported` 中的具名源站优先于旧单源凭证；否则旧单源配置会物化为名为 `default` 的源站（Base URL 与已存令牌不变）。导入文件位于 `$DSH_HOME/settings.yaml.imported`，未设置 `DSH_HOME` 时位于 `~/.dsh/settings.yaml.imported`。可选依赖 `js-yaml` 用于完整 YAML 解析，缺失时由内置解析器处理已知的 Grafana 段结构。迁移不会覆盖运行期间并发保存的配置。
+### 0.17.x：设置页与配置迁移
+
+DSH `0.1.7+` 使用插件设置区的独立 **Grafana** tab；较旧宿主保留内嵌的 Grafana 助手卡片。
+
+**配置自动迁移。** 升级前 `settings.yaml.imported` 中的具名源站优先于旧单源凭证；否则旧单源配置会物化为名为 `default` 的源站（Base URL 与已存令牌不变）。导入文件位于 `$DSH_HOME/settings.yaml.imported`，未设置 `DSH_HOME` 时位于 `~/.dsh/settings.yaml.imported`。本次维护继续使用可选依赖 `js-yaml` v4，以保留旧 YAML 的锚点与 `<<` 合并语义；仅该依赖本身缺失时，才由内置解析器处理已知的基础 Grafana 段结构。
+
+文件读取、YAML 解析或导入写入失败时，迁移停止并输出脱敏原因；不会再推断单源配置、修改凭证或改写导入文件。请修复配置或依赖后由维护者重载插件再试。迁移不会覆盖运行期间并发保存的配置。
 
 ## 配置
 
-在 DSH Web 中打开 **设置 → 插件 → Grafana 助手**。
+在 DSH `0.1.7+` 中打开 **设置 → 插件 → Grafana**；较旧宿主使用 Grafana 助手卡片。
 
-> 提示：设置页按 Host 端的 settings 命名空间（`grafana`）派发插件卡片。命名空间列表只在设置文档变更或连接重置时刷新，因此升级插件后如果卡片没有出现，刷新页面（或重连 Web UI）即可。
+> 提示：旧宿主按 settings 命名空间（`grafana`）派发内嵌卡片；新宿主注册独立的 Grafana tab。升级后请重载对应 profile 并刷新页面，使新插件代码生效。
 
 需要配置：
 
@@ -345,7 +355,7 @@ npm run verify
 npm pack --dry-run --ignore-scripts
 ```
 
-自动化测试使用 Node 内置测试运行器和模拟 Grafana 响应。CI 覆盖 Node 20、22 和 24。
+自动化测试使用 Node 内置测试运行器和模拟 Grafana 响应。CI 的 `0.2.0-rc.2` 基线覆盖 Node 20、22 和 24，另用 Node 22 验证 `dsh-tools@0.2.1-alpha.1`。CI 实际生成 `.tgz` 并扫描包内标识；这些检查不替代真实 DSH/Grafana 验收。
 
 更多信息参见 [CONTRIBUTING.md](./CONTRIBUTING.md) 和 [CHANGELOG.md](./CHANGELOG.md)。
 

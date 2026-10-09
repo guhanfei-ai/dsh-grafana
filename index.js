@@ -99,16 +99,17 @@ export function importedSettingsPath(env = process.env, home = homedir()) {
 }
 
 // js-yaml 是可选依赖：缺失时使用只处理已知 grafana 段形状的简易解析器。
-function parseImportedYaml(text) {
+function parseImportedYaml(text, loadModule = require) {
+  let yaml
   try {
-    const yaml = require('js-yaml')
-    return yaml.load(text)
-  } catch {
-    // js-yaml 不可用：尝试用简易缩进解析器提取 grafana 段。
-    // 这不是完整 YAML 解析，只处理 settings.yaml.imported 的已知结构：
-    // 顶层 key 缩进 0，子属性缩进 2，数组项用 `- ` 开头。
+    yaml = loadModule('js-yaml')
+  } catch (error) {
+    // 只允许可选依赖本身缺失时降级；损坏的安装、缺失的传递依赖或模块
+    // 初始化异常都不能被当成“未安装”。完整解析器拒绝的 YAML 更不能重解析。
+    if (error?.code !== 'MODULE_NOT_FOUND' || !/^Cannot find module ['"]js-yaml['"](?:\r?\n|$)/.test(error.message)) throw error
     return parseGrafanaSectionSimple(text)
   }
+  return yaml.load(text)
 }
 
 // 简易 grafana 段提取器：无 js-yaml 时的 fallback。
@@ -118,6 +119,8 @@ function parseGrafanaSectionSimple(text) {
   let inGrafana = false
   let grafanaIndent = -1
   const result = {}
+  const seen = new Set()
+  let foundGrafana = false
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
@@ -128,6 +131,8 @@ function parseGrafanaSectionSimple(text) {
     if (indent === 0) {
       inGrafana = false
       if (line.trim().startsWith('grafana:')) {
+        if (foundGrafana) throw new Error('Invalid imported Grafana configuration: duplicate section.')
+        foundGrafana = true
         inGrafana = true
         grafanaIndent = 0
       }
@@ -146,6 +151,11 @@ function parseGrafanaSectionSimple(text) {
 
     const key = trimmed.slice(0, colonIdx).trim()
     const value = trimmed.slice(colonIdx + 1).trim()
+
+    if (['sources', 'defaultSource', 'baseUrl', 'tokenRef', 'readOnly'].includes(key)) {
+      if (seen.has(key)) throw new Error('Invalid imported Grafana configuration: duplicate field.')
+      seen.add(key)
+    }
 
     if (key === 'sources') {
       // 解析数组项
@@ -171,6 +181,7 @@ function parseGrafanaSectionSimple(text) {
             if (propColon !== -1) {
               const pk = propTrimmed.slice(0, propColon).trim()
               const pv = propTrimmed.slice(propColon + 1).trim()
+              if (Object.hasOwn(src, pk)) throw new Error('Invalid imported Grafana configuration: duplicate source field.')
               if (pk !== 'id') src[pk] = pv
             }
             j++
@@ -187,8 +198,10 @@ function parseGrafanaSectionSimple(text) {
       i = j - 1
     } else if (key === 'defaultSource' || key === 'baseUrl' || key === 'tokenRef' || key === 'readOnly') {
       if (value) {
-        if (key === 'readOnly') result[key] = value === 'true'
-        else result[key] = value
+        if (key === 'readOnly') {
+          if (value !== 'true' && value !== 'false') throw new Error('Invalid imported Grafana configuration: readOnly must be a boolean.')
+          result[key] = value === 'true'
+        } else result[key] = value
       }
     }
   }
@@ -248,7 +261,8 @@ function validateConfig(value) {
 // oneLine + redactSecrets 清洗后的消息归类，绝不把原文或配置值写入 stderr。
 function migrationFailure(step, error) {
   const message = oneLine(redactSecrets(error?.message ?? String(error)), 180)
-  const reason = /conflict|revision|changed since/i.test(message) ? 'revision-conflict'
+  const reason = error?.name === 'YAMLException' ? 'invalid-import'
+    : /conflict|revision|changed since/i.test(message) ? 'revision-conflict'
     : /invalid|duplicate|too many|must refer/i.test(message) ? 'invalid-config'
       : /ENOENT|EACCES|EPERM|read/i.test(message) ? 'read-error'
         : 'settings-error'
@@ -294,13 +308,12 @@ export function apply(ctx, config = {}) {
     })
 
     // 优先恢复 .imported 的原始多源配置；仅在缺少有效 sources 时才从 legacy
-    // 单源凭证推断配置。三步独立报状态/失败但不阻断插件加载；静默 catch 会让
+    // 单源凭证推断配置。导入失败即停止迁移，但不阻断插件加载；静默 catch 会让
     // 真机验收无法区分「没执行」「读错目录」与「revision 冲突」。
     ;(async () => {
       // ── 步骤 3：优先恢复 0.1.7 升级前的原始多源配置 ──────────────────
       let importedSection = null
       let importStatus = 'skipped reason=no-imported-file'
-      let importedHasSources = false
       try {
         const descriptor = descriptorOf()
         if (currentConfig(descriptor).sources?.length) {
@@ -333,7 +346,6 @@ export function apply(ctx, config = {}) {
                 })
                 .filter(Boolean)
               if (validSources.length) {
-                importedHasSources = true
                 const requestedDefault = typeof importedSection.defaultSource === 'string' ? importedSection.defaultSource : ''
                 const validDefault = validSources.some((source) => source.id === requestedDefault)
                 const defaultSource = validDefault ? requestedDefault : validSources[0].id
@@ -349,15 +361,11 @@ export function apply(ctx, config = {}) {
         }
       } catch (error) {
         migrationFailure('step3', error)
-        // 原始 sources 已存在却写入失败（包括并发冲突）时，不得以推断出的
-        // 单源配置再次写入，尤其不能覆盖刚刚保存的用户源站。
-        if (importedHasSources) {
-          migrationStatus('step1', 'skipped reason=import-failed')
-          migrationStatus('step2', 'skipped reason=import-failed')
-          return
-        }
-        importedSection = null
-        importStatus = null
+        // 读取、解析或写入恢复配置失败时，整次迁移保持现状；不能继续用
+        // legacy 凭证推断单源并写入，否则会掩盖原始配置错误或并发冲突。
+        migrationStatus('step1', 'skipped reason=import-failed')
+        migrationStatus('step2', 'skipped reason=import-failed')
+        return
       }
 
       // ── 步骤 1：URL 从凭证库迁移到 settings ──────────────────────────
@@ -525,6 +533,7 @@ export const internals = Object.freeze({
   normalizeBaseUrl,
   parseDashboardUrl,
   parseGrafanaSectionSimple,
+  parseImportedYaml,
   parseUid,
   readLimitedText,
   redactSecrets,

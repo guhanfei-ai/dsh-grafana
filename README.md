@@ -24,10 +24,12 @@ A DeepSeek Harness plugin for agent-native Grafana observability — dashboards,
 | Component | Supported baseline |
 | --- | --- |
 | Node.js | 20.11 or newer |
-| DeepSeek Harness | Prerelease peers from `0.1.0-rc.6` through `0.2.0-rc.2` (verified baselines: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.7-rc.2`, `0.2.0-rc.2`; prerelease matching depends on the supported version tuple) |
+| DeepSeek Harness | Default development dependency: `dsh-tools@0.2.0-rc.2`; additional automated dependency checks cover `0.2.1-alpha.1`. Historical baselines: `0.1.0-rc.6`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.7-rc.2`. Real host and browser acceptance is recorded separately in `INTEGRATION.md`. |
 | Grafana | Legacy Dashboard HTTP API as documented for Grafana 10/11 |
 
 Grafana 12 introduced a new dashboard API. The legacy endpoints used by this plugin may remain available, but Grafana 12+ is not part of the certified matrix yet.
+
+Standard npm dependency resolution and DSH host preflight handle prereleases differently: the `0.2.0-rc.2` and `0.2.1-alpha.1` host checks enable `includePrerelease`. The plugin still declares the `0.2.1` tuple explicitly for standard dependency resolution; this does not certify the alpha host, Desktop or browser experience.
 
 There is no build step: the plugin is plain ESM JavaScript, so installing it is enough — nothing to compile or bundle before it loads.
 
@@ -56,7 +58,9 @@ Restart the selected DSH profile after installation.
 
 On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform; `deploy.sh` requires Git Bash, WSL, macOS, or Linux.
 
-## Upgrading to 0.12.0
+## Upgrade notes
+
+### 0.12.0: renamed tools and older host UI
 
 **Two tools were renamed.** `grafana_query` is now `grafana_panel_query`, and `grafana_health` is now `grafana_status`. Parameters, outputs, timeouts, and approval behavior are unchanged.
 
@@ -69,13 +73,19 @@ The old names stay registered as error-only stubs: calling `grafana_query` or `g
 
 **The browser settings card requires DSH 0.1.2 or newer.** On older hosts (0.1.0–0.1.1) the card shows an explicit "host too old" notice instead of the source list — that is a version gate, not lost configuration. All host-side tools keep working on those hosts, and the plugin still installs on `0.1.0-rc.6` and newer.
 
-**Configuration migrates automatically.** Existing named sources in the pre-upgrade `settings.yaml.imported` take priority over a legacy single-source credential; otherwise a single-source configuration is materialized as a named `default` source (same base URL, same stored token). The importer reads `$DSH_HOME/settings.yaml.imported`, or `~/.dsh/settings.yaml.imported` when `DSH_HOME` is unset. The optional `js-yaml` dependency handles full YAML; if unavailable, a built-in parser handles the known Grafana section shape. Migration does not overwrite a configuration saved concurrently.
+### 0.17.x: settings UI and configuration migration
+
+DSH `0.1.7+` uses a dedicated **Grafana** tab in plugin settings; older hosts retain the embedded Grafana assistant card.
+
+**Configuration migrates automatically.** Existing named sources in the pre-upgrade `settings.yaml.imported` take priority over a legacy single-source credential; otherwise a single-source configuration is materialized as a named `default` source (same base URL, same stored token). The importer reads `$DSH_HOME/settings.yaml.imported`, or `~/.dsh/settings.yaml.imported` when `DSH_HOME` is unset. This maintenance cycle keeps the optional `js-yaml` dependency on v4 to preserve existing aliases and `<<` merges; only the absence of that package itself enables the restricted parser for the known basic Grafana section shape.
+
+File-reading, YAML-parsing or import-write failures stop migration with a redacted reason, without inferring a legacy source, changing credentials or rewriting the import file. After repairing the configuration or dependency, the maintainer can reload the plugin to retry. Migration does not overwrite a configuration saved concurrently.
 
 ## Configuration
 
-In DSH Web, open **Settings → Plugins → Grafana assistant**.
+On DSH `0.1.7+`, open **Settings → Plugins → Grafana**; older hosts use the Grafana assistant card.
 
-> Note: the settings page dispatches plugin cards by the Host settings namespace (`grafana`). The served-namespace list is re-read only on settings-document commits or connection resets, so if the card does not appear right after upgrading the plugin, refresh the page (or reconnect the Web UI).
+> Note: older hosts dispatch embedded cards by the `grafana` settings namespace; newer hosts register a separate Grafana tab. After upgrading, reload the selected profile and refresh the page to load the new plugin code.
 
 Configure:
 
@@ -345,7 +355,7 @@ npm run verify
 npm pack --dry-run --ignore-scripts
 ```
 
-Tests use Node's built-in test runner and mocked Grafana responses. CI verifies Node 20, 22, and 24.
+Tests use Node's built-in test runner and mocked Grafana responses. The `0.2.0-rc.2` CI baseline covers Node 20, 22 and 24; Node 22 additionally checks `dsh-tools@0.2.1-alpha.1`. CI builds an actual `.tgz` and scans its contents for unexpected identifiers. These checks do not replace real DSH/Grafana acceptance.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CHANGELOG.md](./CHANGELOG.md).
 

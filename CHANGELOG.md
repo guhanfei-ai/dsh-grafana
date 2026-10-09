@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Imported settings use the restricted parser only when the optional `js-yaml` package itself is absent. Invalid YAML, missing transitive dependencies and module initialization failures stop the migration without settings writes or credential cleanup. The restricted parser also rejects duplicate fields and invalid read-only booleans.
+
+### Changed
+
+- The `dsh-tools` peer range explicitly includes `0.2.1` prereleases. CI adds an isolated `0.2.1-alpha.1` dependency job alongside the `0.2.0-rc.2` baseline, and scans an actual package archive instead of relying only on a packaging dry run. These checks do not certify Desktop, browser or real Grafana behavior.
+- Keep `js-yaml` on v4 for this maintenance cycle: v5 changes the default loader schema, merge-key support and empty-input behavior. Regression tests preserve v4 configuration imports, including quoted Unicode and aliases with merge keys.
+- Clarify the settings tab on newer hosts, version-specific migration guidance, dependency-resolution semantics and manual acceptance requirements in both READMEs and the integration record.
+
+## [0.17.1] - 2026-09-30
+
+### Fixed
+
 - Startup migration resolves the pre-upgrade settings file through `DSH_HOME` or the platform home, restores imported multi-source configuration before considering legacy single-source credentials, and repairs an invalid imported default-source reference. Each migration step emits a bounded, redacted diagnostic without logging URLs, credential references, tokens, or source names.
 - Added repository-text and pre-publish archive checks for unexpected infrastructure identifiers. The optional `js-yaml` dependency makes the full YAML importer explicit; the restricted fallback remains available when it is absent. The READMEs now describe the `0.2.0-rc.2` compatibility baseline.
 

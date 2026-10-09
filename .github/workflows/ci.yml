@@ -1,5 +1,5 @@
 # CI 工作流：每次向 main 分支推送或发起针对 main 的 PR 时，
-# 在多个 Node.js 版本上执行校验、打包预演与安全审计。
+# 在多个 Node.js 与 dsh-tools 版本上执行校验、包内检查与安全审计。
 name: CI
 
 # 触发条件：
@@ -18,14 +18,22 @@ permissions:
 jobs:
   # 校验任务：在矩阵中列出的每个 Node.js 版本上运行同一套校验。
   verify:
-    name: Node ${{ matrix.node }}
+    name: Node ${{ matrix.node }} / dsh-tools ${{ matrix.dsh_tools }}
     runs-on: ubuntu-latest
     strategy:
       # 即使某个版本失败也不中断其它版本，便于看全矩阵结果。
       fail-fast: false
       matrix:
-        # 覆盖 README 中声明的兼容矩阵：Node 20 / 22 / 24。
-        node: [20, 22, 24]
+        # 基线保留三种 Node；alpha 增加独立验证，不覆盖默认开发依赖。
+        include:
+          - node: 20
+            dsh_tools: 0.2.0-rc.2
+          - node: 22
+            dsh_tools: 0.2.0-rc.2
+          - node: 24
+            dsh_tools: 0.2.0-rc.2
+          - node: 22
+            dsh_tools: 0.2.1-alpha.1
     steps:
       # 拉取源码。
       - uses: actions/checkout@v4
@@ -36,9 +44,19 @@ jobs:
           cache: npm
       # 按 lockfile 精准安装依赖，--ignore-scripts 跳过安装期脚本（含 prepack）以免误触发发布流程。
       - run: npm ci --ignore-scripts
+      # 每个任务使用独立 checkout；仅 alpha 任务替换测试依赖，不改清单或锁文件。
+      - if: matrix.dsh_tools != '0.2.0-rc.2'
+        run: npm install --no-save --package-lock=false --ignore-scripts --registry=https://registry.npmjs.org "@deepseek-ai/dsh-tools@${{ matrix.dsh_tools }}"
+      # 确认测试实际解析到矩阵指定版本，防止依赖替换失败后仍测旧版本。
+      - name: Check resolved dsh-tools version
+        run: node -e 'require("node:assert/strict").equal(require("@deepseek-ai/dsh-tools/package.json").version, process.argv[1])' "${{ matrix.dsh_tools }}"
       # 运行 package.json 中定义的 verify：语法 check + 单元测试。
       - run: npm run verify
-      # 在不真正发布的情况下打包，验证 files 清单与打包完整性。
-      - run: npm pack --dry-run --ignore-scripts
+      # 实际打包后扫描 tar 成员；产物只留在 runner 临时目录，不进入发布流程。
+      - name: Check package archive
+        shell: bash
+        run: |
+          archive_name="$(npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP" --silent)"
+          node scripts/identifier-check.js --archive "$RUNNER_TEMP/$archive_name"
       # 仅审计生产依赖，且只报告 high 及以上级别的漏洞。
       - run: npm audit --omit=dev --audit-level=high

@@ -3111,6 +3111,7 @@ test('internals exports the stable debug surface across the lib/ split', () => {
     'normalizeBaseUrl',
     'parseDashboardUrl',
     'parseGrafanaSectionSimple',
+    'parseImportedYaml',
     'parseUid',
     'readLimitedText',
     'redactSecrets',
