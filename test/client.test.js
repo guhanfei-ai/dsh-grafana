@@ -5,12 +5,12 @@ import vm from 'node:vm'
 
 // 在 vm 沙箱里加载浏览器 bundle：注入 URL、window.__ModuleLoader__ 与 crypto
 // （generateSourceId 走 crypto.randomUUID 路径需要它）。返回 { definition, runtime }。
-function loadBrowserModule(react = {}) {
+function loadBrowserModule(react = {}, browserGlobals = {}) {
   let definition
   const window = { __ModuleLoader__: { load(value) { definition = value } }, confirm: () => true }
   vm.runInNewContext(
     readFileSync(new URL('../client.js', import.meta.url), 'utf8'),
-    { URL, window, crypto: globalThis.crypto },
+    { URL, window, crypto: globalThis.crypto, ...browserGlobals },
   )
   const runtime = definition.factory((id) => {
     // jsx/jsxs 返回可遍历的节点：组件级用例要按 type/children 找到按钮与输入框。
@@ -24,8 +24,8 @@ function loadBrowserModule(react = {}) {
   return { definition, runtime }
 }
 
-function loadBrowserRuntime(react) {
-  return loadBrowserModule(react).runtime
+function loadBrowserRuntime(react, browserGlobals) {
+  return loadBrowserModule(react, browserGlobals).runtime
 }
 
 // 装配 face 并挂上可变的 settings/credentials mock。所有跨 realm 对象一律用
@@ -129,12 +129,12 @@ function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = '
 }
 
 // backend：传入已建好的后端即可让多个卡片共享同一份权威状态（复现并发保存）。
-function setup({ backend = null, react = null, remote = true, ...backendOptions } = {}) {
+function setup({ backend = null, react = null, remote = true, browserGlobals = {}, slot = 'settings.plugin.item', ...backendOptions } = {}) {
   const built = backend ?? buildBackend(backendOptions)
   const services = remote ? { 'remote.settings': built.settings, 'remote.credentials': built.credentials } : {}
   let face
   let component = null
-  const runtime = loadBrowserRuntime(react ?? {})
+  const runtime = loadBrowserRuntime(react ?? {}, browserGlobals)
   runtime.apply({
     // cordis ctx.get 语义（4.0.2 实测）：服务缺席时返回 undefined，不抛。
     // 刻意不提供 connection —— 任何回退到 connection.api 的实现都会当场失败。
@@ -151,14 +151,21 @@ function setup({ backend = null, react = null, remote = true, ...backendOptions 
           assert.equal(specification.key, 'grafana')
           assert.equal('id' in specification, false)
           assert.equal('order' in specification, false)
-          face = specification.inject().grafanaCard
-          component = card
+          if (slot === specification.name) {
+            face = specification.inject().grafanaCard
+            component = card
+          }
         } else {
           // 新槽（tab slot）：registerOptions 为 id/order/label，render 回调返回 React element。
           assert.equal(specification.id, 'grafana')
           assert.equal(typeof specification.order, 'number')
           assert.equal(typeof specification.label, 'string')
           assert.equal(typeof card, 'function')
+          if (slot === specification.name) {
+            const element = card()
+            face = element.props.grafanaCard
+            component = element.type
+          }
         }
         return () => {}
       },
@@ -187,6 +194,7 @@ function cardHarness(options = {}) {
   let cursor = 0
   let mounted = false
   const react = {
+    createElement: (type, props) => ({ type, props }),
     useState(initial) {
       const index = cursor++
       if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial
@@ -217,6 +225,7 @@ function cardHarness(options = {}) {
   return {
     ...harness,
     states,
+    render,
     buttons,
     switchButton,
     // 等首次 describe 落地，再展开卡片（收起时子内容不渲染）。
@@ -420,6 +429,70 @@ test('localePreference reads the locale namespace preference', async () => {
   const { face } = setup({ locale: 'en' })
   assert.equal(await face.localePreference(), 'en')
 })
+
+// 同一组件覆盖旧内嵌卡片与新 tab；验证首屏和异步读取后的文案，防止桌面端
+// navigator 默认为英文时把插件默认语言也带成英文。
+function renderedText(node) {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(renderedText).join('\n')
+  return node && typeof node === 'object' ? renderedText(node.props?.children) : ''
+}
+
+for (const slot of ['settings.plugin.item', 'settings.plugins.tab']) {
+  for (const [label, navigator] of [
+    ['English web browser', { language: 'en-US', languages: ['en-US'] }],
+    ['desktop renderer with English navigator', { language: 'en-US', languages: ['en-US'], userAgent: 'Electron' }],
+    ['Chinese browser', { language: 'zh-CN', languages: ['zh-CN'] }],
+    ['missing navigator', undefined],
+  ]) {
+    test(`${slot} defaults to Chinese with ${label}`, async () => {
+      const card = cardHarness({ slot, locale: '', browserGlobals: { navigator } })
+      assert.match(renderedText(card.render()), /Grafana 助手/)
+      await card.ready()
+      const text = renderedText(card.render())
+      for (const caption of ['Grafana 助手', '只读模式', '新增源站', '保存全部源站']) {
+        assert.ok(text.includes(caption), `missing Chinese caption: ${caption}`)
+      }
+      assert.doesNotMatch(text, /Grafana assistant|Add source|Read-only mode/)
+    })
+  }
+
+  for (const locale of ['system', 'auto', 'fr', '']) {
+    test(`${slot} keeps the Chinese default for unresolved locale ${JSON.stringify(locale)}`, async () => {
+      const card = cardHarness({ slot, locale, browserGlobals: { navigator: { language: 'en-US' } } })
+      await card.ready()
+      assert.match(renderedText(card.render()), /新增源站/)
+    })
+  }
+
+  test(`${slot} keeps Chinese when locale settings cannot be read`, async () => {
+    const card = cardHarness({
+      slot,
+      browserGlobals: { navigator: { language: 'en-US' } },
+      fail: { 'settings.describe': 'temporary read failure' },
+    })
+    await card.ready()
+    const text = renderedText(card.render())
+    assert.match(text, /Grafana 助手/)
+    assert.match(text, /temporary read failure/)
+    assert.equal(card.calls.some(([method]) => method === 'settings.mutate'), false)
+  })
+
+  test(`${slot} keeps Chinese on a host without locale settings`, async () => {
+    const card = cardHarness({ slot, remote: false, browserGlobals: { navigator: { language: 'en-US' } } })
+    await card.ready()
+    assert.match(renderedText(card.render()), /Grafana 助手/)
+    assert.match(renderedText(card.render()), /当前 DSH 宿主版本过旧/)
+  })
+
+  for (const [locale, caption] of [['zh', '新增源站'], ['en', 'Add source']]) {
+    test(`${slot} honors an explicit ${locale} host preference`, async () => {
+      const card = cardHarness({ slot, locale, browserGlobals: { navigator: { language: 'en-US' } } })
+      await card.ready()
+      assert.ok(renderedText(card.render()).includes(caption))
+    })
+  }
+}
 
 test('internals derive token refs, generate unique read-only ids, normalize and validate source lists', () => {
   const { tokenRefForId, generateSourceId, normalizeSource, validateSources } = loadBrowserRuntime().internals
@@ -875,18 +948,18 @@ test('an unconfirmed initial read keeps the card read-only instead of enabling a
   await card.ready()
   // 未就绪：loaded=false、错误指路 Reload、新增被拦（本地仍是空草稿，不是降级基线）。
   assert.equal(card.states[9], false)
-  assert.match(String(card.states[6]), /cannot be parsed/)
-  card.click('Add source')
+  assert.match(String(card.states[6]), /配置数据无法解析/)
+  card.click('新增源站')
   assert.equal(card.states[0].length, 0)
   // 恢复正常后 Reload：基线替换、开放写入。
   remote.settings.describe = describe
-  await card.click('Reload')
+  await card.click('重新读取')
   assert.equal(card.states[9], true)
   assert.equal(card.states[0].length, 1)
   assert.equal(String(card.states[6]), '')
   // 此时保存带修订号（写入不再是空基线的整表覆盖）。
   card.change('password', 'demo-replacement')
-  await card.click('Save this source')
+  await card.click('保存当前源站')
   assert.equal(remote.state.writes.at(-1).expectedRevision, 0)
   assert.equal(remote.state.sources.length, 1)
   const activeRef = remote.state.sources[0].tokenRef
@@ -1296,11 +1369,11 @@ test('sources are not writable before the configuration has been read successful
   // 故障恢复后仍不开放写入：本页从未拿到过权威基线，此时保存会用空列表覆盖
   // 后端已有的全部源站。
   delete card.fail['settings.describe']
-  await card.click('Add source')
-  assert.match(String(card.states[6]), /not been read successfully/)
+  await card.click('新增源站')
+  assert.match(String(card.states[6]), /尚未成功读取配置/)
   assert.equal(card.calls.some(([m]) => m === 'settings.mutate'), false)
   // 重新读取之后才拿到基线；写入仍然要由用户显式触发。
-  await card.click('Reload')
+  await card.click('重新读取')
   assert.equal(card.calls.some(([m]) => m === 'settings.mutate'), false)
   const after = await card.face.describe()
   assert.deepEqual(after.sources.map((s) => s.name), ['alpha'])

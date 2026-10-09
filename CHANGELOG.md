@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The Grafana settings page defaults to Simplified Chinese in both web and desktop clients, including the first render and missing, unsupported or unreadable locale preferences. Browser and Electron language detection no longer changes the default; explicit DSH English selections remain supported.
 - Imported settings use the restricted parser only when the optional `js-yaml` package itself is absent. Invalid YAML, missing transitive dependencies and module initialization failures stop the migration without settings writes or credential cleanup. The restricted parser also rejects duplicate fields and invalid read-only booleans.
 
 ### Changed

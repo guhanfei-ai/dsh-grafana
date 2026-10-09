@@ -201,14 +201,6 @@ window.__ModuleLoader__.load({
 			}
 		};
 
-		// 非浏览器环境（如测试沙箱）中没有 navigator，回退为英文。
-		function detectLanguage() {
-			try {
-				if (typeof navigator !== "undefined" && String(navigator.language || "").toLowerCase().startsWith("zh")) return "zh";
-			} catch { /* 忽略，走默认。 */ }
-			return "en";
-		}
-
 		const S = {
 			// 折叠卡片外壳对齐官方 PluginCard（ui-settings-plugins 包）的观感：
 			// 收起时用 bg-layer-3，展开后切换到 bg-layer-2。
@@ -429,7 +421,8 @@ window.__ModuleLoader__.load({
 			// （连续移除多个源站且都失败时，每条都得有自己的重试入口）。源站列表已删，
 			// 这里只补凭证库那一刀；某条重试成功才移除该条提示。
 			const [tokenCleanups, setTokenCleanups] = react.useState([]);
-			const [lang, setLang] = react.useState(detectLanguage);
+			// Web 与桌面端统一默认简体中文，不依赖浏览器或 Electron 的语言。
+			const [lang, setLang] = react.useState("zh");
 			// loaded：是否至少成功读取过一次配置。没有权威基线就开放写入，等于允许
 			// 一张空列表覆盖掉全部已存源站，故读取失败期间一律不写。
 			const [loaded, setLoaded] = react.useState(false);
@@ -446,7 +439,7 @@ window.__ModuleLoader__.load({
 			// 失败原因，渲染在开关下方；同样排在 useState 序列末尾，理由同上。
 			const [modeMsg, setModeMsg] = react.useState("");
 			const [modeError, setModeError] = react.useState("");
-			const T = STRINGS[lang] ?? STRINGS.en;
+			const T = STRINGS[lang] ?? STRINGS.zh;
 			const storedById = new Map(stored.map((s) => [s.id, s]));
 			// 任一源站卡片脏（含新增未保存）即存在待保存内容，供「保存全部源站」可用性判断。
 			const anyDirty = sources.some((s) => rowDirty(s, storedById));
@@ -502,12 +495,11 @@ window.__ModuleLoader__.load({
 				return () => { alive = false; };
 			}, [face]);
 
-			// GUI 自身的语言偏好（locale 命名空间）优先于浏览器语言。失败只影响文案，
-			// 不值得打断卡片，故仍退回浏览器语言。
+			// GUI 明确选择的语言优先；未选择、不支持或读取失败时保持默认简体中文。
 			react.useEffect(() => {
 				let alive = true;
 				face.localePreference().then((p) => {
-					if (alive && (p === "zh" || p === "en")) setLang(p);
+					if (alive) setLang(p === "en" ? "en" : "zh");
 				}).catch(() => {});
 				return () => { alive = false; };
 			}, [face]);
@@ -1101,7 +1093,7 @@ window.__ModuleLoader__.load({
 					], Number.isInteger(expectedRevision) ? expectedRevision : (Number.isInteger(describedRevision) ? describedRevision : void 0)), "settings.mutate");
 				},
 				// 读取 GUI 的语言偏好（locale 命名空间的 preference 字段）；不可用时返回空串。
-				// 语言只是外观，失败不值得报错打断卡片，故这里吸掉异常退回浏览器语言。
+				// 语言只是外观，失败不值得报错打断卡片，故这里吸掉异常保留默认简体中文。
 				localePreference: async () => {
 					const settings = settingsApi();
 					if (!settings?.describe) return "";

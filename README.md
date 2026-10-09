@@ -85,6 +85,8 @@ File-reading, YAML-parsing or import-write failures stop migration with a redact
 
 On DSH `0.1.7+`, open **Settings → Plugins → Grafana**; older hosts use the Grafana assistant card.
 
+The Grafana configuration page defaults to Simplified Chinese in both web and desktop installations, independently of the browser or system language. An explicit English selection in DSH language settings is honored; an absent, unsupported or unreadable preference uses Simplified Chinese.
+
 > Note: older hosts dispatch embedded cards by the `grafana` settings namespace; newer hosts register a separate Grafana tab. After upgrading, reload the selected profile and refresh the page to load the new plugin code.
 
 Configure:
