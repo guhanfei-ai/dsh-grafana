@@ -18,7 +18,7 @@ function loadBrowserModule(react = {}, browserGlobals = {}) {
       const node = (type, props) => ({ type, props })
       return { jsx: node, jsxs: node }
     }
-    if (id === 'react') return react
+    if (id === 'react') return { createElement: (type, props) => ({ type, props }), ...react }
     throw new Error(`Unexpected browser dependency: ${id}`)
   })
   return { definition, runtime }
@@ -128,50 +128,127 @@ function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = '
   return { calls, state, credState, fail: failState, settings, credentials }
 }
 
+const SETTINGS_SPECS = {
+  'settings.section': { kind: 'list', scope: 'root' },
+  'settings.plugins.tab': { kind: 'list', scope: 'root' },
+  'settings.plugin.item': { kind: 'keyed', scope: 'root' },
+}
+
+// 模拟真实声明生命周期：未知槽等待，撤销立即清空注册，重声明创建新的生命周期。
+// 微任务可手动 flush，覆盖同 tick 撤销/重挂及 fiber 卸载早于控制器清理的竞态。
+function slotHarness({ declared = Object.keys(SETTINGS_SPECS), probe = true, failInject = '' } = {}) {
+  const specs = new Map(declared.map((name) => [name, SETTINGS_SPECS[name]]))
+  const entries = new Map()
+  const controllers = new Set()
+  const effects = []
+  const pending = []
+  const injected = []
+  const registered = []
+  let unloading = false
+  let maxEntries = 0
+  const inactive = () => Object.assign(new Error('fiber is unloading'), { code: 'INACTIVE_EFFECT' })
+  const once = (fn) => {
+    let stopped = false
+    return () => { if (!stopped) { stopped = true; fn?.() } }
+  }
+  const slots = {
+    ...(probe ? { spec: (name) => specs.get(name) } : {}),
+    inject(name, callback) {
+      assert.ok(name in SETTINGS_SPECS, `unexpected slot: ${name}`)
+      injected.push(name)
+      if (name === failInject) throw new Error('slot injection failed')
+      const controller = { name, active: false, cleanup: null }
+      controller.enter = () => {
+        if (!specs.has(name) || controller.active) return
+        controller.active = true
+        controller.cleanup = callback()
+      }
+      controller.leave = () => {
+        if (!controller.active) return
+        controller.active = false
+        const cleanup = controller.cleanup
+        controller.cleanup = null
+        cleanup?.()
+      }
+      controllers.add(controller)
+      controller.enter()
+      return once(() => { controllers.delete(controller); controller.leave() })
+    },
+    register(specification, card) {
+      if (unloading) throw inactive()
+      assert.ok(specs.has(specification.name), 'cannot register into an undeclared slot')
+      if (specification.name === 'settings.plugin.item') {
+        assert.equal(specification.key, 'grafana')
+        assert.equal('id' in specification, false)
+        assert.equal('order' in specification, false)
+      } else {
+        assert.equal(specification.id, 'grafana')
+        assert.equal(typeof specification.order, 'number')
+        assert.equal(specification.label, 'Grafana')
+      }
+      assert.equal(typeof card, 'function')
+      const key = `${specification.name}/${specification.id ?? specification.key}`
+      assert.equal(entries.has(key), false, 'duplicate slot registration')
+      const entry = { specification, card }
+      entries.set(key, entry)
+      registered.push(entry)
+      maxEntries = Math.max(maxEntries, entries.size)
+      return once(() => { if (entries.get(key) === entry) entries.delete(key) })
+    },
+  }
+  const ctx = {
+    slots,
+    effect(callback) {
+      if (unloading) throw inactive()
+      const dispose = once(callback())
+      effects.push(dispose)
+      return dispose
+    },
+  }
+  return {
+    ctx, slots, entries, controllers, injected, registered,
+    queueMicrotask: (callback) => pending.push(callback),
+    flush() { while (pending.length) pending.shift()() },
+    maxEntries: () => maxEntries,
+    declare(name, spec = SETTINGS_SPECS[name]) {
+      assert.equal(specs.has(name), false, 'slot is already declared')
+      specs.set(name, spec)
+      for (const controller of [...controllers]) if (controller.name === name) controller.enter()
+    },
+    collapse(name) {
+      specs.delete(name)
+      for (const [key, entry] of entries) if (entry.specification.name === name) entries.delete(key)
+      for (const controller of [...controllers]) if (controller.name === name) controller.leave()
+    },
+    beginUnload() { unloading = true },
+    resume() { unloading = false },
+    dispose() {
+      unloading = true
+      for (const dispose of effects.toReversed()) dispose()
+      for (const controller of [...controllers]) { controllers.delete(controller); controller.leave() }
+      entries.clear()
+    },
+  }
+}
+
 // backend：传入已建好的后端即可让多个卡片共享同一份权威状态（复现并发保存）。
 function setup({ backend = null, react = null, remote = true, browserGlobals = {}, slot = 'settings.plugin.item', ...backendOptions } = {}) {
   const built = backend ?? buildBackend(backendOptions)
   const services = remote ? { 'remote.settings': built.settings, 'remote.credentials': built.credentials } : {}
-  let face
-  let component = null
-  const runtime = loadBrowserRuntime(react ?? {}, browserGlobals)
+  const lifecycle = slotHarness({ declared: [slot] })
+  const runtime = loadBrowserRuntime(react ?? {}, { ...browserGlobals, queueMicrotask: lifecycle.queueMicrotask })
   runtime.apply({
-    // cordis ctx.get 语义（4.0.2 实测）：服务缺席时返回 undefined，不抛。
-    // 刻意不提供 connection —— 任何回退到 connection.api 的实现都会当场失败。
+    ...lifecycle.ctx,
+    // 刻意不提供 connection；远端门面缺席时 ctx.get 返回 undefined。
     get(name) { return services[name] },
-    slots: {
-      inject(name, callback) {
-        // 双代兼容：旧槽 settings.plugin.item + 新槽 settings.plugins.tab
-        assert.ok(name === 'settings.plugin.item' || name === 'settings.plugins.tab', `unexpected slot: ${name}`)
-        callback()
-      },
-      register(specification, card) {
-        if (specification.name === 'settings.plugin.item') {
-          // 旧槽（keyed slot）：key 必须与 index.js 的 SETTINGS_NAMESPACE 一致，且不带 id/order。
-          assert.equal(specification.key, 'grafana')
-          assert.equal('id' in specification, false)
-          assert.equal('order' in specification, false)
-          if (slot === specification.name) {
-            face = specification.inject().grafanaCard
-            component = card
-          }
-        } else {
-          // 新槽（tab slot）：registerOptions 为 id/order/label，render 回调返回 React element。
-          assert.equal(specification.id, 'grafana')
-          assert.equal(typeof specification.order, 'number')
-          assert.equal(typeof specification.label, 'string')
-          assert.equal(typeof card, 'function')
-          if (slot === specification.name) {
-            const element = card()
-            face = element.props.grafanaCard
-            component = element.type
-          }
-        }
-        return () => {}
-      },
-    },
   })
-  return { ...built, face, component }
+  lifecycle.flush()
+  assert.equal(lifecycle.entries.size, 1)
+  const { specification, card } = [...lifecycle.entries.values()][0]
+  const element = specification.name === 'settings.plugin.item' ? null : card()
+  const props = element?.props ?? specification.inject()
+  const component = element?.type ?? card
+  return { ...built, face: props.grafanaCard, props, component }
 }
 
 // 并发用例的共享后端：一个已落库的源站 + 一枚已生效的令牌，带版本检查的 mutate。
@@ -207,7 +284,7 @@ function cardHarness(options = {}) {
   // 传入 backend 时多个卡片共用同一份权威状态，用来复现两个设置页的并发保存。
   const { backend = null, ...rest } = options
   const harness = setup({ ...rest, backend, react })
-  const render = () => { cursor = 0; return harness.component({ grafanaCard: harness.face }) }
+  const render = () => { cursor = 0; return harness.component(harness.props) }
   render()
   mounted = true
   for (const effect of effects) effect()
@@ -227,11 +304,13 @@ function cardHarness(options = {}) {
     states,
     render,
     buttons,
+    inputs,
     switchButton,
-    // 等首次 describe 落地，再展开卡片（收起时子内容不渲染）。
+    // 等首次 describe 落地；独立页已展开，兼容卡片才需要点击展开。
     async ready() {
       await new Promise(setImmediate)
-      buttons()[0].props.onClick()
+      const header = buttons().find((node) => node.props['aria-expanded'] !== undefined)
+      if (!header.props['aria-expanded']) header.props.onClick()
     },
     change(type, value) {
       const input = inputs().find((node) => node.props.type === type)
@@ -246,42 +325,207 @@ function cardHarness(options = {}) {
   }
 }
 
-test('browser module declares the dsh-grafana id, the slots-only inject, and both grafana slots (legacy + 0.1.7 tab)', () => {
-  const { definition, runtime } = loadBrowserModule()
+function mountSettings(lifecycle) {
+  const module = loadBrowserModule({}, { queueMicrotask: lifecycle.queueMicrotask })
+  module.runtime.apply({ ...lifecycle.ctx, get: () => undefined })
+  return module
+}
+
+const onlyEntry = (lifecycle) => {
+  assert.equal(lifecycle.entries.size, 1)
+  return [...lifecycle.entries.values()][0]
+}
+
+test('browser module keeps slots-only injection and registers one independent Grafana settings section', () => {
+  const lifecycle = slotHarness()
+  const { definition, runtime } = mountSettings(lifecycle)
   assert.equal(definition.id, 'dsh-grafana')
-  // 只 inject slots：卡片必须在没有 remote.* 的旧宿主上也能加载，才能显示升级提示。
-  // cordis 4.0.2 实测：inject 里任何缺席的服务都会让 fiber 永远停在 INACTIVE（插件不加载），
-  // 而 ctx.get 可以在运行期读到未声明的服务，故远端门面一律用 ctx.get 延迟解析。
+  // 远端服务缺席不能阻止插件挂载；旧宿主应显示明确的升级提示。
   assert.deepEqual(Array.from(runtime.inject), ['slots'])
-  let face
-  const injected = []
-  runtime.apply({
-    get: () => undefined,
-    slots: {
-      inject: (name, callback) => { injected.push(name); callback() },
-      register: (specification, card) => {
-        if (specification.name === 'settings.plugin.item') {
-          // 旧槽 keyed slot：key = grafana，通过 inject 传 face。
-          assert.equal(specification.key, 'grafana')
-          face = specification.inject().grafanaCard
-        } else if (specification.name === 'settings.plugins.tab') {
-          // 新槽 tab slot：id/order/label，render 回调返回 React element。
-          assert.equal(specification.id, 'grafana')
-          assert.equal(typeof specification.order, 'number')
-          assert.equal(typeof specification.label, 'string')
-          assert.equal(typeof card, 'function')
-        }
-        return () => {}
-      },
-    },
-  })
-  // 双 inject：旧槽 + 新槽都注入（双代兼容）。
-  assert.deepEqual(injected.sort(), ['settings.plugin.item', 'settings.plugins.tab'])
-  // 多源站 face 契约：读回源站列表、整体写入、令牌增删、语言偏好、模式单字段写。
+  lifecycle.flush()
+  assert.deepEqual(lifecycle.injected, ['settings.section', 'settings.plugins.tab', 'settings.plugin.item'])
+  const entry = onlyEntry(lifecycle)
+  assert.equal(entry.specification.name, 'settings.section')
+  assert.equal(entry.specification.id, 'grafana')
+  assert.equal(entry.specification.order, 16)
+  assert.equal(entry.specification.label, 'Grafana')
+  assert.equal('key' in entry.specification, false)
+  const { grafanaCard: face, defaultOpen } = entry.card().props
+  assert.equal(defaultOpen, true)
   for (const method of ['describe', 'writeSources', 'writeReadOnly', 'setToken', 'unsetToken', 'localePreference']) {
     assert.equal(typeof face[method], 'function', `face.${method} must be a function`)
   }
+  assert.equal(lifecycle.maxEntries(), 1)
 })
+
+for (const declared of [
+  ['settings.section'],
+  ['settings.section', 'settings.plugins.tab'],
+  ['settings.plugins.tab', 'settings.plugin.item'],
+  ['settings.plugins.tab'],
+  ['settings.plugin.item'],
+]) {
+  test(`settings entry selects the first supported route from ${declared.join(', ')}`, () => {
+    const lifecycle = slotHarness({ declared })
+    mountSettings(lifecycle)
+    lifecycle.flush()
+    assert.equal(onlyEntry(lifecycle).specification.name, declared[0])
+    assert.equal(lifecycle.maxEntries(), 1)
+    lifecycle.dispose()
+    lifecycle.flush()
+    assert.equal(lifecycle.entries.size, 0)
+    assert.equal(lifecycle.controllers.size, 0)
+  })
+}
+
+test('late declarations upgrade and downgrade one settings entry without duplicates', () => {
+  const lifecycle = slotHarness({ declared: [] })
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  assert.equal(lifecycle.entries.size, 0)
+  for (const name of ['settings.plugin.item', 'settings.plugins.tab', 'settings.section']) {
+    lifecycle.declare(name)
+    lifecycle.flush()
+    assert.equal(onlyEntry(lifecycle).specification.name, name)
+  }
+  lifecycle.collapse('settings.section')
+  lifecycle.flush()
+  assert.equal(onlyEntry(lifecycle).specification.name, 'settings.plugins.tab')
+  lifecycle.collapse('settings.plugins.tab')
+  lifecycle.flush()
+  assert.equal(onlyEntry(lifecycle).specification.name, 'settings.plugin.item')
+  lifecycle.collapse('settings.plugin.item')
+  lifecycle.flush()
+  assert.equal(lifecycle.entries.size, 0)
+  assert.equal(lifecycle.maxEntries(), 1)
+})
+
+test('same-tick declarations choose the section without registering temporary fallbacks', () => {
+  const lifecycle = slotHarness({ declared: [] })
+  mountSettings(lifecycle)
+  lifecycle.declare('settings.plugin.item')
+  lifecycle.declare('settings.plugins.tab')
+  lifecycle.declare('settings.section')
+  lifecycle.flush()
+  assert.equal(lifecycle.registered.length, 1)
+  assert.equal(onlyEntry(lifecycle).specification.name, 'settings.section')
+})
+
+test('same-name same-tick redeclaration replaces the stale registration lifetime', () => {
+  const lifecycle = slotHarness()
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  const original = onlyEntry(lifecycle)
+  lifecycle.collapse('settings.section')
+  lifecycle.declare('settings.section')
+  lifecycle.flush()
+  assert.notEqual(onlyEntry(lifecycle), original)
+  assert.equal(onlyEntry(lifecycle).specification.name, 'settings.section')
+  assert.equal(lifecycle.maxEntries(), 1)
+})
+
+test('collapse of a non-winning slot does not remount the section or discard its local state', () => {
+  const lifecycle = slotHarness()
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  const original = onlyEntry(lifecycle)
+  lifecycle.collapse('settings.plugins.tab')
+  lifecycle.declare('settings.plugins.tab')
+  lifecycle.flush()
+  assert.equal(onlyEntry(lifecycle), original)
+})
+
+for (const spec of [{ kind: 'keyed', scope: 'root' }, { kind: 'list', scope: 'session' }]) {
+  test(`an incompatible section declaration falls back safely (${spec.kind}/${spec.scope})`, () => {
+    const lifecycle = slotHarness({ declared: ['settings.plugins.tab'] })
+    mountSettings(lifecycle)
+    lifecycle.declare('settings.section', spec)
+    lifecycle.flush()
+    assert.equal(onlyEntry(lifecycle).specification.name, 'settings.plugins.tab')
+  })
+}
+
+for (const beforeFlush of [true, false]) {
+  test(`plugin unload cancels waits and queued registration (${beforeFlush ? 'pending' : 'mounted'})`, () => {
+    const lifecycle = slotHarness({ declared: [] })
+    mountSettings(lifecycle)
+    lifecycle.declare('settings.section')
+    if (!beforeFlush) lifecycle.flush()
+    lifecycle.dispose()
+    lifecycle.flush()
+    lifecycle.declare('settings.plugins.tab')
+    lifecycle.flush()
+    assert.equal(lifecycle.entries.size, 0)
+    assert.equal(lifecycle.controllers.size, 0)
+    assert.equal(lifecycle.registered.length, beforeFlush ? 0 : 1)
+  })
+}
+
+test('unload before the controller cleanup cannot revive an entry or leak an inactive-effect error', () => {
+  const lifecycle = slotHarness()
+  mountSettings(lifecycle)
+  lifecycle.beginUnload()
+  assert.doesNotThrow(() => lifecycle.flush())
+  assert.equal(lifecycle.entries.size, 0)
+  assert.equal(lifecycle.controllers.size, 0)
+  lifecycle.dispose()
+})
+
+test('unload and reload in the same registry create one fresh entry without retained controllers', () => {
+  const lifecycle = slotHarness()
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  const original = onlyEntry(lifecycle)
+  lifecycle.dispose()
+  lifecycle.flush()
+  assert.equal(lifecycle.controllers.size, 0)
+  lifecycle.resume()
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  assert.notEqual(onlyEntry(lifecycle), original)
+  assert.equal(onlyEntry(lifecycle).specification.name, 'settings.section')
+  assert.equal(lifecycle.controllers.size, 3)
+  assert.equal(lifecycle.maxEntries(), 1)
+})
+
+test('a host declaring none of the settings slots stays empty and unloads all waits', () => {
+  const lifecycle = slotHarness({ declared: [] })
+  mountSettings(lifecycle)
+  lifecycle.flush()
+  assert.equal(lifecycle.entries.size, 0)
+  assert.equal(lifecycle.registered.length, 0)
+  lifecycle.dispose()
+  lifecycle.flush()
+  assert.equal(lifecycle.controllers.size, 0)
+})
+
+test('partial injection failure cancels queued registration and previously installed waits', () => {
+  const lifecycle = slotHarness({ failInject: 'settings.plugins.tab' })
+  assert.throws(() => mountSettings(lifecycle), /slot injection failed/)
+  lifecycle.flush()
+  assert.equal(lifecycle.entries.size, 0)
+  assert.equal(lifecycle.controllers.size, 0)
+})
+
+test('real registration errors are not swallowed as unload races', () => {
+  const lifecycle = slotHarness()
+  lifecycle.slots.register = () => { throw new Error('registration failed') }
+  mountSettings(lifecycle)
+  assert.throws(() => lifecycle.flush(), /registration failed/)
+  lifecycle.dispose()
+})
+
+for (const slot of ['settings.plugin.item', 'settings.plugins.tab']) {
+  test(`hosts without a declaration probe retain the original ${slot} registration`, () => {
+    const lifecycle = slotHarness({ declared: [slot], probe: false })
+    mountSettings(lifecycle)
+    lifecycle.flush()
+    assert.deepEqual(lifecycle.injected, ['settings.plugins.tab', 'settings.plugin.item'])
+    assert.equal(onlyEntry(lifecycle).specification.name, slot)
+    lifecycle.dispose()
+    assert.equal(lifecycle.controllers.size, 0)
+  })
+}
 
 test('describe reads back every source with its token status and the default source id', async () => {
   const { face } = setup({
@@ -430,15 +674,15 @@ test('localePreference reads the locale namespace preference', async () => {
   assert.equal(await face.localePreference(), 'en')
 })
 
-// 同一组件覆盖旧内嵌卡片与新 tab；验证首屏和异步读取后的文案，防止桌面端
-// navigator 默认为英文时把插件默认语言也带成英文。
+// 同一组件覆盖独立设置页、兼容 tab 与旧内嵌卡片；验证首屏和异步读取后的文案，
+// 防止桌面端 navigator 默认为英文时把插件默认语言也带成英文。
 function renderedText(node) {
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(renderedText).join('\n')
   return node && typeof node === 'object' ? renderedText(node.props?.children) : ''
 }
 
-for (const slot of ['settings.plugin.item', 'settings.plugins.tab']) {
+for (const slot of ['settings.section', 'settings.plugin.item', 'settings.plugins.tab']) {
   for (const [label, navigator] of [
     ['English web browser', { language: 'en-US', languages: ['en-US'] }],
     ['desktop renderer with English navigator', { language: 'en-US', languages: ['en-US'], userAgent: 'Electron' }],
@@ -493,6 +737,66 @@ for (const slot of ['settings.plugin.item', 'settings.plugins.tab']) {
     })
   }
 }
+
+test('the independent settings page is expanded on its first render without enabling unread writes', async () => {
+  const card = cardHarness({ slot: 'settings.section' })
+  assert.equal(card.buttons()[0].props['aria-expanded'], true)
+  for (const caption of ['只读模式', '新增源站', '保存全部源站']) {
+    assert.ok(renderedText(card.render()).includes(caption), `missing first-render caption: ${caption}`)
+  }
+  assert.equal(card.switchButton().props.disabled, true)
+  assert.equal(card.buttons().find((node) => node.props.children === '保存全部源站').props.disabled, true)
+  assert.equal(card.calls.some(([method]) => method === 'settings.mutate'), false)
+  await card.ready()
+  assert.equal(card.buttons()[0].props['aria-expanded'], true)
+  assert.equal(card.switchButton().props.disabled, false)
+  card.buttons()[0].props.onClick()
+  assert.equal(card.buttons()[0].props['aria-expanded'], false)
+  assert.equal(card.calls.some(([method]) => method === 'settings.mutate'), false)
+})
+
+for (const slot of ['settings.plugin.item', 'settings.plugins.tab']) {
+  test(`the compatibility ${slot} card keeps its collapsed first render`, async () => {
+    const card = cardHarness({ slot })
+    assert.equal(card.buttons()[0].props['aria-expanded'], false)
+    assert.doesNotMatch(renderedText(card.render()), /新增源站|保存全部源站/)
+    await card.ready()
+    assert.equal(card.buttons()[0].props['aria-expanded'], true)
+  })
+}
+
+test('the independent page reuses source save, token masking and mode writes without changing stored identities', async () => {
+  const backend = sharedBackend()
+  const card = cardHarness({ slot: 'settings.section', backend })
+  await card.ready()
+  const original = { ...backend.state.sources[0] }
+  const originalCreds = { ...backend.credState }
+  const token = card.inputs().find((node) => node.props.type === 'password')
+  assert.match(token.props.value, /^\*+$/)
+  assert.notEqual(token.props.value, originalCreds[original.tokenRef])
+  card.change('text', 'renamed')
+  await card.click('Save this source')
+  assert.deepEqual(backend.state.sources, [{ ...original, name: 'renamed' }])
+  assert.deepEqual(backend.credState, originalCreds)
+  assert.equal(backend.state.defaultSource, original.id)
+  await card.switchButton().props.onClick()
+  assert.equal(backend.state.readOnly, true)
+  assert.deepEqual(backend.state.sources, [{ ...original, name: 'renamed' }])
+  assert.deepEqual(backend.credState, originalCreds)
+  const writes = card.calls.filter(([method]) => method === 'settings.mutate')
+  assert.deepEqual(writes.map(([, args]) => args.length), [3, 3])
+  assert.equal(JSON.stringify(writes[1][1][1]), JSON.stringify([{ op: 'set', path: ['readOnly'], value: true }]))
+})
+
+test('the independent page exposes a failed initial read and keeps all remote writes blocked', async () => {
+  const card = cardHarness({ slot: 'settings.section', fail: { 'settings.describe': 'temporary read failure' } })
+  await card.ready()
+  assert.equal(card.buttons()[0].props['aria-expanded'], true)
+  assert.match(renderedText(card.render()), /temporary read failure/)
+  assert.equal(card.switchButton().props.disabled, true)
+  assert.equal(card.buttons().find((node) => node.props.children === '保存全部源站').props.disabled, true)
+  assert.equal(card.calls.some(([method]) => method === 'settings.mutate'), false)
+})
 
 test('internals derive token refs, generate unique read-only ids, normalize and validate source lists', () => {
   const { tokenRefForId, generateSourceId, normalizeSource, validateSources } = loadBrowserRuntime().internals

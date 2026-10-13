@@ -429,8 +429,8 @@ window.__ModuleLoader__.load({
 			// revision：最近一次成功读取的配置版本。写入时回传，宿主据此拒绝基于
 			// 陈旧基线的整表覆盖（两个设置页同时编辑时后保存的一方会收到冲突）。
 			const [revision, setRevision] = react.useState(null);
-			// 展开状态是卡片本地的阅读手势，Host 与设置页都不参与（同官方 PluginCard）。
-			const [open, setOpen] = react.useState(false);
+			// 独立设置页默认展开；旧版内嵌卡片仍默认收起。展开只影响本地阅读状态。
+			const [open, setOpen] = react.useState(props.defaultOpen === true);
 			// 当前模式（只读/读写）：随 describe 读回的 value.readOnly 展示，
 			// 监控排障用户据此确认权限边界，不必去猜写入工具为何缺席。
 			// 刻意放在 useState 序列末尾：测试台按下标存取状态，插在中间会整体错位。
@@ -987,6 +987,95 @@ window.__ModuleLoader__.load({
 			return Array.isArray(list) ? list : [];
 		}
 
+		function registerSettingsEntry(ctx, face) {
+			const candidates = [
+				{
+					name: "settings.section", kind: "list", scope: "root",
+					options: { name: "settings.section", id: "grafana", order: 16, label: "Grafana" },
+					component: () => react.createElement(GrafanaCard, { grafanaCard: face, defaultOpen: true })
+				},
+				{
+					name: "settings.plugins.tab", kind: "list", scope: "root",
+					options: { name: "settings.plugins.tab", id: "grafana", order: 100, label: "Grafana" },
+					component: () => react.createElement(GrafanaCard, { grafanaCard: face })
+				},
+				{
+					name: "settings.plugin.item", kind: "keyed",
+					options: { name: "settings.plugin.item", key: "grafana", inject: () => ({ grafanaCard: face }) },
+					component: GrafanaCard
+				}
+			];
+			// 无声明探测接口的老宿主保持原来的双代注册；不能把未知槽当成可用入口，
+			// 更不能因一个永不渲染的新槽而撤掉原有卡片。两代旧槽由各自宿主消费。
+			if (typeof ctx.slots.spec !== "function") {
+				for (const candidate of candidates.slice(1)) {
+					ctx.slots.inject(candidate.name, () => ctx.slots.register(candidate.options, candidate.component));
+				}
+				return;
+			}
+			ctx.effect(() => {
+				const available = new Map();
+				const waits = [];
+				let active;
+				let unregister;
+				let queued = false;
+				let stopped = false;
+				const reconcile = () => {
+					if (stopped || queued) return;
+					queued = true;
+					// 在声明/撤销回调之外注册：避免将新入口挂到正在销毁的 effect 上，
+					// 同时把同一轮槽位变化合并为一次切换，不制造重复入口。
+					queueMicrotask(() => {
+						queued = false;
+						if (stopped) return;
+						const next = candidates.map((candidate) => available.get(candidate.name)).find(Boolean);
+						if (next === active) return;
+						unregister?.();
+						unregister = void 0;
+						active = void 0;
+						if (next) {
+							try {
+								unregister = ctx.slots.register(next.options, next.component);
+								active = next;
+							} catch (error) {
+								// Fiber 卸载可能先于本控制器的清理；待执行微任务不得复活入口。
+								if (error?.code !== "INACTIVE_EFFECT") throw error;
+								stop();
+							}
+						}
+					});
+				};
+				const stop = () => {
+					if (stopped) return;
+					stopped = true;
+					const disposeActive = unregister;
+					unregister = void 0;
+					active = void 0;
+					disposeActive?.();
+					for (const dispose of waits.reverse()) dispose?.();
+					available.clear();
+				};
+				try {
+					for (const candidate of candidates) waits.push(ctx.slots.inject(candidate.name, () => {
+						const spec = ctx.slots.spec(candidate.name);
+						if (spec?.kind !== candidate.kind || candidate.scope && spec.scope !== candidate.scope) return;
+						// 每个声明生命周期用新对象标识；同 tick 撤销并重声明同名槽时也须重挂。
+						const lifetime = { ...candidate };
+						available.set(candidate.name, lifetime);
+						reconcile();
+						return () => {
+							if (available.get(candidate.name) === lifetime) available.delete(candidate.name);
+							reconcile();
+						};
+					}));
+				} catch (error) {
+					stop();
+					throw error;
+				}
+				return stop;
+			}, "dsh-grafana: settings navigation");
+		}
+
 		function apply(ctx) {
 			// 每次调用时解析远端门面（不在 apply 时缓存）：卡片挂载发生在设置页渲染之后，
 			// 而设置页自身 inject ["remote", "remote.settings"]，缺它整页都渲染不出来，
@@ -1107,26 +1196,7 @@ window.__ModuleLoader__.load({
 					}
 				}
 			};
-			// 双代兼容：旧槽（0.1.5 及更早）+ 新槽（0.1.7+）各 inject、各自静默。
-			// slots 系统对未知 key 无硬校验、无报错串——旧宿主上新槽 inject 注册成功
-			// 但永不渲染，新宿主上旧槽同理，双方互不干扰（与 023 双路径方法论一致）。
-
-			// 旧槽：settings.plugin.item（keyed slot，设置页内嵌条目）
-			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-				// keyed slot：设置页按 Host 端 settings namespace（见 index.js 的
-				// SETTINGS_NAMESPACE）派发卡片，没有 key 的注册永远不会被渲染。
-				name: "settings.plugin.item",
-				key: "grafana",
-				inject: () => ({ grafanaCard: face })
-			}, GrafanaCard));
-
-			// 新槽：settings.plugins.tab（root scope，Plugins 区整页 tab）
-			// registerOptions 从 {key, inject} 变为 {id, order, label}；
-			// render 回调直接返回 React element，不再通过 inject props 传 face。
-			ctx.slots.inject("settings.plugins.tab", () => ctx.slots.register(
-				{ name: "settings.plugins.tab", id: "grafana", order: 100, label: "Grafana" },
-				() => react.createElement(GrafanaCard, { grafanaCard: face })
-			));
+			registerSettingsEntry(ctx, face);
 		}
 
 		exports.apply = apply;

@@ -75,7 +75,7 @@ The old names stay registered as error-only stubs: calling `grafana_query` or `g
 
 ### 0.17.x: settings UI and configuration migration
 
-DSH `0.1.7+` uses a dedicated **Grafana** tab in plugin settings; older hosts retain the embedded Grafana assistant card.
+Hosts exposing declaration inspection and the `settings.section` slot provide an independent **Grafana** item in the Settings left navigation, with the configuration card expanded by default. Hosts without that section fall back to the Grafana plugin tab or legacy embedded card; hosts without declaration inspection retain the original compatibility registrations. Selection follows actual host capabilities, not version strings, and inspecting hosts register only one supported entry. Moving the entry does not change configuration, source UIDs or token storage.
 
 **Configuration migrates automatically.** Existing named sources in the pre-upgrade `settings.yaml.imported` take priority over a legacy single-source credential; otherwise a single-source configuration is materialized as a named `default` source (same base URL, same stored token). The importer reads `$DSH_HOME/settings.yaml.imported`, or `~/.dsh/settings.yaml.imported` when `DSH_HOME` is unset. This maintenance cycle keeps the optional `js-yaml` dependency on v4 to preserve existing aliases and `<<` merges; only the absence of that package itself enables the restricted parser for the known basic Grafana section shape.
 
@@ -83,11 +83,11 @@ File-reading, YAML-parsing or import-write failures stop migration with a redact
 
 ## Configuration
 
-On DSH `0.1.7+`, open **Settings → Plugins → Grafana**; older hosts use the Grafana assistant card.
+Open **Settings → Grafana in the left navigation** (after Built-in plugins) to see the expanded configuration panel. If the host cannot provide an independent section, use **Settings → Plugins (or Built-in plugins) → Grafana**; hosts supporting only the legacy slot use the embedded Grafana assistant card.
 
 The Grafana configuration page defaults to Simplified Chinese in both web and desktop installations, independently of the browser or system language. An explicit English selection in DSH language settings is honored; an absent, unsupported or unreadable preference uses Simplified Chinese.
 
-> Note: older hosts dispatch embedded cards by the `grafana` settings namespace; newer hosts register a separate Grafana tab. After upgrading, reload the selected profile and refresh the page to load the new plugin code.
+> Note: the independent section takes precedence over the plugin tab, which takes precedence over the legacy embedded card. Compatibility cards keep their collapsed default. After upgrading, the maintainer can reload the selected profile and refresh the page to load the new plugin code. Development-directory watching/HMR depends on the actual host setup; an edited source file alone does not prove the running UI has updated.
 
 Configure:
 
