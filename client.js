@@ -112,6 +112,9 @@ window.__ModuleLoader__.load({
 				tokenLabel: "服务账号令牌（Service Account Token）",
 				configured: "已配置",
 				notConfigured: "未配置",
+				statusUnknown: "状态读取失败",
+				tokenHintUnknown: "无法确认令牌状态，请重新读取；这不表示令牌未配置。",
+				sharedCredentialHint: "凭证库可能由多个 profile 共用。替换令牌或移除源站不会自动清除旧凭证，避免影响其他配置。",
 				tokenPlaceholder: "留空则保留当前令牌；输入新令牌以替换",
 				tokenHintConfigured: "已配置。星号只是占位符，并非存储的值。",
 				tokenHintEmpty: "存储在本地 DSH 凭证库中，凭证值永远不会被读回。",
@@ -124,17 +127,14 @@ window.__ModuleLoader__.load({
 				unsavedBadge: "未保存",
 				saved: "已保存。新会话将使用更新后的配置。",
 				invalidUrl: "Grafana URL 必须是不含凭证、查询参数或片段的绝对 HTTP(S) 地址。",
-				confirmRemoveSource: "确定要移除该源站吗？其专用令牌会一并清除；若该令牌仍被其它源站共用、或清理状态无法确认，则会保留。",
-				removedTokenPending: "源站“{name}”已移除，但其令牌清理失败（源站列表已更新，可点击重试补清）：",
-				replacedTokenPending: "源站“{name}”已改用新令牌，但其被替换的旧令牌清理失败（可点击重试补清）：",
-				stagedTokenPending: "保存未生效，暂存的新令牌（{name}）未能回收（可点击重试清除）：",
-				retryTokenCleanup: "重试清除令牌",
+				confirmRemoveSource: "确定要从当前 profile 移除该源站吗？关联凭证不会自动清除，因为其他 profile 可能仍在使用。",
+				removedCredentialRetained: "源站“{name}”已移除。关联凭证未自动清理，避免影响其他 profile。",
+				replacedCredentialRetained: "源站“{name}”已改用新令牌。旧凭证未自动清理，避免影响其他 profile。",
+				writtenCredentialRetained: "保存未完成确认。本次尝试写入的凭证（{name}）未自动清理，避免误删可能已被引用的凭证。",
 				reload: "重新读取",
 				notLoaded: "尚未成功读取配置，为避免覆盖已有源站，保存已停用。请点击“重新读取”。",
 				revisionConflict: "配置已在别处被修改，已载入最新内容。请确认后重新保存。",
-				unconfirmedWrite: "保存结果未能确认，该凭证暂不自动清除。",
-				cleanupUnverified: "无法确认该凭证是否仍在生效，已保留未清理。请重新读取后再试。",
-				unconfirmedRead: "宿主返回的配置数据无法解析（不是合法的源站列表）。为避免覆盖已存源站或误删凭证，已暂停写入；请点击“重新读取”。",
+				unconfirmedRead: "宿主返回的配置数据无法解析（不是合法的源站列表）。为避免覆盖已存源站，已暂停写入；请点击“重新读取”。",
 				hostTooOld: "当前 DSH 宿主版本过旧（缺少 remote.settings 远端门面），无法读写 Grafana 源站配置。请升级到 0.1.2 或更新版本后重新打开设置页。",
 				modeToggleLabel: "只读模式",
 				stateReadOnly: "只读",
@@ -165,6 +165,9 @@ window.__ModuleLoader__.load({
 				tokenLabel: "Service Account Token",
 				configured: "Configured",
 				notConfigured: "Not configured",
+				statusUnknown: "Status unavailable",
+				tokenHintUnknown: "The token status could not be confirmed. Reload; this does not mean the token is missing.",
+				sharedCredentialHint: "Profiles may share the credential store. Replacing a token or removing a source does not automatically clear old credentials, to avoid affecting other configurations.",
 				tokenPlaceholder: "Leave blank to keep the current token; enter a new token to replace it",
 				tokenHintConfigured: "Configured. The stars are a placeholder, not the stored value.",
 				tokenHintEmpty: "Stored in the local DSH credential store; the value is never read back.",
@@ -177,17 +180,14 @@ window.__ModuleLoader__.load({
 				unsavedBadge: "Unsaved",
 				saved: "Saved. New conversations will use the updated configuration.",
 				invalidUrl: "Grafana URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
-				confirmRemoveSource: "Remove this source? Its stored token is cleared too — unless another source still shares that credential, or the reference state cannot be confirmed, in which case it is kept.",
-				removedTokenPending: "The source “{name}” was removed, but clearing its stored token failed (the source list is already updated; retry to finish the cleanup):",
-				replacedTokenPending: "The source “{name}” now uses its new token, but clearing the token it replaced failed (retry to finish the cleanup):",
-				stagedTokenPending: "The save did not take effect and the staged new token ({name}) could not be discarded (retry to clear it):",
-				retryTokenCleanup: "Retry token cleanup",
+				confirmRemoveSource: "Remove this source from the current profile? Its credential is not automatically cleared because another profile may still use it.",
+				removedCredentialRetained: "The source “{name}” was removed. Its credential was not automatically cleared, to protect other profiles.",
+				replacedCredentialRetained: "The source “{name}” now uses its new token. The old credential was not automatically cleared, to protect other profiles.",
+				writtenCredentialRetained: "The save was not fully confirmed. The attempted credential write for {name} was not automatically cleared, to avoid deleting a possibly active reference.",
 				reload: "Reload",
 				notLoaded: "The configuration has not been read successfully yet, so saving is disabled to avoid overwriting existing sources. Click “Reload”.",
 				revisionConflict: "The configuration changed elsewhere; the latest content has been loaded. Review it and save again.",
-				unconfirmedWrite: "The save result could not be confirmed, so this credential is not cleared automatically.",
-				cleanupUnverified: "Whether this credential is still in use could not be confirmed, so it was left in place. Reload and try again.",
-				unconfirmedRead: "The host returned configuration data that cannot be parsed (not a valid source list). Writing is paused to avoid overwriting stored sources or deleting credentials in use; click “Reload”.",
+				unconfirmedRead: "The host returned configuration data that cannot be parsed (not a valid source list). Writing is paused to avoid overwriting stored sources; click “Reload”.",
 				hostTooOld: "This DSH host is too old (the remote.settings facade is missing), so Grafana sources can be neither read nor written. Please upgrade to 0.1.2 or newer and reopen the settings page.",
 				modeToggleLabel: "Read-only mode",
 				stateReadOnly: "Read-only",
@@ -289,13 +289,12 @@ window.__ModuleLoader__.load({
 		}
 
 		// 一次保存的令牌编排（纯函数，供「保存当前源站」与「保存全部源站」共用）：
-		// tokenWrites 待写入的凭证；staleRefs 生效后要清掉的旧凭证；stagedRefs 配置
-		// 写入失败时要回收的暂存凭证；committed 已提交的令牌（回读时据此清草稿）；
+		// tokenWrites 待写入的凭证；staleRefs 生效后保留的旧引用（仅提示）；
+		// committed 已提交的令牌（回读时据此清草稿）；
 		// tokenRefFor 该卡片在本次写入里应采用的 tokenRef。
 		function buildSavePlan(drafts, storedById) {
 			const tokenWrites = [];
 			const staleRefs = [];
-			const stagedRefs = [];
 			const committed = new Map();
 			const tokenRefFor = new Map();
 			for (const draft of drafts) {
@@ -305,11 +304,10 @@ window.__ModuleLoader__.load({
 				committed.set(draft.id, plan.value);
 				tokenRefFor.set(draft.id, plan.ref);
 				if (plan.staged) {
-					stagedRefs.push(plan.ref);
 					if (plan.replaces) staleRefs.push({ ref: plan.replaces, name: draft.name });
 				}
 			}
-			return { tokenWrites, staleRefs, stagedRefs, committed, tokenRefFor };
+			return { tokenWrites, staleRefs, committed, tokenRefFor };
 		}
 
 		// 写后回读的合并：存储为准刷新权威字段与令牌状态，保留仍存在的草稿编辑、
@@ -317,7 +315,7 @@ window.__ModuleLoader__.load({
 		// committed（Map id→令牌值）是本次成功提交且随后未被再次编辑的令牌草稿：
 		// 这些草稿必须清空，否则「已保存」的卡片一直算脏，下一次保存会把这枚旧令牌
 		// 再写一遍，把别处的令牌轮换撤销掉。
-		function mergeDrafts(described, drafts, committed) {
+		function mergeDrafts(described, drafts, committed, previousStored = []) {
 			const describedIds = new Set(described.map((s) => s.id));
 			const draftById = new Map(drafts.map((s) => [s.id, s]));
 			const merged = described.map((s) => {
@@ -330,10 +328,10 @@ window.__ModuleLoader__.load({
 				const tokenDraft = submitted !== undefined && String(d.tokenDraft ?? "").trim() === submitted ? "" : (d.tokenDraft ?? "");
 				return { ...base, name: d.name, baseUrl: d.baseUrl, tokenDraft, tokenFocus: d.tokenFocus ?? false };
 			});
-			// 存储里缺席的草稿分两类：令牌「已配置」只可能对曾持久化的源站成立，故这类草稿
-			// 说明该卡片已被别处移出存储 → 丢弃其陈旧草稿；从未持久化的新卡片令牌必未配置，
-			// 原样保留，免得把用户正在填写、尚未保存的新源站被回读冲掉。
-			for (const d of drafts) if (!describedIds.has(d.id) && !d.tokenConfigured) merged.push({ ...d });
+			// 是否曾持久化由上次存储基线判断，不能由凭证状态推断：已保存源站也可能
+			// 没有令牌，或状态读取失败。只保留真正未保存的新草稿。
+			const storedIds = new Set(previousStored.map((s) => s.id));
+			for (const d of drafts) if (!describedIds.has(d.id) && !storedIds.has(d.id)) merged.push({ ...d });
 			return merged;
 		}
 
@@ -344,52 +342,21 @@ window.__ModuleLoader__.load({
 			return Boolean(draft) && storedById.has(draft.id);
 		}
 
-		// 「移除源站」的远端编排（接线层可单测）：源站列表先写、令牌后清。令牌清理
-		// 失败不回滚源站删除——新源站 id 是全新 UUID，不会复用该 ref，残留的只是一条
-		// 无引用的孤儿凭证——但必须如实报告失败并保留待重试的 ref，绝不谎报成功。
-		// 凭证回收带引用保护（与保存路径的轮换保护同一原则）：配置允许多个源站共用
-		// 一个自定义 tokenRef，「被移除的卡片不再用它」不等于「无人在用」；凭证只写
-		// 不读，删掉在用的就再也拿不回来。写入已生效，随后的 describe 读到的就是新
-		// 列表；读取失败或业务载荷畸形（unconfirmed）时一律不回收——留一条孤儿凭证
-		// 远好过删掉另一源站正在使用的凭证。
-		// remotes 即 face（只用 writeSources / describe / unsetToken）；plan = { nextSources,
-		// nextDefault, tokenRef, tokenConfigured, expectedRevision? }。返回 { tokenCleaned: true }
-		// 或 { tokenCleaned: false, tokenRef, error }（error 已收敛为字符串消息；HOST_UNSUPPORTED
-		// 等本地化翻译由组件层完成）。
+		// 配置属于当前 profile，凭证库却可能跨 profile 共用。当前 settings.describe
+		// 无法证明别的 profile 不再引用某凭证，因此这里只移除配置，不回收共享凭证。
 		async function removeSourceRemote(remotes, plan) {
 			await remotes.writeSources(plan.nextSources, plan.nextDefault, plan.expectedRevision);
-			if (!plan.tokenConfigured) return { tokenCleaned: true };
-			try {
-				const fresh = await remotes.describe();
-				if (fresh?.unconfirmed !== false) return { tokenCleaned: true };
-				const stillUsed = new Set((fresh.sources ?? []).map((s) => s.tokenRef || tokenRefForId(s.id)));
-				if (stillUsed.has(plan.tokenRef)) return { tokenCleaned: true };
-			} catch {
-				return { tokenCleaned: true };
-			}
-			try {
-				await remotes.unsetToken(plan.tokenRef);
-			} catch (error) {
-				return { tokenCleaned: false, tokenRef: plan.tokenRef, error: String(error && error.message ? error.message : error) };
-			}
-			return { tokenCleaned: true };
+			return { tokenRetained: Boolean(plan.tokenRef) };
 		}
 
-		// 待清理令牌按 ref 累积：连续移除两个源站且令牌都清理失败时，两条提示必须各自
-		// 保留——单对象状态会让第二个覆盖第一个，先失败的那条孤儿令牌就再没有重试入口。
-		// 同一 ref 再次失败只更新原因，不拆成两条。
-		function mergeTokenCleanup(list, entry) {
+		// 保留凭证的说明按 ref 累积；同一 ref 更新说明，不拆成多条。
+		function mergeRetainedCredential(list, entry) {
 			const rows = Array.isArray(list) ? list : [];
 			const index = rows.findIndex((row) => row.ref === entry.ref);
 			if (index === -1) return [...rows, entry];
 			const next = rows.slice();
 			next[index] = { ...rows[index], ...entry };
 			return next;
-		}
-
-		// 重试成功只移除自身那一条：其余待清理项的重试入口不受影响。
-		function dropTokenCleanup(list, ref) {
-			return (Array.isArray(list) ? list : []).filter((row) => row.ref !== ref);
 		}
 
 		// 源站删除写入成功后的本地权威推进：远端已生效，界面不得继续依赖回读——
@@ -417,10 +384,8 @@ window.__ModuleLoader__.load({
 			const [saving, setSaving] = react.useState(false);
 			const [saved, setSaved] = react.useState(false);
 			const [error, setError] = react.useState("");
-			// 移除源站后令牌清理失败的待重试列表：每项 { ref, name, error }，按 ref 累积
-			// （连续移除多个源站且都失败时，每条都得有自己的重试入口）。源站列表已删，
-			// 这里只补凭证库那一刀；某条重试成功才移除该条提示。
-			const [tokenCleanups, setTokenCleanups] = react.useState([]);
+			// 保留凭证的会话内提示：每项 { ref, name, kind }，不提供不安全的删除入口。
+			const [retainedCredentials, setRetainedCredentials] = react.useState([]);
 			// Web 与桌面端统一默认简体中文，不依赖浏览器或 Electron 的语言。
 			const [lang, setLang] = react.useState("zh");
 			// loaded：是否至少成功读取过一次配置。没有权威基线就开放写入，等于允许
@@ -520,11 +485,11 @@ window.__ModuleLoader__.load({
 			// committed 为本次成功提交的令牌草稿（id→值），对应卡片若未被再次编辑就清空草稿。
 			// 读取不可信（unconfirmed）时抛错而非合并：合并一个降级出来的空列表会把
 			// 本地基线清掉，调用方按读取失败处理（保存结果如实显示为同步失败）。
-			async function reread(committed) {
+			async function reread(committed, previousStored = stored) {
 				const r = await face.describe();
 				if (r?.unconfirmed) throw new Error(T.unconfirmedRead);
 				const described = r.sources ?? [];
-				setSources((prev) => mergeDrafts(described, prev, committed));
+				setSources((prev) => mergeDrafts(described, prev, committed, previousStored));
 				setStored(described);
 				setDefaultSource(r.defaultSource ?? "");
 				setReadOnly(r.readOnly === true);
@@ -543,101 +508,45 @@ window.__ModuleLoader__.load({
 				}
 			}
 
-			// 记录一条凭证清理失败（保留重试入口）。kind 决定提示文案：
-			// removed=移除源站后的孤儿令牌；replaced=轮换后被替换的旧令牌；staged=保存
-			// 失败后未能回收的暂存令牌。
-			function noteTokenCleanup(entry) {
-				setTokenCleanups((prev) => mergeTokenCleanup(prev, { ...entry, error: messageOf(entry.error) }));
+			// removed=移除后保留；replaced=轮换后保留；staged=保存未确认时保留。
+			function noteRetainedCredential(entry) {
+				setRetainedCredentials((prev) => mergeRetainedCredential(prev, entry));
 			}
 
-			// 统一的写入落点：先写令牌草稿，再整表写 sources + defaultSource（带版本检查），
-			// 生效后清理被替换的旧凭证，最后回读合并。
-			// 失败时保证「生效的 URL 与令牌」仍然配套：配置没写成就回收暂存的新令牌，
-			// 不让新令牌留在旧地址上生效。
+			// 新令牌先落到新引用，再原子切换当前 profile 的配置。没有宿主全局引用
+			// 协调能力前，所有成功、失败、未知应答路径都禁止回收共享凭证。
 			async function persist({ nextSources, nextDefault, plan }) {
 				if (!loaded) { setError(T.notLoaded); return; }
-				// 配置写入是「宿主明确拒绝」还是「结果未知」，决定暂存凭证能不能回收。
-				let rejected = false;
+				const attemptedRefs = [];
 				setSaving(true); setSaved(false); setError("");
 				try {
-					// 先完成全部校验再开始任何写入，避免名称/URL 非法时令牌已落库的半保存状态。
 					validateSources(nextSources, T);
-					for (const { ref, value } of plan.tokenWrites) await face.setToken(ref, value);
-					try {
-						await face.writeSources(nextSources, nextDefault, revision);
-					} catch (writeError) {
-						// 只有宿主明确拒绝才算「确定没写入」，此时暂存的新令牌成了孤儿
-						// 凭证，可以回收。结果未知（RPC 断开等）时不能删——宿主可能已经
-						// 提交，删掉就等于把一个正在生效的令牌抹掉。
-						rejected = Boolean(writeError && writeError.remoteRejected);
-						if (rejected) {
-							for (const ref of plan.stagedRefs) {
-								try {
-									await face.unsetToken(ref);
-								} catch (error) {
-									noteTokenCleanup({ ref, name: ref, error, kind: "staged" });
-								}
-							}
-						}
-						throw writeError;
+					for (const { ref, value } of plan.tokenWrites) {
+						// RPC 抛错也可能已经写入；记下尝试过的引用，不据此删除。
+						attemptedRefs.push(ref);
+						await face.setToken(ref, value);
 					}
-					// 配置已生效：被替换掉的旧令牌可以清除了——前提是没有别的源站还在用它。
-					// 配置允许多个源站共用一个自定义 tokenRef，「本源站不再引用」不等于
-					// 「无人引用」；凭证只写不读，删掉就再也拿不回来。
-					const stillUsed = await activeTokenRefs();
-					for (const entry of plan.staleRefs) {
-						// 无法确认（读取失败）时一律不动：留一条孤儿凭证远好过删掉在用的。
-						if (stillUsed === null || stillUsed.has(entry.ref)) continue;
-						try {
-							await face.unsetToken(entry.ref);
-						} catch (error) {
-							noteTokenCleanup({ ref: entry.ref, name: entry.name, error, kind: "replaced" });
-						}
-					}
-					// 同步回读：写入已成功，回读失败（含 unconfirmed）只影响界面同步——
-					// 显示读取错误、不显示「已保存」即可，不进入写入错误的处理链（否则会
-					// 误触发「结果未知」的暂存凭证处置，把已生效的保存当成未确认）。
+					await face.writeSources(nextSources, nextDefault, revision);
+					// 已确认提交，立即记录持久化身份；即使两次回读都失败，也不能再把
+					// 新卡片当成从未保存的草稿。当前闭包的回读显式使用该新基线。
+					setStored(nextSources);
+					setDefaultSource(nextDefault);
+					for (const entry of plan.staleRefs) noteRetainedCredential({ ...entry, kind: "replaced" });
 					let readError = null;
 					try {
-						await reread(plan.committed);
+						await reread(plan.committed, nextSources);
 					} catch (e) {
 						readError = e;
-						await reread().catch(() => {});
+						await reread(undefined, nextSources).catch(() => {});
 					}
 					if (readError === null) setSaved(true);
 					else setError(messageOf(readError));
 				} catch (e) {
 					setError(messageOf(e));
-					// 基线可能已经前进（版本冲突、别处先写）：以服务端为准重读一次，
-					// 用户草稿保留，重新保存即可带上新版本。重读失败也不影响上面的报错。
 					await reread().catch(() => {});
-					// 结果未知时暂存凭证必须留着按权威状态处置，不能当成孤儿。
-					if (!rejected && plan.stagedRefs.length > 0) await settleUnconfirmedStaged(plan.stagedRefs);
+					for (const ref of attemptedRefs) noteRetainedCredential({ ref, name: ref, kind: "staged" });
 				} finally {
 					setSaving(false);
-				}
-			}
-
-			// 当前仍在被引用的凭证引用集合；无法读取权威状态（读取抛错，或信封 ok
-			// 但业务载荷缺失/畸形）时返回 null（调用方按「无法确认」处理，不做任何删除）。
-			async function activeTokenRefs() {
-				try {
-					const fresh = await face.describe();
-					if (fresh?.unconfirmed) return null;
-					return new Set((fresh.sources ?? []).map((s) => s.tokenRef || tokenRefForId(s.id)));
-				} catch {
-					return null;
-				}
-			}
-
-			// 写入结果未知后的暂存凭证处置：先问权威状态——若配置已经切到某个暂存引用，
-			// 说明这次写入其实生效了，那条引用正在生效，绝不能清。其余的保留为待清理项
-			// （重试前会再确认一次，见 retryTokenCleanup）。
-			async function settleUnconfirmedStaged(refs) {
-				const activeRefs = await activeTokenRefs();
-				for (const ref of refs) {
-					if (activeRefs !== null && activeRefs.has(ref)) continue;
-					noteTokenCleanup({ ref, name: ref, error: new Error(T.unconfirmedWrite), kind: "staged" });
 				}
 			}
 
@@ -669,7 +578,7 @@ window.__ModuleLoader__.load({
 				await persist({ nextSources, nextDefault: resolveDefault(nextSources, defaultSource), plan });
 			}
 
-			// 移除即写：确认后立即从存储删除该卡片并清除其令牌，不再等保存按钮。
+			// 移除即写：只删除当前 profile 的源站配置，关联凭证保留。
 			async function onRemove(id) {
 				if (!loaded) { setError(T.notLoaded); return; }
 				if (!window.confirm(T.confirmRemoveSource)) return;
@@ -690,19 +599,18 @@ window.__ModuleLoader__.load({
 						nextDefault,
 						expectedRevision: revision,
 						tokenRef: target.tokenRef || tokenRefForId(target.id),
-						tokenConfigured: Boolean(target.tokenConfigured),
 					});
 					// 写入已生效：先按已知结果推进本地权威展示（不等回读），否则回读
 					// 失败时界面会留着实际上已删除的源站卡片。
 					setSources((prev) => localStateAfterRemoval({ sources: prev, removedId: id, nextSources, nextDefault }).sources);
 					setStored(nextSources);
 					setDefaultSource(nextDefault);
-					// 再记录清理失败（保留重试入口）：即使回读失败，提示也不会丢。
-					if (!outcome.tokenCleaned) {
-						noteTokenCleanup({ ref: outcome.tokenRef, name: target.name, error: outcome.error, kind: "removed" });
+					// 保留说明不依赖后续回读是否成功。
+					if (outcome.tokenRetained) {
+						noteRetainedCredential({ ref: target.tokenRef || tokenRefForId(target.id), name: target.name, kind: "removed" });
 					}
 					await reread();
-					if (outcome.tokenCleaned) setSaved(true);
+					setSaved(true);
 				} catch (e) {
 					setError(messageOf(e));
 					// 同上：基线可能已前进，重读一次再让用户重试。
@@ -710,46 +618,6 @@ window.__ModuleLoader__.load({
 				} finally {
 					setSaving(false);
 				}
-			}
-
-			// 重试清除某一条孤儿令牌：只补这一条 ref 的那一刀。成功只移除自身提示，
-			// 并再同步一次（此前的回读可能失败过，本地不得停留在过期状态）；失败就地
-			// 更新该条的原因，其余待清理项的重试入口原样保留。
-			async function retryTokenCleanup(ref) {
-				if (!ref) return;
-				setSaving(true); setSaved(false);
-				// 引用可能已经被后来的保存重新启用（另一页写入、或本页保存成功后又改过）：
-				// 先按权威状态确认它仍未生效再清。宁可留一条孤儿凭证，也不能删掉正在用
-				// 的令牌——凭证是只写的，删掉就再也拿不回来。
-				const activeRefs = await activeTokenRefs();
-				if (activeRefs === null) {
-					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: T.cleanupUnverified }));
-					setSaving(false);
-					return;
-				}
-				if (activeRefs.has(ref)) {
-					setTokenCleanups((prev) => dropTokenCleanup(prev, ref));
-					setSaving(false);
-					return;
-				}
-				try {
-					await face.unsetToken(ref);
-				} catch (e) {
-					setTokenCleanups((prev) => mergeTokenCleanup(prev, { ref, error: messageOf(e) }));
-					setSaving(false);
-					return;
-				}
-				setTokenCleanups((prev) => dropTokenCleanup(prev, ref));
-				setError("");
-				setSaved(true);
-				try {
-					await reread();
-				} catch (e) {
-					// 清理已成功，但重同步失败的同步错误仍须显示（不能假装一致）。
-					const message = String(e && e.message ? e.message : e);
-					setError(message === HOST_UNSUPPORTED ? T.hostTooOld : message);
-				}
-				setSaving(false);
 			}
 
 			// 设为默认即写：只改 defaultSource，sources 数组以存储值原样回写（不动草稿）。
@@ -803,20 +671,20 @@ window.__ModuleLoader__.load({
 				setSaving(false);
 			}
 
-			// 待清理凭证的提示文案按来源分档：移除源站的孤儿令牌、轮换后被替换的
-			// 旧令牌、保存失败后未回收的暂存令牌。三种都得给出各自的重试入口。
-			function cleanupMessage(entry) {
+			// 按操作说明为什么没有自动清理凭证；不把主动保留说成清理失败。
+			function retentionMessage(entry) {
 				const name = String(entry.name || entry.ref);
-				if (entry.kind === "replaced") return T.replacedTokenPending.replace("{name}", name);
-				if (entry.kind === "staged") return T.stagedTokenPending.replace("{name}", name);
-				return T.removedTokenPending.replace("{name}", name);
+				if (entry.kind === "replaced") return T.replacedCredentialRetained.replace("{name}", name);
+				if (entry.kind === "staged") return T.writtenCredentialRetained.replace("{name}", name);
+				return T.removedCredentialRetained.replace("{name}", name);
 			}
 
 			function renderSource(s) {
 				const isDefault = effectiveDefault === s.id;
 				const dirty = rowDirty(s, storedById);
 				// 已配置时显示虚假掩码；聚焦后展示空白的替换草稿（沿用单源站掩码/聚焦逻辑）。
-				const tokenValue = s.tokenConfigured && !s.tokenFocus && s.tokenDraft === "" ? MASK : s.tokenDraft;
+				const tokenValue = s.tokenConfigured === true && !s.tokenFocus && s.tokenDraft === "" ? MASK : s.tokenDraft;
+				const unknown = s.tokenConfigured !== true && s.tokenConfigured !== false;
 				return hs("div", { key: s.id, style: S.sourceCard, children: [
 					hs("div", { style: S.sourceHeader, children: [
 						h("span", { style: S.label, children: T.sourceNameLabel }),
@@ -847,7 +715,7 @@ window.__ModuleLoader__.load({
 					hs("div", { style: S.row, children: [
 						hs("div", { style: S.head, children: [
 							h("label", { style: S.label, children: T.tokenLabel }),
-							h("span", { style: { ...S.badge, ...(s.tokenConfigured ? S.badgeOk : {}) }, children: s.tokenConfigured ? T.configured : T.notConfigured })
+							h("span", { style: { ...S.badge, ...(s.tokenConfigured ? S.badgeOk : {}) }, children: unknown ? T.statusUnknown : (s.tokenConfigured ? T.configured : T.notConfigured) })
 						] }),
 						hs("div", { style: S.inputRow, children: [
 							h("input", {
@@ -865,7 +733,7 @@ window.__ModuleLoader__.load({
 								}
 							})
 						] }),
-						h("p", { style: S.hint, children: s.tokenConfigured ? T.tokenHintConfigured : T.tokenHintEmpty })
+						h("p", { style: S.hint, children: unknown ? T.tokenHintUnknown : (s.tokenConfigured ? T.tokenHintConfigured : T.tokenHintEmpty) })
 					] }),
 					// 本卡片专属保存：仅当有未保存编辑时可用，只提交本卡片。
 					hs("div", { style: S.footer, children: [
@@ -925,25 +793,24 @@ window.__ModuleLoader__.load({
 					hs("div", { style: S.head, children: [
 						h("span", { style: S.title, children: T.sourcesHeading })
 					] }),
+					h("p", { style: S.hint, children: T.sharedCredentialHint }),
 					hostUnsupported ? h("p", { style: S.err, children: T.hostTooOld }) : null,
 					!hostUnsupported && sources.length === 0 ? h("p", { style: S.hint, children: T.sourcesEmpty }) : null,
 					hostUnsupported ? null : hs("div", { style: S.list, children: sources.map(renderSource) }),
 					hs("div", { style: S.footer, children: [
 						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported, onClick: onAdd, children: T.addSource }),
-						// 读取失败后唯一的出路：重新读取。没有权威基线时新增/保存都被拦住。
-						!loaded && !hostUnsupported ? h("button", { type: "button", style: S.button, disabled: saving, onClick: reload, children: T.reload }) : null
+						// 随时可重新读取状态；没有权威配置基线时新增/保存仍被拦住。
+						!hostUnsupported ? h("button", { type: "button", style: S.button, disabled: saving, onClick: reload, children: T.reload }) : null
 					] }),
 					hs("div", { style: S.footer, children: [
 						h("button", { type: "button", style: S.button, disabled: saving || hostUnsupported || !anyDirty, onClick: onSaveAll, children: saving ? T.saving : T.saveAllSources }),
 						saved ? h("p", { style: S.msg, children: T.saved }) : null,
 						error ? h("p", { style: S.err, children: error }) : null
 					] }),
-					// 令牌清理待重试：每条一个独立的提示与重试按钮（按 ref 累积，互不覆盖），
-					// 独立于通用 error 展示，提示保留到各自重试成功为止。
-					...tokenCleanups.map((entry) => hs("div", { key: entry.ref, style: S.footer, children: [
-						h("p", { style: S.err, children: `${cleanupMessage(entry)} ${entry.error}` }),
-						h("button", { type: "button", style: S.button, disabled: saving, onClick: () => retryTokenCleanup(entry.ref), children: T.retryTokenCleanup })
-					] }))
+					// 只提示保留情况，不提供未经宿主全局协调的删除/重试入口。
+					...retainedCredentials.map((entry) => h("p", {
+						key: entry.ref, style: S.hint, children: retentionMessage(entry)
+					}))
 				] }) : null
 			] });
 		}
@@ -961,8 +828,7 @@ window.__ModuleLoader__.load({
 		// 远端应答统一拆封：remote.* 一律返回 { ok, value } 或 { ok:false, error:{ message } }，
 		// 没有 result.value 外层（那是 WebSocket 传输信封，远端门面已经拆过了）。
 		// 失败必须抛出可读信息：静默降级成空数据会把故障伪装成“没有配置”。
-		// remoteRejected 标记区分两种失败：宿主明确拒绝（可以据此回滚）与结果未知
-		// （RPC 断开、传输异常——宿主可能已经提交，绝不能当成回滚信号）。
+		// remoteRejected 标记区分宿主明确拒绝与传输结果未知；两者均不授权删除共享凭证。
 		function remoteRejectedError(message) {
 			const error = new Error(message);
 			error.remoteRejected = true;
@@ -974,7 +840,7 @@ window.__ModuleLoader__.load({
 			const message = (response && typeof response === "object" ? response.error?.message : undefined) || `${what} failed`;
 			// 只有形状完整、明确写着 ok:false 的应答才算「宿主明确拒绝」。信封缺失或
 			// 畸形（undefined、null、没有 ok 字段）时无从判定，必须按结果未知处理——
-			// 当成拒绝会回滚一次其实已经提交、且已经生效的写入。
+			// 不能把无法确认的应答宣称为未提交。
 			if (response && typeof response === "object" && response.ok === false) throw remoteRejectedError(message);
 			throw new Error(message);
 		}
@@ -1101,13 +967,12 @@ window.__ModuleLoader__.load({
 					// 数组；写入口（validateConfig）保证每行都是可识别的源站形状。因此：
 					// value 不是对象、sources 不是数组、或 normalizeSource 丢弃了任何一行，
 					// 都说明这不是宿主契约内的合法配置——经降级/过滤得到的空列表不是
-					// 「权威的空配置」，把它用于删除决策会放行对共享凭证的删除，把它用于
-					// 基线会让随后的保存不带修订号地整表覆盖已存源站。
+					// 「权威的空配置」；把它用于基线会让随后的保存不带修订号地整表覆盖已存源站。
 					const rawValue = grafanaNs?.value;
 					const rawSources = rawValue && typeof rawValue === "object" && !Array.isArray(rawValue) && Array.isArray(rawValue.sources) ? rawValue.sources : null;
 					const sources = rawSources === null ? [] : rawSources.map(normalizeSource).filter(Boolean);
 					// 信封 ok 但载荷缺失/畸形（没有 namespaces 数组、没有 grafana 命名空间、
-					// 或上述业务载荷无效）时为 true：渲染层可降级，凭证回收与基线替换必须
+					// 或上述业务载荷无效）时为 true：渲染层可降级，基线替换必须
 					// 按「无法确认」处理。
 					const unconfirmed = !Array.isArray(described?.namespaces) || !grafanaNs
 						|| rawSources === null || sources.length !== rawSources.length;
@@ -1120,31 +985,37 @@ window.__ModuleLoader__.load({
 					let creds = {};
 					const credentials = credentialsApi();
 					if (refs.length && credentials?.describe) {
-						// describe(refs)：位置参数数组；value 直接就是 ref → { configured, source?, writable } 的 record。
-						creds = unwrap(await credentials.describe(refs), "credentials.describe") ?? {};
+						try {
+							const result = unwrap(await credentials.describe(refs), "credentials.describe");
+							if (result && typeof result === "object" && !Array.isArray(result)) creds = result;
+						} catch {
+							// 状态失败不是缺失；不回显可能含敏感数据的 provider 错误。
+						}
 					}
 					const defaultSource = typeof value.defaultSource === "string" ? value.defaultSource : "";
 					return {
 						hostUnsupported: false,
 						unconfirmed,
-						sources: sources.map((s) => ({ ...s, tokenConfigured: Boolean(creds[s.tokenRef]?.configured) })),
+						sources: sources.map((s) => {
+							const info = Object.prototype.hasOwnProperty.call(creds, s.tokenRef) ? creds[s.tokenRef] : null;
+							const known = info && typeof info === "object" && !Array.isArray(info)
+								&& Object.prototype.hasOwnProperty.call(info, "configured") && typeof info.configured === "boolean";
+							return { ...s, tokenConfigured: known ? info.configured : null };
+						}),
 						defaultSource,
 						// 只读模式是非 secret 的普通配置项，随 value 明文返回，卡片据此展示权限边界。
 						readOnly: value.readOnly === true,
 						revision
 					};
 				},
-				// 令牌走凭证库（仅写不读）：set(ref, value) / unset(ref)，均为位置参数。
+				// 令牌走凭证库（仅写不读）：set(ref, value) 为位置参数；共享删除被禁用。
 				setToken: async (ref, value) => {
 					const credentials = credentialsApi();
 					if (!credentials?.set) throw new Error(HOST_UNSUPPORTED);
 					unwrap(await credentials.set(ref, value), "credentials.set");
 				},
-				unsetToken: async (ref) => {
-					const credentials = credentialsApi();
-					if (!credentials?.unset) throw new Error(HOST_UNSUPPORTED);
-					unwrap(await credentials.unset(ref), "credentials.unset");
-				},
+				// 保留旧门面方法名以明确拒绝陈旧调用，不暴露不安全的共享删除操作。
+				unsetToken: async () => { throw new Error("SHARED_CREDENTIAL_CLEANUP_DISABLED"); },
 				// 写入整个 sources 数组 + defaultSource。单次 mutate 双 set op：set 对目标路径
 				// 整体赋值（数组整体替换，不做按下标合并），两个 op 在宿主写队列的单个事务里
 				// 一起应用、一起持久化——此前「先 mutate unset 再 update」两步写在第二步失败时，
@@ -1204,7 +1075,7 @@ window.__ModuleLoader__.load({
 		// 供测试驱动的纯函数、应答解析与卡片文案（不参与运行时契约）。
 		// STRINGS 入列是为了让“宿主过旧”提示的双语存在性可被断言：卡片的 render 路径
 		// 本仓库没有 DOM 测试台，文案键缺失只能在这一层拦住。
-		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault, removeSourceRemote, mergeTokenCleanup, dropTokenCleanup, localStateAfterRemoval, stagedTokenRef, tokenWritePlan, buildSavePlan });
+		exports.internals = Object.freeze({ STRINGS, settingsNamespacesOf, generateSourceId, tokenRefForId, normalizeSource, validateSources, nextSourcesFor, rowDirty, mergeDrafts, canSetDefault, removeSourceRemote, mergeRetainedCredential, localStateAfterRemoval, stagedTokenRef, tokenWritePlan, buildSavePlan });
 		return module.exports;
 	}
 });

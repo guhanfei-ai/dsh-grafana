@@ -21,6 +21,8 @@ If private reporting is unavailable, contact the repository owner privately befo
 
 - Grafana credentials are resolved only on the DSH host.
 - Browser configuration uses DSH's privileged loopback-same-origin credential RPC.
+- Profiles may share a credential store while keeping separate source configurations. The settings client never automatically deletes credentials after rotation, removal or an unconfirmed save; without host-wide coordination, a local reference check cannot prove deletion is safe. Retained credentials may accumulate and remain valid at Grafana until revoked there; source removal is not credential revocation.
+- Credential status is configured, missing or unknown. Provider failures and malformed status replies are unknown, never proof of absence or successful authentication.
 - Every `grafana_push` call enters DSH's native approval flow and fails closed when approval is unavailable.
 - Dashboard identity, version, and folder are checked immediately before a write.
 - Configured Grafana hosts are trusted destinations. Operators remain responsible for DNS, TLS, network routing, and model-provider data policy.

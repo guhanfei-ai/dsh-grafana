@@ -45,10 +45,10 @@ function loadBrowserRuntime(react, browserGlobals) {
 //   · settings.describe 的 value 是聚合格 { writable, hasDocument, namespaces[] }。
 // remote:false 模拟没有 remote.* 命名空间服务的旧宿主；fail 按方法名注入 { ok:false }
 // 应答（例如 { 'credentials.describe': '...' }），用于验证失败不会被静默吞掉。
-function buildBackend({ sources = [], defaultSource = '', creds = {}, locale = 'zh', fail = {}, readOnly = false } = {}) {
+function buildBackend({ sources = [], defaultSource = '', creds = {}, credentialStore = null, locale = 'zh', fail = {}, readOnly = false } = {}) {
   const calls = []
   // state 是后端的可变权威：多个卡片（多个设置页）可以共享同一份，用来复现并发保存。
-  const credState = { ...creds }
+  const credState = credentialStore ?? { ...creds }
   const state = { sources: sources.map((s) => ({ ...s })), defaultSource, readOnly, revision: 0, creds: credState, writes: [] }
   // 可变副本：用例可以在运行期摘掉某条失败注入，模拟「故障恢复」。
   const failState = { ...fail }
@@ -252,6 +252,14 @@ function setup({ backend = null, react = null, remote = true, browserGlobals = {
 }
 
 // 并发用例的共享后端：一个已落库的源站 + 一枚已生效的令牌，带版本检查的 mutate。
+function sharedBackendOptions() {
+  return {
+    sources: [{ id: 'id-a', name: 'a', baseUrl: 'https://alpha.example.com', tokenRef: 'GRAFANA_TOKEN_ida' }],
+    defaultSource: 'id-a',
+    creds: { GRAFANA_TOKEN_ida: 'demo-token-original' },
+  }
+}
+
 function sharedBackend(options = {}) {
   return buildBackend({
     locale: 'en',
@@ -539,7 +547,7 @@ test('describe reads back every source with its token status and the default sou
   const r = await face.describe()
   assert.equal(JSON.stringify(r), JSON.stringify({
     hostUnsupported: false,
-    // 载荷结构有效（读到 namespaces 与 grafana 命名空间）：凭证回收路径可放心
+    // 载荷结构有效（读到 namespaces 与 grafana 命名空间）：配置基线可放心
     // 把它当权威状态；unconfirmed 只在信封 ok 但业务载荷缺失时为 true。
     unconfirmed: false,
     sources: [
@@ -580,13 +588,12 @@ test('every remote call passes exactly the declared number of arguments', async 
   await face.localePreference()
   await face.writeSources([source], 'id-a')
   await face.setToken('GRAFANA_TOKEN_ida', 'v')
-  await face.unsetToken('GRAFANA_TOKEN_ida')
+  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_ida'), /SHARED_CREDENTIAL_CLEANUP_DISABLED/)
   const declared = {
     'settings.describe': 0,
     'settings.mutate': 3,
     'credentials.describe': 1,
     'credentials.set': 2,
-    'credentials.unset': 1,
   }
   assert.deepEqual([...new Set(calls.map(([m]) => m))].sort(), Object.keys(declared).sort())
   for (const [method, args] of calls) {
@@ -637,36 +644,25 @@ test('writeSources derives the token ref from the id when a new source omits it'
   assert.equal(JSON.stringify(sourcesOp.value), JSON.stringify([{ id: 'abc-123', name: 'fresh', baseUrl: 'https://fresh.example.com', tokenRef: 'GRAFANA_TOKEN_abc123' }]))
 })
 
-test('setToken and unsetToken route through the credential store with the per-source ref', async () => {
+test('setToken uses its reference while the old deletion facade refuses unsafe cleanup', async () => {
   const { face, calls } = setup()
-  await face.setToken('GRAFANA_TOKEN_idprod', 'tok')
+  await face.setToken('GRAFANA_TOKEN_idprod', 'demo-token')
   const setCall = calls.find(([m]) => m === 'credentials.set')
-  assert.equal(JSON.stringify(setCall[1]), JSON.stringify(['GRAFANA_TOKEN_idprod', 'tok']))
-  await face.unsetToken('GRAFANA_TOKEN_idprod')
-  const unsetCall = calls.find(([m]) => m === 'credentials.unset')
-  assert.equal(JSON.stringify(unsetCall[1]), JSON.stringify(['GRAFANA_TOKEN_idprod']))
+  assert.equal(JSON.stringify(setCall[1]), JSON.stringify(['GRAFANA_TOKEN_idprod', 'demo-token']))
+  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_idprod'), /SHARED_CREDENTIAL_CLEANUP_DISABLED/)
+  assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
 })
 
-test('removing a source rewrites the list and unsets its token credential', async () => {
-  const { face, calls } = setup({
-    sources: [
-      { id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' },
-      { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' },
-    ],
-    defaultSource: 'id-prod',
-    creds: { GRAFANA_TOKEN_idprod: 'p', GRAFANA_TOKEN_ideu: 'e' },
-  })
-  // 模拟保存：移除 eu → 写入只剩 prod 的列表 + 清除 eu 的令牌凭证。
-  await face.writeSources([{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }], 'id-prod')
-  await face.unsetToken('GRAFANA_TOKEN_ideu')
-  const unsetCall = calls.find(([m]) => m === 'credentials.unset')
-  assert.equal(JSON.stringify(unsetCall[1]), JSON.stringify(['GRAFANA_TOKEN_ideu']))
-  const r = await face.describe()
-  assert.equal(r.sources.length, 1)
-  assert.equal(r.sources[0].id, 'id-prod')
-  assert.equal(r.defaultSource, 'id-prod')
-  // eu 的令牌已从凭证库清除。
-  assert.equal(r.sources.some((s) => s.id === 'id-eu'), false)
+test('removing a source updates only its profile and retains the credential', async () => {
+  const card = cardHarness({ ...sharedBackendOptions(), locale: 'en' })
+  await card.ready()
+  await card.click('Remove source')
+  assert.equal(card.state.sources.length, 0)
+  assert.equal(card.state.defaultSource, '')
+  assert.equal(card.credState.GRAFANA_TOKEN_ida, 'demo-token-original')
+  assert.equal(card.calls.some(([m]) => m === 'credentials.unset'), false)
+  assert.equal(card.states[5], true)
+  assert.match(JSON.stringify(card.render()), /not automatically cleared/)
 })
 
 test('localePreference reads the locale namespace preference', async () => {
@@ -853,7 +849,7 @@ test('describe reports an unsupported host instead of rendering an empty source 
   assert.equal(await face.localePreference(), '')
   // 写路径必须抛稳定错误码，绝不能静默“成功”。
   await assert.rejects(() => face.setToken('GRAFANA_TOKEN_x', 'tok'), /HOST_UNSUPPORTED/)
-  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_x'), /HOST_UNSUPPORTED/)
+  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_x'), /SHARED_CREDENTIAL_CLEANUP_DISABLED/)
   await assert.rejects(() => face.writeSources([{ id: 'a', name: 'a' }], 'a'), /HOST_UNSUPPORTED/)
 })
 
@@ -866,7 +862,7 @@ test('a rejected settings.describe surfaces its message instead of being swallow
   await assert.rejects(() => face.describe(), /settings document is locked/)
 })
 
-test('a rejected credentials.describe surfaces its message and never fakes “not configured”', async () => {
+test('a rejected credentials.describe reports unknown without leaking the provider error', async () => {
   // 旧实现在这里抛 TypeError 并被卡片的 .catch(() => {}) 吞掉，导致令牌状态恒显示“未配置”。
   const { face } = setup({
     sources: [{ id: 'id-prod', name: 'prod', baseUrl: 'https://prod.example.com', tokenRef: 'GRAFANA_TOKEN_idprod' }],
@@ -874,7 +870,10 @@ test('a rejected credentials.describe surfaces its message and never fakes “no
     creds: { GRAFANA_TOKEN_idprod: 'secret' },
     fail: { 'credentials.describe': 'credential store unavailable' },
   })
-  await assert.rejects(() => face.describe(), /credential store unavailable/)
+  const described = await face.describe()
+  assert.equal(described.unconfirmed, false)
+  assert.equal(described.sources.length, 1)
+  assert.equal(described.sources[0].tokenConfigured, null)
 })
 
 test('writeSources surfaces a rejected mutate instead of reporting success', async () => {
@@ -910,114 +909,56 @@ test('setToken surfaces a rejected credential write', async () => {
   await assert.rejects(() => face.setToken('GRAFANA_TOKEN_x', 'tok'), /credential store is read-only/)
 })
 
-test('unsetToken surfaces a rejected credential clear', async () => {
-  const { face } = setup({ fail: { 'credentials.unset': 'credential store is read-only' } })
-  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_x'), /credential store is read-only/)
+test('unsafe credential deletion is refused before contacting the provider', async () => {
+  const { face, calls } = setup({ fail: { 'credentials.unset': 'credential store is read-only' } })
+  await assert.rejects(() => face.unsetToken('GRAFANA_TOKEN_x'), /SHARED_CREDENTIAL_CLEANUP_DISABLED/)
+  assert.equal(calls.length, 0)
 })
 
-// 移除源站的远端编排（onRemove 的接线层）：列表先写、令牌后清；令牌清理失败必须
-// 如实返回待重试的 ref，且已生效的列表删除不回滚——UI 据此显示「源站已移除、令牌
-// 清理失败」与重试按钮，而不是把移除渲染成全然成功。
-test('removeSourceRemote writes the list first and reports a failed token clear without rolling back', async () => {
-  const internals = loadBrowserRuntime().internals
-  const source = { id: 'id-eu', name: 'eu', baseUrl: 'https://eu.example.com', tokenRef: 'GRAFANA_TOKEN_ideu' }
-
-  // 成功路径：恰一次 mutate 写列表，随后 unset 清令牌；两步都成功。
-  {
-    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu', creds: { GRAFANA_TOKEN_ideu: 'e' } })
-    const outcome = await internals.removeSourceRemote(face, {
-      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
+// 移除只写当前 profile 配置，任何凭证状态下都不自动删除共享凭证。
+test('removeSourceRemote retains credentials for every status and propagates settings rejection', async () => {
+  const { removeSourceRemote } = loadBrowserRuntime().internals
+  const source = sharedBackendOptions().sources[0]
+  for (const tokenConfigured of [true, false, null]) {
+    const { face, calls, credState } = setup(sharedBackendOptions())
+    const outcome = await removeSourceRemote(face, {
+      nextSources: [], nextDefault: '', tokenRef: source.tokenRef, tokenConfigured,
     })
-    assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
-    assert.deepEqual(
-      calls.map(([m]) => m).filter((m) => m === 'settings.mutate' || m === 'credentials.unset'),
-      ['settings.mutate', 'credentials.unset'],
-    )
-    // 令牌确实被清了。
-    assert.equal((await face.describe()).sources.some((s) => s.id === 'id-eu'), false)
+    assert.equal(outcome.tokenRetained, true)
+    assert.deepEqual(calls.map(([method]) => method), ['settings.mutate'])
+    assert.equal(credState[source.tokenRef], 'demo-token-original')
+    assert.equal((await face.describe()).sources.length, 0)
   }
-
-  // 清理失败：列表写入已生效（不回滚），失败如实带回待重试的 ref 与原因。
-  {
-    const { face, calls } = setup({
-      sources: [source],
-      defaultSource: 'id-eu',
-      creds: { GRAFANA_TOKEN_ideu: 'e' },
-      fail: { 'credentials.unset': 'credential store is read-only' },
-    })
-    const outcome = await internals.removeSourceRemote(face, {
-      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
-    })
-    assert.equal(outcome.tokenCleaned, false)
-    assert.equal(outcome.tokenRef, 'GRAFANA_TOKEN_ideu')
-    assert.match(outcome.error, /credential store is read-only/)
-    // 源站删除没有被回滚：存储里已无该源站（描述里 tokenConfigured 也随 describe 消失）。
-    const described = await face.describe()
-    assert.equal(described.sources.some((s) => s.id === 'id-eu'), false)
-    // 清理确实尝试过（GET 重试链之外恰一次 unset）。
-    assert.equal(calls.filter(([m]) => m === 'credentials.unset').length, 1)
-  }
-
-  // 令牌本就未配置：不碰凭证库。
-  {
-    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu' })
-    const outcome = await internals.removeSourceRemote(face, {
-      nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: false,
-    })
-    assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
-    assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
-  }
-
-  // 列表写入本身被拒：整体失败向外抛（沿用 persist 的错误路径），不进入令牌清理。
-  {
-    const { face, calls } = setup({ sources: [source], defaultSource: 'id-eu', fail: { 'settings.mutate': 'revision conflict' } })
-    await assert.rejects(
-      () => internals.removeSourceRemote(face, {
-        nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_ideu', tokenConfigured: true,
-      }),
-      /revision conflict/,
-    )
-    assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
-  }
+  const { face, calls } = setup({ ...sharedBackendOptions(), fail: { 'settings.mutate': 'revision conflict' } })
+  await assert.rejects(() => removeSourceRemote(face, {
+    nextSources: [], nextDefault: '', tokenRef: source.tokenRef,
+  }), /revision conflict/)
+  assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
+  assert.equal((await face.describe()).sources.length, 1)
 })
 
-test('the removed-token captions exist in both locales', () => {
+test('retention and unknown-state captions exist in both locales without a cleanup retry', () => {
   const { STRINGS } = loadBrowserRuntime().internals
   for (const lang of ['zh', 'en']) {
-    for (const key of ['removedTokenPending', 'retryTokenCleanup']) {
-      assert.equal(typeof STRINGS[lang][key], 'string', `${lang}.${key} must exist`)
+    for (const key of ['removedCredentialRetained', 'replacedCredentialRetained', 'writtenCredentialRetained', 'statusUnknown', 'tokenHintUnknown', 'sharedCredentialHint']) {
+      assert.equal(typeof STRINGS[lang][key], 'string')
       assert.ok(STRINGS[lang][key].length > 0)
     }
+    assert.equal(STRINGS[lang].retryTokenCleanup, undefined)
+    assert.ok(STRINGS[lang].removedCredentialRetained.includes('{name}'))
   }
-  assert.notEqual(STRINGS.zh.removedTokenPending, STRINGS.en.removedTokenPending)
-  assert.notEqual(STRINGS.zh.retryTokenCleanup, STRINGS.en.retryTokenCleanup)
-  // 多条待清理项并存时用户要能分辨是哪一台源站：文案带源站名占位符。
-  for (const lang of ['zh', 'en']) assert.ok(STRINGS[lang].removedTokenPending.includes('{name}'))
 })
 
-// 连续移除两个源站且令牌都清理失败：两条提示必须各自保留（单对象状态会让第二条
-// 覆盖第一条，先失败的那条孤儿令牌就再没有重试入口），且各自重试互不影响。
-test('token cleanup failures accumulate per ref and clear independently', () => {
-  const { mergeTokenCleanup, dropTokenCleanup } = loadBrowserRuntime().internals
-  // 跨 realm 对象一律用 JSON.stringify 比较（vm 沙箱造出的数组原型链与本 realm 不同源）。
-  let list = mergeTokenCleanup([], { ref: 'GRAFANA_TOKEN_ida', name: 'a', error: 'store read-only' })
-  list = mergeTokenCleanup(list, { ref: 'GRAFANA_TOKEN_idb', name: 'b', error: 'store offline' })
-  assert.equal(JSON.stringify(list.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_ida', 'GRAFANA_TOKEN_idb']))
-  // 重试 a 成功只移除 a，b 的重试入口与原样保留。
-  const afterA = dropTokenCleanup(list, 'GRAFANA_TOKEN_ida')
-  assert.equal(JSON.stringify(afterA.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_idb']))
-  assert.equal(afterA[0].name, 'b')
-  assert.equal(afterA[0].error, 'store offline')
-  // 同一 ref 重试仍失败：只更新原因，不拆成两条（也不丢名称）。
-  const retried = mergeTokenCleanup(afterA, { ref: 'GRAFANA_TOKEN_idb', error: 'still read-only' })
-  assert.equal(retried.length, 1)
-  assert.equal(retried[0].error, 'still read-only')
-  assert.equal(retried[0].name, 'b')
-  // 全部清理成功后清空。
-  assert.equal(JSON.stringify(dropTokenCleanup(retried, 'GRAFANA_TOKEN_idb')), '[]')
-  // 空/畸形入参不炸。
-  assert.equal(JSON.stringify(dropTokenCleanup(null, 'x')), '[]')
-  assert.equal(JSON.stringify(mergeTokenCleanup(null, { ref: 'r' })), JSON.stringify([{ ref: 'r' }]))
+// 保留说明逐项累积，同一引用不重复添加。
+test('retained-credential notices accumulate and deduplicate per reference', () => {
+  const { mergeRetainedCredential } = loadBrowserRuntime().internals
+  let list = mergeRetainedCredential([], { ref: 'GRAFANA_TOKEN_ida', name: 'a', kind: 'removed' })
+  list = mergeRetainedCredential(list, { ref: 'GRAFANA_TOKEN_idb', name: 'b', kind: 'replaced' })
+  list = mergeRetainedCredential(list, { ref: 'GRAFANA_TOKEN_idb', kind: 'staged' })
+  assert.equal(list.length, 2)
+  assert.equal(list[1].name, 'b')
+  assert.equal(list[1].kind, 'staged')
+  assert.equal(JSON.stringify(mergeRetainedCredential(null, { ref: 'r' })), JSON.stringify([{ ref: 'r' }]))
 })
 
 // 删除写入成功后必须立即按已知结果推进本地：远端已生效，回读失败时界面不能继续
@@ -1048,33 +989,19 @@ test('the local state advances on a successful removal write without waiting for
   assert.equal(cleared.defaultSource, '')
 })
 
-test('two consecutive failed removals yield distinct pending token refs', async () => {
-  const internals = loadBrowserRuntime().internals
-  const sources = [
-    { id: 'id-a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_ida' },
-    { id: 'id-b', name: 'b', baseUrl: 'https://b.example.com', tokenRef: 'GRAFANA_TOKEN_idb' },
-  ]
-  const { face } = setup({
-    sources,
-    defaultSource: 'id-a',
-    creds: { GRAFANA_TOKEN_ida: 'a', GRAFANA_TOKEN_idb: 'b' },
-    fail: { 'credentials.unset': 'credential store is read-only' },
-  })
-  // 先移除 a，再移除 b：两次清理都失败，但各自带回自己的 ref 与源站名。
-  const first = await internals.removeSourceRemote(face, {
-    nextSources: [sources[1]], nextDefault: 'id-b', tokenRef: 'GRAFANA_TOKEN_ida', tokenConfigured: true,
-  })
-  const second = await internals.removeSourceRemote(face, {
-    nextSources: [], nextDefault: '', tokenRef: 'GRAFANA_TOKEN_idb', tokenConfigured: true,
-  })
-  assert.equal(first.tokenCleaned, false)
-  assert.equal(second.tokenCleaned, false)
-  let pending = []
-  pending = internals.mergeTokenCleanup(pending, { ref: first.tokenRef, name: 'a', error: first.error })
-  pending = internals.mergeTokenCleanup(pending, { ref: second.tokenRef, name: 'b', error: second.error })
-  // 两条并存（不是后者覆盖前者），才可能各自重试。
-  assert.equal(JSON.stringify(pending.map((entry) => entry.ref)), JSON.stringify(['GRAFANA_TOKEN_ida', 'GRAFANA_TOKEN_idb']))
-  assert.equal(JSON.stringify(pending.map((entry) => entry.name)), JSON.stringify(['a', 'b']))
+test('consecutive source removals retain both credentials and both notices', async () => {
+  const card = cardHarness({ locale: 'en', sources: [
+    { id: 'a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_a' },
+    { id: 'b', name: 'b', baseUrl: 'https://b.example.com', tokenRef: 'GRAFANA_TOKEN_b' },
+  ], creds: { GRAFANA_TOKEN_a: 'demo-a', GRAFANA_TOKEN_b: 'demo-b' } })
+  await card.ready()
+  await card.click('Remove source')
+  await card.click('Remove source')
+  assert.equal(card.state.sources.length, 0)
+  assert.equal(card.states[7].length, 2)
+  assert.equal(card.credState.GRAFANA_TOKEN_a, 'demo-a')
+  assert.equal(card.credState.GRAFANA_TOKEN_b, 'demo-b')
+  assert.equal(card.calls.some(([m]) => m === 'credentials.unset'), false)
 })
 
 // 配置允许多个源站共用一个自定义 tokenRef：移除其中一个时，剩余源站仍引用的
@@ -1089,7 +1016,7 @@ test('removing one source keeps the token another source still shares', async ()
   const outcome = await internals.removeSourceRemote(face, {
     nextSources: [beta], nextDefault: 'id-b', tokenRef: shared, tokenConfigured: true,
   })
-  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenRetained: true }))
   // 未发 unset：剩余源站仍引用该凭证。
   assert.equal(calls.some(([m]) => m === 'credentials.unset'), false)
   assert.equal(state.creds[shared], 'demo-shared')
@@ -1109,7 +1036,7 @@ test('a malformed post-removal describe keeps the shared token instead of treati
   const realDescribe = settings.describe
   let malformedOnce = false
   settings.describe = async (...args) => {
-    // 保存（移除写入）成功后的第一次引用确认读取：{ok:true,value:{}}。
+    // 保存（移除写入）成功后的第一次同步读取：{ok:true,value:{}}。
     if (!malformedOnce) {
       malformedOnce = true
       return { ok: true, value: {} }
@@ -1119,9 +1046,10 @@ test('a malformed post-removal describe keeps the shared token instead of treati
   const outcome = await internals.removeSourceRemote(face, {
     nextSources: [beta], nextDefault: 'id-b', tokenRef: shared, tokenConfigured: true,
   })
-  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenCleaned: true }))
+  assert.equal(JSON.stringify(outcome), JSON.stringify({ tokenRetained: true }))
   // 共享凭证仍在（后续 describe 恢复正常后可见剩余源站仍在引用它）。
   assert.equal(state.creds[shared], 'demo-shared')
+  assert.equal((await face.describe()).unconfirmed, true)
   const described = await face.describe()
   assert.equal(described.unconfirmed, false)
   assert.equal(described.sources.some((s) => s.id === 'id-b' && s.tokenConfigured), true)
@@ -1145,12 +1073,13 @@ test('the remove confirmation keeps the shared-credential wording without promis
   const { STRINGS } = loadBrowserRuntime().internals
   for (const lang of ['zh', 'en']) {
     const text = STRINGS[lang].confirmRemoveSource
-    assert.match(text, /共用|shares/)
+    assert.match(text, /profile/)
+    assert.match(text, /不会自动清除|not automatically cleared/)
     assert.doesNotMatch(text, /如实提示|says so/)
   }
 })
 
-// 保存路径的同形防护（G3 原文场景）：轮换成功后的引用确认读取畸形时，被替换的
+// 保存路径的同形防护（G3 原文场景）：轮换成功后的同步读取畸形时，被替换的
 // 共享凭证必须保留——畸形读取不等于「无人引用」。
 test('a malformed read after a successful rotation keeps the shared token', async () => {
   const remote = sharedBackend()
@@ -1176,8 +1105,9 @@ test('a malformed read after a successful rotation keeps the shared token', asyn
   card.change('password', 'demo-alpha-replacement')
   armed = true
   await card.click('Save this source')
-  // 保存本身成功：畸形读取只跳过旧引用清理，不把保存渲染成失败。
-  assert.equal(card.states[5], true)
+  // 配置保存成功，但首次同步读取不可信，必须显示同步错误。
+  assert.equal(card.states[5], false)
+  assert.match(card.states[6], /cannot be parsed/)
   const [alpha, beta] = remote.state.sources
   assert.equal(remote.state.creds[alpha.tokenRef], 'demo-alpha-replacement')
   // 第二源站仍指向原引用；畸形读取没有被当成「无人引用」，共享凭证必须还在。
@@ -1208,8 +1138,8 @@ test('face.describe marks structurally invalid source payloads as unconfirmed', 
   }
 })
 
-// 命名空间在场但业务载荷无效（三种形状）：轮换成功后的引用确认读取返回这种载荷，
-// 不能把它当成「权威的空列表」放行对共享凭证的删除。
+// 命名空间在场但业务载荷无效（三种形状）：轮换成功后的同步读取返回这种载荷，
+// 不能把它当成「权威的空列表」替换配置基线。
 test('a namespace with a malformed source payload is unconfirmed, not an empty list', async () => {
   for (const value of [{}, { sources: 'invalid' }, { sources: [null] }]) {
     const remote = sharedBackend()
@@ -1226,7 +1156,7 @@ test('a namespace with a malformed source payload is unconfirmed, not an empty l
     let next = false
     remote.settings.mutate = async (...args) => { const result = await mutate(...args); next = true; return result }
     remote.settings.describe = async (...args) => {
-      // 写入成功后的第一次引用确认读取：命名空间在场、业务载荷无效。
+      // 写入成功后的第一次同步读取：命名空间在场、业务载荷无效。
       if (next) { next = false; return { ok: true, value: { namespaces: [{ ns: 'grafana', revision: 1, value }] } } }
       return describe(...args)
     }
@@ -1234,7 +1164,7 @@ test('a namespace with a malformed source payload is unconfirmed, not an empty l
     await card.click('Save this source')
     const [alpha, beta] = remote.state.sources
     assert.equal(remote.state.creds[alpha.tokenRef], 'demo-alpha-replacement')
-    // 第二源站仍指向共享引用：降级出的空列表没有被当「无人引用」，共享凭证保留。
+    // 第二源站仍指向共享引用；同步失败不会触发任何凭证删除。
     assert.equal(beta.tokenRef, 'GRAFANA_TOKEN_alpha')
     assert.equal(remote.state.creds.GRAFANA_TOKEN_alpha, 'demo-shared')
     assert.equal(card.states[0][1].tokenConfigured, true)
@@ -1359,7 +1289,7 @@ test('mergeDrafts keeps other cards’ drafts and drops cards removed from the s
   const described = [
     { id: 'a', name: 'a-stored', baseUrl: 'https://stored.example.com', tokenRef: 'GRAFANA_TOKEN_a', tokenConfigured: true },
   ]
-  const merged = mergeDrafts(described, drafts)
+  const merged = mergeDrafts(described, drafts, undefined, drafts.slice(0, 2))
   assert.equal(merged.length, 2)
   // a：草稿（含令牌草稿与聚焦态）保留，但 tokenConfigured 以存储为准刷新。
   assert.equal(merged[0].id, 'a')
@@ -1374,7 +1304,7 @@ test('mergeDrafts keeps other cards’ drafts and drops cards removed from the s
   // 存储里新增而草稿没有的卡片：补进来并初始化草稿字段。
   const withExtra = mergeDrafts([...described, {
     id: 'c', name: 'c', baseUrl: 'https://c.example.com', tokenRef: 'GRAFANA_TOKEN_c', tokenConfigured: false,
-  }], drafts)
+  }], drafts, undefined, drafts.slice(0, 2))
   const c = withExtra.find((s) => s.id === 'c')
   assert.equal(c.tokenDraft, '')
   assert.equal(c.tokenFocus, false)
@@ -1493,12 +1423,14 @@ test('a failed settings write leaves the old token serving the old URL instead o
   // settings 持久化失败（凭证写入发生在前）。
   card.settings.mutate = async () => ({ ok: false, error: { message: 'settings persistence failed' } })
   await card.click('Save this source')
-  // 生效配置仍是旧 URL + 旧令牌；新令牌既没有写到旧 ref，也没留下孤儿暂存凭证。
+  // 生效配置仍是旧 URL + 旧令牌；新凭证留在独立引用，不回收也不覆盖旧 ref。
   const stored = await card.face.describe()
   assert.equal(stored.sources[0].baseUrl, 'https://alpha.example.com')
   assert.equal(stored.sources[0].tokenRef, 'GRAFANA_TOKEN_ida')
   assert.equal(card.credState.GRAFANA_TOKEN_ida, 'token-alpha')
-  assert.deepEqual(Object.keys(card.credState), ['GRAFANA_TOKEN_ida'])
+  assert.equal(Object.keys(card.credState).length, 2)
+  assert.equal(card.calls.some(([m]) => m === 'credentials.unset'), false)
+  assert.equal(card.states[7][0].kind, 'staged')
   assert.match(String(card.states[6]), /settings persistence failed/)
 })
 
@@ -1521,8 +1453,7 @@ test('a successful token save stops being dirty and does not revert a later rota
   assert.equal(card.calls.filter(([m]) => m === 'credentials.set').length, 1)
 })
 
-// 两个页面依次保存同一源站：后保存者的暂存引用必须是自己的，配置被 CAS 拒绝后
-// 只能回收自己的那一条，不能删掉另一页已经生效的凭证。
+// 两个页面依次保存同一源站：CAS 拒绝陈旧配置，所有已写入凭证保留。
 test('a stale second save cannot delete the credential the winning page just activated', async () => {
   const remote = sharedBackend()
   const first = cardHarness({ backend: remote })
@@ -1539,32 +1470,29 @@ test('a stale second save cannot delete the credential the winning page just act
   await second.click('Save this source')
   assert.equal(remote.state.sources[0].baseUrl, 'https://new-a.example.com')
   assert.equal(second.states[6], 'revision conflict')
-  // 生效凭证仍在：第二页只回收了自己那条独占的暂存引用。
+  // 生效凭证仍在；被拒页面的暂存凭证也不自动删除。
   assert.equal(remote.state.creds[activeRef], 'demo-token-a')
 })
 
-// 单页：首次保存失败且暂存清理失败留下重试提示；再次保存成功后，旧提示指向的
-// 引用已被新的独占引用取代，点重试不能删掉正在生效的凭证。
-test('a stale cleanup notice never deletes the credential that has since gone live', async () => {
+// 保留说明不再提供删除重试；后来被启用的引用仍安全。
+test('retention notices have no unsafe retry even when their credential becomes active', async () => {
   const remote = sharedBackend()
   const card = cardHarness({ backend: remote })
   await card.ready()
-  card.change('url', 'https://replacement.example.com')
   card.change('password', 'demo-token-replacement')
-  remote.state.failMutate = true
-  const realUnset = remote.credentials.unset
-  remote.credentials.unset = async () => ({ ok: false, error: { message: 'credential cleanup unavailable' } })
+  remote.fail['settings.mutate'] = 'settings write rejected'
   await card.click('Save this source')
-  assert.equal(card.states[7].length, 1)
-  remote.state.failMutate = false
-  remote.credentials.unset = realUnset
-  await card.click('Save this source')
-  const activeRef = remote.state.sources[0].tokenRef
-  assert.equal(remote.state.creds[activeRef], 'demo-token-replacement')
-  // 旧提示仍在（那条孤儿凭证确实还在），但重试必须发现该引用已生效并放弃删除。
-  await card.click('Retry token cleanup')
-  assert.equal(remote.state.creds[activeRef], 'demo-token-replacement')
-  assert.equal(card.states[7].length, 0)
+  const retained = card.states[7][0].ref
+  assert.equal(remote.state.creds[retained], 'demo-token-replacement')
+  delete remote.fail['settings.mutate']
+  remote.state.sources[0].tokenRef = retained
+  remote.state.revision += 1
+  await card.click('Reload')
+  assert.equal(card.states[0][0].tokenConfigured, true)
+  assert.equal(card.buttons().some((b) => /Retry token cleanup|重试清除令牌/.test(String(b.props.children))), false)
+  await assert.rejects(() => card.face.unsetToken(retained), /SHARED_CREDENTIAL_CLEANUP_DISABLED/)
+  assert.equal(remote.state.creds[retained], 'demo-token-replacement')
+  assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
 })
 
 // 配置提交成功但应答丢失（RPC 断开）：不能推断「写入未生效」去删暂存凭证。
@@ -1808,3 +1736,216 @@ test('a failed mode write keeps the previous mode and surfaces the error', async
   assert.equal(String(card.states[13]), '')
   assert.match(String(card.states[14]), /settings persistence failed/)
 })
+
+
+// 独立 profile 的 settings/revision 分开，只有凭证 store 共用：不是同 profile 多页面。
+for (const operation of ['rotate-one', 'rotate-all', 'remove', 'rejected-save', 'lost-response']) {
+  test(`shared credentials survive ${operation} in another profile`, async () => {
+    const store = { GRAFANA_TOKEN_ida: 'demo-token-original' }
+    const web = buildBackend({ ...sharedBackendOptions(), credentialStore: store, locale: 'en' })
+    const desktop = buildBackend({ ...sharedBackendOptions(), credentialStore: store, locale: 'en' })
+    const other = setup({ backend: desktop })
+    const card = cardHarness({ backend: web })
+    await card.ready()
+    const otherBefore = JSON.stringify(desktop.state.sources)
+    if (operation === 'remove') {
+      await card.click('Remove source')
+      assert.equal(web.state.sources.length, 0)
+    } else {
+      card.change('password', 'demo-token-web-new')
+      if (operation === 'rejected-save') web.fail['settings.mutate'] = 'settings rejected'
+      if (operation === 'lost-response') {
+        const mutate = web.settings.mutate
+        web.settings.mutate = async (...args) => { await mutate(...args); throw new Error('transport disconnected') }
+      }
+      await card.click(operation === 'rotate-all' ? 'Save all sources' : 'Save this source')
+      if (operation === 'rejected-save') {
+        assert.equal(web.state.sources[0].tokenRef, 'GRAFANA_TOKEN_ida')
+        assert.match(card.states[6], /settings rejected/)
+      } else {
+        assert.notEqual(web.state.sources[0].tokenRef, 'GRAFANA_TOKEN_ida')
+        assert.equal(store[web.state.sources[0].tokenRef], 'demo-token-web-new')
+      }
+    }
+    assert.equal(store.GRAFANA_TOKEN_ida, 'demo-token-original')
+    assert.equal(JSON.stringify(desktop.state.sources), otherBefore)
+    assert.equal(desktop.state.revision, 0)
+    assert.equal((await other.face.describe()).sources[0].tokenConfigured, true)
+    assert.equal([...web.calls, ...desktop.calls].some(([m]) => m === 'credentials.unset'), false)
+    assert.equal(card.states[7].length > 0, true)
+    assert.equal(card.buttons().some((b) => /Retry token cleanup|重试清除令牌/.test(String(b.props.children))), false)
+  })
+}
+
+test('a partial credential write failure preserves all old and possibly written references', async () => {
+  const remote = sharedBackend({ sources: [
+    { id: 'a', name: 'a', baseUrl: 'https://a.example.com', tokenRef: 'GRAFANA_TOKEN_a' },
+    { id: 'b', name: 'b', baseUrl: 'https://b.example.com', tokenRef: 'GRAFANA_TOKEN_b' },
+  ], creds: { GRAFANA_TOKEN_a: 'demo-a', GRAFANA_TOKEN_b: 'demo-b' } })
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  const passwords = card.inputs().filter((n) => n.props.type === 'password')
+  passwords[0].props.onChange({ target: { value: 'demo-new-a' } })
+  passwords[1].props.onChange({ target: { value: 'demo-new-b' } })
+  const set = remote.credentials.set
+  let writes = 0
+  remote.credentials.set = async (...args) => {
+    await set(...args)
+    if (++writes === 2) throw new Error('write reply lost')
+    return { ok: true }
+  }
+  await card.click('Save all sources')
+  assert.deepEqual(remote.state.sources.map((s) => s.tokenRef), ['GRAFANA_TOKEN_a', 'GRAFANA_TOKEN_b'])
+  assert.equal(Object.keys(remote.credState).length, 4)
+  assert.equal(card.states[7].length, 2)
+  assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
+  assert.match(card.states[6], /write reply lost/)
+})
+
+const unknownCredentialCases = [
+  ['absent facade', (b) => { b.credentials = undefined }],
+  ['absent method', (b) => { delete b.credentials.describe }],
+  ['missing envelope', (b) => { b.credentials.describe = async () => undefined }],
+  ['missing value', (b) => { b.credentials.describe = async () => ({ ok: true }) }],
+  ['missing reference', (b) => { b.credentials.describe = async () => ({ ok: true, value: {} }) }],
+  ['array payload', (b) => { b.credentials.describe = async () => ({ ok: true, value: [] }) }],
+  ['missing configured', (b) => { b.credentials.describe = async () => ({ ok: true, value: { GRAFANA_TOKEN_ida: {} } }) }],
+  ['nonboolean configured', (b) => { b.credentials.describe = async () => ({ ok: true, value: { GRAFANA_TOKEN_ida: { configured: 'true' } } }) }],
+  ['inherited configured', (b) => { b.credentials.describe = async () => ({ ok: true, value: { GRAFANA_TOKEN_ida: Object.create({ configured: true }) } }) }],
+  ['inherited reference', (b) => { b.credentials.describe = async () => ({ ok: true, value: Object.create({ GRAFANA_TOKEN_ida: { configured: true } }) }) }],
+  ['rejection', (b) => { b.credentials.describe = async () => ({ ok: false, error: { message: 'demo-provider-secret' } }) }],
+  ['exception', (b) => { b.credentials.describe = async () => { throw new Error('demo-provider-secret') } }],
+]
+for (const [label, inject] of unknownCredentialCases) {
+  test(`credential ${label} is unknown without losing settings or faking a mask`, async () => {
+    const remote = sharedBackend()
+    inject(remote)
+    const card = cardHarness({ backend: remote })
+    await card.ready()
+    assert.equal(card.states[0][0].tokenConfigured, null)
+    assert.equal(card.states[9], true)
+    assert.equal(card.states[10], 0)
+    assert.equal(card.inputs().find((n) => n.props.type === 'password').props.value, '')
+    const rendered = JSON.stringify(card.render())
+    assert.match(rendered, /Status unavailable/)
+    assert.doesNotMatch(rendered, /demo-provider-secret/)
+    assert.equal(card.buttons().some((n) => n.props.children === 'Reload'), true)
+    assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
+  })
+}
+
+test('credential status failure affects only rows whose boolean status is unavailable', async () => {
+  const remote = sharedBackend({ sources: [
+    ...sharedBackendOptions().sources,
+    { id: 'b', name: 'b', baseUrl: 'https://b.example.com', tokenRef: 'GRAFANA_TOKEN_b' },
+    { id: 'c', name: 'c', baseUrl: 'https://c.example.com', tokenRef: 'GRAFANA_TOKEN_c' },
+  ] })
+  remote.credentials.describe = async () => ({ ok: true, value: {
+    GRAFANA_TOKEN_ida: { configured: true }, GRAFANA_TOKEN_b: { configured: false },
+  } })
+  const { face } = setup({ backend: remote })
+  assert.equal(JSON.stringify((await face.describe()).sources.map((s) => s.tokenConfigured)), '[true,false,null]')
+})
+
+for (const locale of ['zh', 'en']) {
+  test(`unknown credential state is visible and reloadable in ${locale}`, async () => {
+    const remote = sharedBackend({ locale })
+    remote.credentials.describe = async () => ({ ok: true, value: {} })
+    const card = cardHarness({ backend: remote })
+    await card.ready()
+    const rendered = JSON.stringify(card.render())
+    assert.match(rendered, locale === 'zh' ? /状态读取失败/ : /Status unavailable/)
+    remote.credentials.describe = async () => ({ ok: true, value: { GRAFANA_TOKEN_ida: { configured: true } } })
+    await card.click(locale === 'zh' ? '重新读取' : 'Reload')
+    assert.equal(card.states[0][0].tokenConfigured, true)
+    assert.match(card.inputs().find((n) => n.props.type === 'password').props.value, /^\*{28}$/)
+  })
+}
+
+for (const tokenConfigured of [true, false, null]) {
+  test(`draft merging uses persistence rather than credential status ${tokenConfigured}`, () => {
+    const { mergeDrafts } = loadBrowserRuntime().internals
+    const saved = { id: 'saved', name: 'saved', tokenConfigured, tokenDraft: 'demo-draft' }
+    const fresh = { id: 'fresh', name: 'fresh', tokenConfigured, tokenDraft: 'demo-new' }
+    const merged = mergeDrafts([], [saved, fresh], undefined, [saved])
+    assert.equal(JSON.stringify(merged.map((s) => s.id)), '["fresh"]')
+    assert.equal(merged[0].tokenDraft, 'demo-new')
+  })
+}
+
+for (const failFirstRead of [false, true]) {
+  test(`a newly committed source removed before reread is not resurrected (retry=${failFirstRead})`, async () => {
+    const remote = buildBackend({ locale: 'en' })
+    const card = cardHarness({ backend: remote })
+    await card.ready()
+    await card.click('Add source')
+    card.change('text', 'new-source')
+    card.change('url', 'https://new.example.com')
+    card.change('password', 'demo-new-token')
+    const mutate = remote.settings.mutate
+    remote.settings.mutate = async (...args) => {
+      const result = await mutate(...args)
+      // 另一页面在首次提交成功后、回读之前移除此源站。
+      remote.state.sources = []
+      remote.state.defaultSource = ''
+      remote.state.revision += 1
+      return result
+    }
+    const describe = remote.settings.describe
+    let failed = false
+    remote.settings.describe = async (...args) => {
+      if (failFirstRead && !failed) { failed = true; return { ok: true, value: {} } }
+      return describe(...args)
+    }
+    await card.click('Save this source')
+    assert.equal(card.states[0].length, 0)
+    remote.settings.mutate = mutate
+    await card.click('Save all sources')
+    assert.equal(remote.state.sources.length, 0)
+    assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
+  })
+}
+
+test('two failed post-save reads still remember that a new source was persisted', async () => {
+  const remote = buildBackend({ locale: 'en' })
+  const card = cardHarness({ backend: remote })
+  await card.ready()
+  await card.click('Add source')
+  card.change('text', 'new-source')
+  card.change('url', 'https://new.example.com')
+  card.change('password', 'demo-new-token')
+  const describe = remote.settings.describe
+  remote.settings.describe = async () => ({ ok: true, value: {} })
+  await card.click('Save this source')
+  assert.equal(remote.state.sources.length, 1)
+  assert.equal(card.states[1].length, 1, 'confirmed commit advances the persistence baseline')
+  assert.equal(card.states[5], false)
+  remote.state.sources = []
+  remote.state.defaultSource = ''
+  remote.state.revision += 1
+  remote.settings.describe = describe
+  // 旧修订号的保存被拒；回读必须丢弃这个已保存后被删除的源站。
+  await card.click('Save all sources')
+  assert.equal(card.states[0].length, 0)
+  await card.click('Save all sources')
+  assert.equal(remote.state.sources.length, 0)
+  assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
+})
+
+for (const initialState of ['missing', 'unknown']) {
+  test(`a saved source with ${initialState} credentials is not resurrected by a later save-all`, async () => {
+    const remote = sharedBackend({ creds: {} })
+    if (initialState === 'unknown') remote.credentials.describe = async () => ({ ok: true, value: {} })
+    const card = cardHarness({ backend: remote })
+    await card.ready()
+    remote.state.sources = []
+    remote.state.defaultSource = ''
+    remote.state.revision += 1
+    card.change('text', 'edited-source')
+    await card.click('Save all sources')
+    assert.equal(card.states[0].length, 0)
+    await card.click('Save all sources')
+    assert.equal(remote.state.sources.length, 0)
+    assert.equal(remote.calls.some(([m]) => m === 'credentials.unset'), false)
+  })
+}

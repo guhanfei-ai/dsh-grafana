@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Prevent cross-profile credential loss: the settings client retains old and possibly written credentials on rotation, source removal and failed or unconfirmed saves. Profile-local settings cannot prove a shared credential is globally unused, so automatic cleanup and its retry action are disabled until the host supplies coordinated reference checks. Retention is explained in the UI; it may leave unused credentials and does not revoke Grafana access.
+- Credential status reads distinguish configured, confirmed missing and unknown. Missing facades, malformed status replies and provider failures no longer masquerade as missing credentials; the page offers Reload and `grafana_sources` reports `token=unknown` without leaking provider errors. Draft merging uses the persisted source baseline rather than token presence, preventing missing/unknown saved sources from being resurrected after removal elsewhere.
 - The Grafana settings page defaults to Simplified Chinese in both web and desktop clients, including the first render and missing, unsupported or unreadable locale preferences. Browser and Electron language detection no longer changes the default; explicit DSH English selections remain supported.
 - Imported settings use the restricted parser only when the optional `js-yaml` package itself is absent. Invalid YAML, missing transitive dependencies and module initialization failures stop the migration without settings writes or credential cleanup. The restricted parser also rejects duplicate fields and invalid read-only booleans.
 
