@@ -24,16 +24,17 @@ jobs:
       # 即使某个版本失败也不中断其它版本，便于看全矩阵结果。
       fail-fast: false
       matrix:
-        # 基线保留三种 Node；alpha 增加独立验证，不覆盖默认开发依赖。
+        # 基线（= devDependencies 钉住的 dsh-tools 版本）保留三种 Node；
+        # 旧线增加独立验证，不覆盖默认开发依赖，守住 0.2.0 已装基盘不回归。
         include:
           - node: 20
-            dsh_tools: 0.2.0-rc.2
+            dsh_tools: 0.2.1-rc.2
           - node: 22
-            dsh_tools: 0.2.0-rc.2
+            dsh_tools: 0.2.1-rc.2
           - node: 24
-            dsh_tools: 0.2.0-rc.2
+            dsh_tools: 0.2.1-rc.2
           - node: 22
-            dsh_tools: 0.2.1-alpha.1
+            dsh_tools: 0.2.0-rc.2
     steps:
       # 拉取源码。
       - uses: actions/checkout@v4
@@ -44,8 +45,8 @@ jobs:
           cache: npm
       # 按 lockfile 精准安装依赖，--ignore-scripts 跳过安装期脚本（含 prepack）以免误触发发布流程。
       - run: npm ci --ignore-scripts
-      # 每个任务使用独立 checkout；仅 alpha 任务替换测试依赖，不改清单或锁文件。
-      - if: matrix.dsh_tools != '0.2.0-rc.2'
+      # 每个任务使用独立 checkout；仅旧线任务替换测试依赖，不改清单或锁文件。
+      - if: matrix.dsh_tools != '0.2.1-rc.2'
         run: npm install --no-save --package-lock=false --ignore-scripts --registry=https://registry.npmjs.org "@deepseek-ai/dsh-tools@${{ matrix.dsh_tools }}"
       # 确认测试实际解析到矩阵指定版本，防止依赖替换失败后仍测旧版本。
       - name: Check resolved dsh-tools version
