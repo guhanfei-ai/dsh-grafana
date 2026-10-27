@@ -56,7 +56,7 @@ dsh plugin --profile <profile> add link:/absolute/path/to/dsh-grafana
 
 Restart the selected DSH profile after installation.
 
-On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform; `deploy.sh` requires Git Bash, WSL, macOS, or Linux.
+On Windows, use an absolute `link:C:/path/to/dsh-grafana` path. The plugin itself is cross-platform.
 
 ## Upgrade notes
 
@@ -362,32 +362,6 @@ npm pack --dry-run --ignore-scripts
 Tests use Node's built-in test runner and mocked Grafana responses. The `0.2.0-rc.2` CI baseline covers Node 20, 22 and 24; Node 22 additionally checks `dsh-tools@0.2.1-alpha.1`. CI builds an actual `.tgz` and scans its contents for unexpected identifiers. These checks do not replace real DSH/Grafana acceptance.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CHANGELOG.md](./CHANGELOG.md).
-
-## Publishing
-
-Ordinary manual pushes do not trigger versioning or releases. Publishing is an explicit three-step flow from a clean, already committed `main` branch:
-
-```bash
-./deploy.sh release   # lock the version: bump, commit, tag, push (patch/minor/major or x.y.z)
-./deploy.sh build     # verify and pack the tarball into dist/
-./deploy.sh publish   # publish the tarball to npm, then create the GitHub Release with it
-```
-
-Run `./deploy.sh` with no arguments for the built-in help. Run `gh auth login` and `npm login` once before the first release. Each step guards itself: `all` and `release` pre-check the GitHub CLI and npm login state up front (so an expired or missing credential fails before the version is locked, tagged, and pushed), `release` requires a clean synced `main`, `build` requires the tag to sit on `HEAD`, and `publish` requires the packed tarball plus GitHub and npm credentials. Every remote-mutating step asks for confirmation first.
-
-`publish` uploads the exact tarball from `dist/` to npm first, then attaches the same file to the GitHub Release, so both channels serve byte-identical artifacts. npm versions are immutable: if `dsh-grafana@<version>` already exists on npm, the npm step is skipped and only the GitHub Release is created. The script never overwrites an existing GitHub Release.
-
-### npm prerequisites
-
-One-time setup before the first npm publish:
-
-1. Use an npmjs.com account with a verified email and two-factor authentication enabled for writes.
-2. Run `npm login` and confirm with `npm whoami`.
-3. The unscoped name `dsh-grafana` is already reserved under the package owner account. Switching to an organization scope such as `@guhanfei-ai/dsh-grafana` requires changing `package.json` first; `deploy.sh` reads the package name from there.
-
-With write 2FA enabled, `npm publish` prompts for a one-time password interactively. For non-interactive runs, pass it through the `NPM_OTP` environment variable.
-
-For supply-chain provenance, prefer npm Trusted Publishing from a dedicated CI workflow with `--provenance` over local publishing: a local login cannot provide the CI OIDC identity that provenance requires.
 
 ## License
 

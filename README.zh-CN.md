@@ -56,7 +56,7 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-grafana
 
 安装后重启对应 DSH profile。
 
-Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台；`deploy.sh` 需要 Git Bash、WSL、macOS 或 Linux。
+Windows 可使用 `link:C:/path/to/dsh-grafana` 形式的绝对路径。插件运行本身支持跨平台。
 
 ## 升级说明
 
@@ -362,32 +362,6 @@ npm pack --dry-run --ignore-scripts
 自动化测试使用 Node 内置测试运行器和模拟 Grafana 响应。CI 的 `0.2.0-rc.2` 基线覆盖 Node 20、22 和 24，另用 Node 22 验证 `dsh-tools@0.2.1-alpha.1`。CI 实际生成 `.tgz` 并扫描包内标识；这些检查不替代真实 DSH/Grafana 验收。
 
 更多信息参见 [CONTRIBUTING.md](./CONTRIBUTING.md) 和 [CHANGELOG.md](./CHANGELOG.md)。
-
-## 发布
-
-普通手工 `git push` 不会触发版本号、tag 或 Release。发布是一个显式的三步流程，要求 `main` 工作区干净且变更已提交：
-
-```bash
-./deploy.sh release   # 锁版本：递增版本、提交、打 tag、推送（patch/minor/major 或 x.y.z）
-./deploy.sh build     # 验证并打包，产物输出到 dist/
-./deploy.sh publish   # 先将安装包发布到 npm，再创建 GitHub Release 并上传同一产物
-```
-
-直接运行 `./deploy.sh`（不带参数）可查看内置帮助。首次发布前需要运行一次 `gh auth login` 和 `npm login`。每一步都有自我守卫：`all` 与 `release` 在开始前会先预检 GitHub 与 npm 登录状态（避免版本锁定、tag 推送之后才发现凭证失效白跑一遍），`release` 要求 `main` 干净且与远端同步，`build` 要求 tag 已锁定在 `HEAD` 上，`publish` 要求打包产物存在且 GitHub 与 npm 凭证就绪；所有会改动远端的操作都会先要求明确确认。
-
-`publish` 会先把 `dist/` 里的安装包发布到 npm，再把同一个文件上传到 GitHub Release，两个渠道分发的产物字节完全一致。npm 版本号不可变：如果 `dsh-grafana@<version>` 已在 npm 上存在，则跳过 npm 步骤、只创建 GitHub Release；脚本也绝不会覆盖已存在的 GitHub Release。
-
-### npm 前置条件
-
-首次 npm 发布前的一次性准备：
-
-1. 使用已验证邮箱、并为写操作开启双因素认证的 npmjs.com 账号。
-2. 执行 `npm login`，再用 `npm whoami` 确认身份。
-3. 无作用域名称 `dsh-grafana` 已由包所有者账号占用。如需改用 `@guhanfei-ai/dsh-grafana` 这类组织作用域名称，请先修改 `package.json`；`deploy.sh` 会从其中读取包名。
-
-开启写操作 2FA 后，`npm publish` 会交互式提示输入一次性验证码；非交互场景可通过 `NPM_OTP` 环境变量传入。
-
-如需供应链来源证明，建议改用独立 CI 工作流配置 npm Trusted Publishing 并加 `--provenance`；本地登录不具备可信来源证明所需的 CI OIDC 身份。
 
 ## 许可证
 
