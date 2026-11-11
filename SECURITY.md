@@ -23,7 +23,8 @@ If private reporting is unavailable, contact the repository owner privately befo
 - Browser configuration uses DSH's privileged loopback-same-origin credential RPC.
 - Profiles may share a credential store while keeping separate source configurations. The settings client never automatically deletes credentials after rotation, removal or an unconfirmed save; without host-wide coordination, a local reference check cannot prove deletion is safe. Retained credentials may accumulate and remain valid at Grafana until revoked there; source removal is not credential revocation.
 - Credential status is configured, missing or unknown. Provider failures and malformed status replies are unknown, never proof of absence or successful authentication.
-- Every `grafana_push` call enters DSH's native approval flow and fails closed when approval is unavailable.
+- Both `grafana_push` and `grafana_clone` require native approval by default and fail closed when it is unavailable. This plugin explicitly maps the calling session's live `danger-full-access` file policy to skipping its own extra confirmation; it is not a host-wide grant for remote services. Upstream decisions, plugin read-only mode, target-source binding, and write validation remain in force.
+- Disabled approval prompts alone never grant permission. A known `never` policy without a full-access exemption produces an automatic-policy-denial error, not a claim that the user clicked Reject. Missing or unreadable policy capabilities never introduce an exemption.
 - Dashboard identity, version, and folder are checked immediately before a write.
 - Configured Grafana hosts are trusted destinations. Operators remain responsible for DNS, TLS, network routing, and model-provider data policy.
 

@@ -15,7 +15,7 @@ A DeepSeek Harness plugin for agent-native Grafana observability — dashboards,
 - Edit panels, queries, thresholds, variables, and layout through conversation.
 - Preserve the dashboard folder automatically.
 - Detect concurrent edits before writing.
-- Require native DSH user approval for every write.
+- Require native DSH approval unless the calling session explicitly has `danger-full-access`; all write checks still apply.
 - Keep service-account credentials in the local DSH credential store.
 - Configure several named Grafana sources and target one per tool call.
 
@@ -130,7 +130,7 @@ Token changes switch to a fresh credential reference in the settings write. A de
 
 Token status is `configured`, `missing` (confirmed absent), or `unknown` (unconfirmed). A missing credential facade, failed read or malformed reply shows **Status unavailable**, with **Reload** always available; `grafana_sources` reports `token=unknown` without exposing credential values or provider errors. Configured means a credential exists, not that Grafana authentication succeeds. Draft persistence is tracked by the settings baseline, independently of token status.
 
-Every tool accepts an optional `source` argument (a configured source name); omit it to use the default source. Call `grafana_sources` to list the configured names, UIDs, base URLs, which token is configured, and which source is the default. Write approvals always show the target source name and URL on the first line so you can confirm which instance is modified, and the write is bound to that source: if the default source changes while the approval is pending, the write is refused instead of going to whichever instance happens to resolve at execution time. A read/approval/write chain is also bound to the source's URL and credential reference, so changing a source's address invalidates snapshots taken before the change — matching `id`/`uid`/`version` alone does not prove two responses came from the same instance. A single-source configuration from earlier versions is migrated on startup into one source named `default`, keeping its custom `tokenRef` if it had one. `allowInsecureHttp` remains a global setting that applies to all sources.
+Every tool accepts an optional `source` argument (a configured source name); omit it to use the default source. Call `grafana_sources` to list the configured names, UIDs, base URLs, which token is configured, and which source is the default. When a write prompt is required, it shows the target source name and URL on the first line so you can confirm which instance is modified, and the write is bound to that source: if the default source changes while the approval is pending, the write is refused instead of going to whichever instance happens to resolve at execution time. A read/approval/write chain is also bound to the source's URL and credential reference, so changing a source's address invalidates snapshots taken before the change — matching `id`/`uid`/`version` alone does not prove two responses came from the same instance. A single-source configuration from earlier versions is migrated on startup into one source named `default`, keeping its custom `tokenRef` if it had one. `allowInsecureHttp` remains a global setting that applies to all sources.
 
 ### Grafana permissions
 
@@ -195,8 +195,8 @@ Every tool accepts an optional `source` argument (a configured source name) to p
 | Tool | Behavior |
 | --- | --- |
 | `grafana_get` | Fetches the complete dashboard and records a short-lived trusted version/folder snapshot. With `summary: true` it returns a compact structural overview (panels, queries, thresholds, variables) instead of the full JSON and records no write snapshot — preferred for large dashboards. |
-| `grafana_push` | Updates a recently fetched dashboard after approval, identity checks, version checks, and folder preservation. |
-| `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Requires approval and a subsequent `grafana_get` before further writes. |
+| `grafana_push` | Updates a recently fetched dashboard under the live approval policy, with identity checks, version checks, and folder preservation. |
+| `grafana_clone` | Duplicates a dashboard into a brand-new dashboard (fresh UID, version 1), keeps the source folder by default, and returns the new dashboard URL. Follows the same approval policy as `grafana_push`; requires a subsequent `grafana_get` before further writes. |
 | `grafana_panel_query` | Executes the panel datasource queries behind a pasted dashboard or panel-view URL (`?viewPanel=` limits the query to that single panel; the URL `from`/`to` range is honored) and returns a bounded summary of the live values. Template variables use saved dashboard state by default; override with the `variables` argument — single values (`{"env":"prod"}`), multi-values (`{"host":["www","m"]}`, expanded per the query's format modifier), or adhoc filters (see [Template variable overrides](#template-variable-overrides-grafana_panel_query)). Adhoc filters are translated per datasource type: Elasticsearch targets get Lucene clauses, Prometheus/Loki see label matchers injected into every vector/stream selector, and SQL datasources get the `${__adhoc}` placeholder replaced with a WHERE clause; other datasource types with active adhoc filters throw an explicit error listing the support matrix. Adhoc overrides replace saved filters entirely — `[]` clears them — and are applied per target datasource uid, so a variable bound to one datasource never touches another. Unsupported operator/datasource combinations throw instead of being silently dropped. Only `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` variable types can be overridden (datasource variables take a uid string); unsupported types throw an error. For Prometheus/Loki targets a bare multi-value variable renders as `(a|b)` so it works inside `=~` matchers. Legacy datasource references are resolved automatically: plain string uids and `{"uid":"$datasource"}` references to datasource-type variables are resolved via `GET /api/datasources` (the saved `"default"` maps to the default datasource). Server-side expressions (`$__expr__`, e.g. `$A / 60`) pass through untouched, panels that fail variable interpolation are skipped instead of aborting the whole dashboard — with each skipped panel's id, title, and reason listed when nothing remains — and a failed batch request automatically falls back to per-panel queries (the whole selection stays a single batch POST whenever possible, keeping `$A`-style expression references intact). Read-only; records no write snapshot. |
 | `grafana_datasources` | Lists the datasources provisioned on a source (uid, plugin type, display name, whether it is the default, access mode, and the configured URL — a `url="(empty)"` row usually means a misconfigured datasource whose queries will fail, so pick another uid). Filter by exact plugin type or a case-insensitive name substring. Results are paged (default 40 rows per page; `limit` changes the page size, `page` fetches later pages), with a final line reporting the page, the total, and how to continue. Call it before `grafana_metric` to learn which uid or name to query. Read-only. |
 | `grafana_metric` | Runs one bare-text query (PromQL such as `up` or `rate(http_requests_total[5m])`, or a LogQL stream selector) directly against a Prometheus or Loki datasource, addressed by uid or exact display name — no dashboard needed. `mode: "instant"` (default) evaluates once at the range end; `mode: "range"` samples the series and reports per-series stats, a rising/falling/flat verdict, and a sparkline — with the actual sampling step on the header line (`step=`) and the returned point count per series (`points=`), so the precision and coverage of the answer are visible (a range query against loki returns log lines rather than numeric samples, so those series report a line count and the last line instead; on loki, instant mode accepts metric queries only — use range for log-stream selectors). Other plugin types and server-side expressions are rejected with a pointer to `grafana_panel_query`. Read-only; records no write snapshot. |
@@ -330,13 +330,30 @@ A real-machine verification matrix (variable overrides × operators × datasourc
 
 1. Ask DSH to fetch a dashboard URL or UID.
 2. Describe the requested changes.
-3. Review the write approval prompt, including the dashboard identity and change summary.
-4. Approve or reject the update.
+3. When a prompt is required, review the dashboard identity and change summary.
+4. Approve or reject the update; explicit full-access sessions skip this plugin's extra prompt.
 5. Refresh Grafana and fetch again before another write.
 
-`grafana_push` defaults to `overwrite: false`. It preserves the current folder, re-fetches the dashboard immediately before writing, and rejects stale versions. Folder moves require `allowFolderMove: true`. Forced overwrite requires `forceOverwrite: true` and still triggers approval.
+`grafana_push` defaults to `overwrite: false`. It preserves the current folder, re-fetches the dashboard immediately before writing, and rejects stale versions. Folder moves still require `allowFolderMove: true`; forced overwrite still requires `forceOverwrite: true`. Both follow the same approval policy below.
 
 The dashboard identity shown in the approval prompt (uid, title, version, folder) and the "fetched X minutes ago" label come entirely from the server-trusted snapshot recorded by `grafana_get`, never from the model-submitted dashboard JSON, so a hallucinated or tampered title cannot mislead the approver. Without a recent trusted snapshot the prompt states that the write will be rejected and asks for `grafana_get` first. Right before the prompt appears, the plugin also re-checks the live Grafana state: version or folder mismatches are surfaced as prominent warnings with both version numbers, and an unreachable Grafana is called out as "unable to confirm the current state". This live check only enriches the approval copy; the final validation always runs again at write time. When the live check succeeds, the prompt also includes a bounded, sanitized content diff between the current Grafana-side dashboard and the proposed JSON (panels, template variables, and top-level fields added, removed, or changed), so the approver can verify the actual change instead of relying on the model-supplied change summary alone.
+
+### Write approval and full access
+
+This plugin deliberately maps the calling session's live file policy to its **extra confirmation** for both `grafana_push` and `grafana_clone`:
+
+| Current session | Plugin behavior |
+| --- | --- |
+| Explicit `danger-full-access`, with either approval policy | Skip this plugin's extra prompt, including for explicit folder moves and forced overwrites. |
+| Other file policy, approval `ask` | Request native approval; missing answerers fail closed. |
+| No full-access exemption, known approval `never` | Deny without a prompt; report automatic policy denial, not a user clicking Reject. |
+| Missing session or missing, unreadable or unknown policy capabilities | No new exemption; retain native fail-closed approval. |
+
+The policy is resolved for each call and is not cached: switching back to a restricted mode restores confirmation on the next call. Custom presets work by their effective mode, not their name. Full access never replaces an upstream `ask`/`deny`/`cancel`, disables plugin read-only mode, grants Grafana permissions, or bypasses source binding and write validation. The host's file policy is not a universal authorization for remote services; skipping this extra prompt is an explicit policy of this plugin.
+
+On older hosts without the optional policy APIs, confirmation remains required. Disabling approval prompts alone does not make writes legal, and an automatic approval-policy failure must not be described as the user personally rejecting the operation. Other host gates can still require or deny approval; this adapter does not change host-wide rejection wording.
+
+Other plugins can copy the [generic adapter and integration recipe](<./CONTRIBUTING.md#reusing-the-write-approval-adapter>).
 
 ## Security and data boundaries
 

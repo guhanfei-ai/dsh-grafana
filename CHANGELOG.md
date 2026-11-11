@@ -21,6 +21,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Keep `js-yaml` on v4 for this maintenance cycle: v5 changes the default loader schema, merge-key support and empty-input behavior. Regression tests preserve v4 configuration imports, including quoted Unicode and aliases with merge keys.
 - Clarify the settings tab on newer hosts, version-specific migration guidance, dependency-resolution semantics and manual acceptance requirements in both READMEs and the integration record.
 
+## [0.18.4] - 2026-11-11
+
+### Fixed
+
+- Both dashboard write tools honor the calling session's live, explicit `danger-full-access` policy by skipping only this plugin's extra confirmation, matching the mindmap pattern. Upstream decisions, plugin read-only mode, target-source binding, and write-time checks remain unchanged. Without that exemption, a known disabled-approval policy now reports an automatic policy denial instead of entering the host path that labels it a user rejection; unknown capabilities retain native fail-closed approval. Cancellation remains cancellation, including when it happens while another gate is pending.
+- Synchronize the lockfile's root version and peer-range metadata with the package manifest, without changing resolved dependencies.
+
+### Added
+
+- A dependency-free write-approval adapter and a copyable integration recipe for other plugins, with 37 regression cases covering permission transitions, session isolation, optional capabilities, target binding, cancellation, and retained write validation. The complete automated suite passes 476 tests; real Grafana acceptance remains separate.
+
 ## [0.17.1] - 2026-09-30
 
 ### Fixed
