@@ -6,8 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Add incremental dashboard writes: `grafana_patch` applies bounded RFC 6902 operations, while `grafana_upsert_panel` and `grafana_variable_upsert` edit one panel or template variable without resending the whole model. All three use the trusted-snapshot, version-check, approval and source-binding chain.
+- Add `dashboardFile` to `grafana_push` and the read-only `grafana_diff_dashboard`: complete dashboard JSON can be read from a file confined to the session working directory, with content changes after approval refused.
+- Add `grafana_version_list` and `grafana_restore_version` for reviewed version-history inspection and rollback, `grafana_verify_panel` for explicit rows/cell/sum assertions, and `grafana_audit_time` for heuristic timezone and SQL time-column review.
+
 ### Fixed
 
+- `grafana_alerts` now queries the built-in Alertmanager and every configured Alertmanager data source, labels the source on aggregated rows, deduplicates forwarded alerts by fingerprint and state, and discloses discovery or per-source failures. An empty result no longer implies that uncovered external Alertmanagers have no alerts.
 - Prevent cross-profile credential loss: the settings client retains old and possibly written credentials on rotation, source removal and failed or unconfirmed saves. Profile-local settings cannot prove a shared credential is globally unused, so automatic cleanup and its retry action are disabled until the host supplies coordinated reference checks. Retention is explained in the UI; it may leave unused credentials and does not revoke Grafana access.
 - Credential status reads distinguish configured, confirmed missing and unknown. Missing facades, malformed status replies and provider failures no longer masquerade as missing credentials; the page offers Reload and `grafana_sources` reports `token=unknown` without leaking provider errors. Draft merging uses the persisted source baseline rather than token presence, preventing missing/unknown saved sources from being resurrected after removal elsewhere.
 - The Grafana settings page defaults to Simplified Chinese in both web and desktop clients, including the first render and missing, unsupported or unreadable locale preferences. Browser and Electron language detection no longer changes the default; explicit DSH English selections remain supported.

@@ -14,6 +14,7 @@ import {
   REQUEST_TIMEOUT_MS,
   TOOL_TIMEOUT_MS,
   TREND_TOOL_TIMEOUT_MS,
+  WRITE_TOOL_NAMES,
 } from '../lib/constants.js'
 import { abortableDelay, redactSecrets } from '../lib/util.js'
 
@@ -170,7 +171,15 @@ test('apply registers the whole tool surface and a hard approval gate for writes
     'grafana_get',
     'grafana_push',
     'grafana_clone',
+    'grafana_patch',
+    'grafana_upsert_panel',
+    'grafana_variable_upsert',
+    'grafana_restore_version',
+    'grafana_version_list',
+    'grafana_diff_dashboard',
+    'grafana_audit_time',
     'grafana_panel_query',
+    'grafana_verify_panel',
     'grafana_datasources',
     'grafana_metric',
     'grafana_trend',
@@ -1275,7 +1284,15 @@ test('every tool timeout covers its worst-case request chain', () => {
     grafana_get: TOOL_TIMEOUT_MS,
     grafana_push: TOOL_TIMEOUT_MS,
     grafana_clone: TOOL_TIMEOUT_MS,
+    grafana_patch: TOOL_TIMEOUT_MS,
+    grafana_upsert_panel: TOOL_TIMEOUT_MS,
+    grafana_variable_upsert: TOOL_TIMEOUT_MS,
+    grafana_restore_version: TOOL_TIMEOUT_MS,
+    grafana_version_list: TOOL_TIMEOUT_MS,
+    grafana_diff_dashboard: TOOL_TIMEOUT_MS,
+    grafana_audit_time: TOOL_TIMEOUT_MS,
     grafana_panel_query: QUERY_TOOL_TIMEOUT_MS,
+    grafana_verify_panel: QUERY_TOOL_TIMEOUT_MS,
     grafana_datasources: TOOL_TIMEOUT_MS,
     grafana_metric: METRIC_TOOL_TIMEOUT_MS,
     grafana_trend: TREND_TOOL_TIMEOUT_MS,
@@ -3924,25 +3941,25 @@ test('parseDashboardUrl restores var-* variable overrides from browser URLs', ()
 test('read-only mode keeps write tools out of the registry and denies them at runtime', async () => {
   const { tools, listeners } = createSettingsContext({ readOnly: true })
   const names = tools.map((tool) => tool.name)
-  assert.equal(names.includes('grafana_push'), false)
-  assert.equal(names.includes('grafana_clone'), false)
+  for (const name of WRITE_TOOL_NAMES) assert.equal(names.includes(name), false, `${name} must not be registered in read-only mode`)
   // 只读工具照常注册。
-  for (const name of ['grafana_get', 'grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
+  for (const name of ['grafana_get', 'grafana_version_list', 'grafana_diff_dashboard', 'grafana_audit_time', 'grafana_panel_query', 'grafana_verify_panel', 'grafana_datasources', 'grafana_metric', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
     assert.ok(names.includes(name), `missing read-only tool ${name}`)
   }
   // 运行时兜底：哪怕写入工具已注册（例如启动后才打开只读），审批门也直接 deny。
-  const decision = await listeners.get('tools/pre-execute')(
-    { name: 'grafana_push', arguments: {} },
-    async () => ({ kind: 'allow' }),
-  )
-  assert.equal(decision.kind, 'deny')
-  assert.match(decision.reason, /[Rr]ead-only/)
+  for (const name of WRITE_TOOL_NAMES) {
+    const decision = await listeners.get('tools/pre-execute')(
+      { name, arguments: {} },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(decision.kind, 'deny', name)
+    assert.match(decision.reason, /[Rr]ead-only/)
+  }
 
   // 默认（读写）配置：写入工具注册，审批门保持 ask 语义而不是误伤。
   const rw = createSettingsContext({})
   const rwNames = rw.tools.map((tool) => tool.name)
-  assert.ok(rwNames.includes('grafana_push'))
-  assert.ok(rwNames.includes('grafana_clone'))
+  for (const name of WRITE_TOOL_NAMES) assert.ok(rwNames.includes(name), `${name} must be registered in read-write mode`)
 })
 
 // ── D4：受控并行与原生调用卡片 ───────────────────────────────────────────────
@@ -3952,6 +3969,14 @@ const VALID_ARGS = {
   grafana_get: { urlOrUid: 'abc123' },
   grafana_push: { dashboardJson: '{"panels":[]}', changeSummary: 's', message: 'm' },
   grafana_clone: { sourceUrlOrUid: 'abc123' },
+  grafana_patch: { urlOrUid: 'abc123', ops: [{ op: 'replace', path: '/title', value: 'x' }], changeSummary: 's', message: 'm' },
+  grafana_upsert_panel: { urlOrUid: 'abc123', panelId: 1, panel: { title: 'x' }, changeSummary: 's', message: 'm' },
+  grafana_variable_upsert: { urlOrUid: 'abc123', name: 'env', variable: { type: 'custom' }, changeSummary: 's', message: 'm' },
+  grafana_restore_version: { urlOrUid: 'abc123', version: 2, changeSummary: 's' },
+  grafana_version_list: { urlOrUid: 'abc123' },
+  grafana_diff_dashboard: { dashboardJson: '{"uid":"abc123","panels":[]}' },
+  grafana_audit_time: { urlOrUid: 'abc123' },
+  grafana_verify_panel: { urlOrUid: 'abc123', panelId: 1, expect: { rows: 1 } },
   grafana_panel_query: { urlOrUid: 'abc123' },
   grafana_datasources: {},
   grafana_metric: { datasource: 'prom-prod', expr: 'up{job="api"}' },
@@ -3966,20 +3991,20 @@ const VALID_ARGS = {
 test('read-only tools without shared write state opt into parallel dispatch', () => {
   const { tools } = createContext()
   // 无共享写状态的只读工具：允许并行。
-  for (const name of ['grafana_panel_query', 'grafana_datasources', 'grafana_metric', 'grafana_compare', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources']) {
+  for (const name of ['grafana_panel_query', 'grafana_verify_panel', 'grafana_datasources', 'grafana_metric', 'grafana_compare', 'grafana_trend', 'grafana_alerts', 'grafana_search', 'grafana_status', 'grafana_sources', 'grafana_version_list', 'grafana_diff_dashboard', 'grafana_audit_time']) {
     const tool = toolByName(tools, name)
     assert.equal(typeof tool.isConcurrencySafe, 'function', `${name} must declare isConcurrencySafe`)
     assert.equal(tool.isConcurrencySafe(VALID_ARGS[name]), true)
   }
-  // grafana_get 要记写快照（共享写状态），push/clone 是写入：三者保持独占调度。
-  for (const name of ['grafana_get', 'grafana_push', 'grafana_clone']) {
+  // grafana_get 要记写快照（共享写状态），push/clone 与所有编辑、回滚工具是写入：保持独占调度。
+  for (const name of ['grafana_get', 'grafana_push', 'grafana_clone', 'grafana_patch', 'grafana_upsert_panel', 'grafana_variable_upsert', 'grafana_restore_version']) {
     assert.notEqual(toolByName(tools, name).isConcurrencySafe?.(VALID_ARGS[name]), true, `${name} must stay exclusive`)
   }
 })
 
 test('every grafana tool presents a native generic call card from args alone', () => {
   const { tools } = createContext()
-  const kinds = { grafana_push: 'edit', grafana_clone: 'edit', grafana_search: 'search' }
+  const kinds = { grafana_push: 'edit', grafana_clone: 'edit', grafana_patch: 'edit', grafana_upsert_panel: 'edit', grafana_variable_upsert: 'edit', grafana_restore_version: 'edit', grafana_search: 'search' }
   for (const tool of tools) {
     // 旧名转发 stub 不参展：它们只报错指路，没有可展示的调用内容。
     if (tool.name === 'grafana_query' || tool.name === 'grafana_health') continue

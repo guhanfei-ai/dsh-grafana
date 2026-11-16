@@ -108,7 +108,7 @@ allowInsecureHttp: false
 readOnly: true
 ```
 
-启用后 `grafana_push` 与 `grafana_clone` 完全不注册——模型没有可调用的写入工具。设置卡片顶部提供**只读模式**开关（开 = 只读，关 = 读写），当前模式一目了然；切换只写插件级 `readOnly` 配置，不影响已配置的源站与默认源站。
+启用后所有大盘写入工具（`grafana_push`、`grafana_clone`、`grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert`、`grafana_restore_version`）都完全不注册——模型没有可调用的写入工具。设置卡片顶部提供**只读模式**开关（开 = 只读，关 = 读写），当前模式一目了然；切换只写插件级 `readOnly` 配置，不影响已配置的源站与默认源站。
 
 切换到只读立即生效：即使写入工具在启动时已注册，审批门也会在运行时拒绝它们。从只读切回读写可能需要重启 DSH（或重新加载插件），取决于插件加载时的模式：以只读模式启动的插件从未注册写入工具，重启或重载之后才会恢复。
 
@@ -150,17 +150,20 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | `grafana_get` | `dashboards:read` |
 | `grafana_push` | `dashboards:read` + `dashboards:write` |
 | `grafana_clone` | `dashboards:read` + `dashboards:write` |
+| `grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert`、`grafana_restore_version` | `dashboards:read` + `dashboards:write` |
+| `grafana_version_list`、`grafana_diff_dashboard`、`grafana_audit_time` | `dashboards:read`（差异工具还可能读取会话工作区内的文件） |
+| `grafana_verify_panel` | `dashboards:read` + `datasources:query` |
 | `grafana_panel_query` | `dashboards:read` + `datasources:query` |
 | `grafana_datasources` | `datasources:read` |
 | `grafana_metric` | `datasources:read` + `datasources:query` |
 | `grafana_compare` | `datasources:read` + `datasources:query`（每台源站各自） |
 | `grafana_trend` | `dashboards:read` + `datasources:query` |
-| `grafana_alerts` | `alert.instances:read`；`definitions: true` 另需 `alert.provisioning:read`；`ruleStates: true` 另需规则读取权限（被拒时就地报出缺失的 scope） |
+| `grafana_alerts` | 发现 Alertmanager 数据源需要 `datasources:read`（不可用时仍查询内置 Alertmanager 并披露该限制），每个被查询的 Alertmanager 需要 `alert.instances:read`；`definitions: true` 另需 `alert.provisioning:read`；`ruleStates: true` 另需规则读取权限（被拒时就地报出缺失的 scope） |
 | `grafana_search` | `dashboards:read` |
 | `grafana_status` | `dashboards:read`（见下注） |
 | `grafana_sources` | 无（只读本机插件配置） |
 
-以读为主的配置可用 Viewer 基础角色叠加 Grafana 固定的只读 Alerting 角色；只有跑 `grafana_push` / `grafana_clone` 的令牌才需要追加 `dashboards:write`（或 Editor 基础角色）。关于 `grafana_status`：`/api/health` 无需鉴权，故该工具改为调用 `GET /api/search` 验证凭证，并从 `/api/health` 的 `database` 字段读取实例健康状态（该接口没有 `status` 字段）。
+以读为主的配置可用 Viewer 基础角色叠加 Grafana 固定的只读 Alerting 角色；只有跑大盘写入（`grafana_push`、`grafana_clone`、`grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert`、`grafana_restore_version`）的令牌才需要追加 `dashboards:write`（或 Editor 基础角色）。关于 `grafana_status`：`/api/health` 无需鉴权，故该工具改为调用 `GET /api/search` 验证凭证，并从 `/api/health` 的 `database` 字段读取实例健康状态（该接口没有 `status` 字段）。
 
 ## 能力覆盖
 
@@ -175,8 +178,10 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | 能力 | 工具 |
 | --- | --- |
 | 读大盘（完整 JSON 或结构化摘要） | `grafana_get` |
-| 改大盘 | `grafana_push` |
+| 改大盘 | `grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert` 或 `grafana_push` |
 | 写 / 新建 | `grafana_push`、`grafana_clone` |
+| 写入前预览差异 | `grafana_diff_dashboard` |
+| 回滚到已保存版本 | `grafana_version_list`、`grafana_restore_version` |
 | 克隆大盘 | `grafana_clone` |
 | 搜索大盘 | `grafana_search` |
 | 面板实时值 | `grafana_panel_query` |
@@ -195,14 +200,22 @@ settings 中的 `baseUrl` 为权威来源；早期版本存在 `GRAFANA_BASE_URL
 | 工具 | 行为 |
 | --- | --- |
 | `grafana_get` | 获取完整大盘，并保存一个短期可信的版本和目录快照。传 `summary: true` 时改为返回结构化摘要（面板、查询、阈值、变量），不记录写快照，适合超大盘。 |
-| `grafana_push` | 按实时审批策略执行，并在身份校验、版本校验和目录保持后写回最近读取的大盘。 |
+| `grafana_push` | 按实时审批策略执行，并在身份校验、版本校验和目录保持后写回最近读取的大盘；完整模型可用 `dashboardJson` 内联，或用会话工作区内的 `dashboardFile` 提供。 |
+| `grafana_patch` | 对最新保存的大盘应用 RFC 6902 增量操作，返回变更路径与新版本；任一操作非法则整份拒绝。 |
+| `grafana_upsert_panel` | 按 id 新增、修改或删除一个面板，无需回传整份大盘；只有显式传入布局参数才调整位置。 |
+| `grafana_variable_upsert` | 按名称新增、修改或删除一个模板变量。 |
+| `grafana_restore_version` | 在相同写入校验与审批策略下，把已保存版本恢复为一个新版本。 |
+| `grafana_version_list` | 只读列出大盘版本历史（最新在前）。 |
+| `grafana_diff_dashboard` | 将待写 JSON（内联或工作区文件）与线上大盘比较；只读且不记录快照。 |
+| `grafana_audit_time` | 报告面板时区与 SQL 时间列用法，并给出启发式矛盾提示；只读。 |
+| `grafana_verify_panel` | 执行一个面板并按行数、单元格或求和断言，区分通过、不符、无数据和查询错误；只读。 |
 | `grafana_clone` | 把大盘复制为全新大盘（全新 UID、版本 1），默认留在源文件夹，并返回新大盘完整地址。与 `grafana_push` 采用同一审批策略，继续写入前必须先调用 `grafana_get`。 |
 | `grafana_panel_query` | 执行粘贴的大盘或面板视图 URL（`?viewPanel=` 限定单面板；沿用 URL 里的 `from`/`to` 时间范围）背后的面板数据源查询，返回有界的实时数据摘要。模板变量默认使用大盘保存状态，可通过 `variables` 参数覆盖——单值（`{"env":"prod"}`）、多值（`{"host":["www","m"]}`，按查询中使用的格式修饰符展开）或 adhoc 过滤（见[模板变量覆盖](#模板变量覆盖grafana_panel_query)）。adhoc 过滤按数据源类型翻译：Elasticsearch 拼进各 target 的 Lucene 查询串，Prometheus/Loki 向每个 vector/stream selector 注入 label matcher，SQL 数据源替换 `rawSql` 中的 `${__adhoc}` 占位符；其它数据源类型存在生效的 adhoc 时显式报错并列出支持矩阵。adhoc 覆盖为整体替换保存态，`[]` 表示清空，并按 target 的数据源 uid 逐个生效——绑定某个数据源的变量不会影响其它数据源。不支持的运算符/数据源组合显式报错，绝不静默忽略。仅支持 `query`/`custom`/`interval`/`adhoc`/`textbox`/`constant`/`datasource` 类型变量覆盖（datasource 型变量传 uid 字符串），不支持的类型会显式报错。Prometheus/Loki target 中裸多值变量渲染为 `(a|b)` 以便用于 `=~` matcher。旧格式 datasource 引用自动解析：纯字符串 uid 与 `{"uid":"$datasource"}` 型 datasource 变量引用经 `GET /api/datasources` 解析（保存值 `"default"` 映射到默认数据源）。服务端表达式（`__expr__`，如 `$A / 60`）原样透传；变量插值失败的面板只跳过不阻断整盘——全部跳过时列出每个面板的 id、标题与原因；批量请求失败时自动降级为逐面板查询（正常路径始终整选区单次批量 POST，保证 `$A` 式表达式引用不断链）。只读，不记录写快照。 |
 | `grafana_datasources` | 列出源站上已配置的数据源（uid、插件类型、显示名、是否默认、访问模式、以及配置的 URL——`url="(empty)"` 的行通常意味着该数据源配置有误、一查即失败，请换用其它 uid）。可按精确插件类型或大小写不敏感的名称子串过滤。结果分页返回（默认每页 40 行；`limit` 调整页大小，`page` 翻页），末尾一行披露当前页、总数与如何继续。调用 `grafana_metric` 前先用它确认要查询的 uid 或名称。只读。 |
 | `grafana_metric` | 无需大盘，直接对 Prometheus 或 Loki 数据源执行一条裸文本查询（PromQL 如 `up` 或 `rate(http_requests_total[5m])`，或 LogQL 流选择器），数据源按 uid 或精确显示名寻址。`mode: "instant"`（默认）在区间末端求值一次；`mode: "range"` 对序列采样并给出每条序列的统计、上升/下降/持平判定与火花线——首行披露实际采样步长（`step=`），每条序列披露实际返回点数（`points=`），回答的精度与覆盖范围可见（对 Loki 的 range 查询返回的是日志行而非数值采样点，故这类序列只报行数与末行；Loki 的 instant 模式只接受 metric 查询，日志流选择器需用 range）。其它插件类型与服务端表达式会被拒绝并指向 `grafana_panel_query`。只读，不记录写快照。 |
 | `grafana_compare` | 在多台已配置 Grafana 源站（一次 2-10 台）上并发执行同一 PromQL 查询，按源站独立解析数据源（同名会分别解到各自的 UID），并返回紧凑的横向比较结果；任一源站失败/无数据/多 series 都不会拖累其它成功源站，所有错误均经脱敏截断。全部请求源站都成功且各自返回单个可比较标量时，尾部附数学 summary（最高/最低/均值/比率）；range 模式的「可比较标量」指带完整 first/last/min/max/avg 的序列，无时间轴的表格或日志结果只按 per-source 详情呈现并说明不可直接比较。只读，不记写快照也不进审批门。 |
 | `grafana_trend` | 一次调用回答大盘的「在涨还是在跌」：把每个可见查询目标以较粗的区间查询重跑，每条序列给出实际返回点数、桶数、首/末/最小/最大/均值、方向判定与火花线；首行披露实际采样步长。表格型结果报告行数与统计并标 `trend=n/a`，不伪造方向。与 `grafana_panel_query` 共用同一套面板管线（变量、adhoc 过滤、旧格式数据源引用、逐面板降级）。时间范围最长 90 天。只读，不记录写快照。 |
-| `grafana_alerts` | 从内置 Alertmanager 列出源站当前正在告警的条目（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。上游的 `active` 状态（Alertmanager v2 的活动告警状态）统一报为 `state=firing`，正常告警不会被当成未知状态漏掉。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。活跃告警按 `limit` 参数封顶（默认 30、上限 100），丢弃的部分在末尾预算行披露。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。`ruleStates: true` 再追加每条规则的评估状态（`rule-state` 行：`inactive`、`pending`、`firing`、`recording`、`unknown`，来自 Prometheus 兼容规则接口）——`pending` 表示条件已满足但 `for` 时长未满，这是 Alertmanager 视角回答不了的；该段可用 `ruleState` 过滤。两个规则段共用 `rulesPage` 分页（每页 100 条），并披露总数与下一页参数。只读；告警文本是不可信数据。 |
+| `grafana_alerts` | 从内置 Alertmanager 与至多 10 个 Alertmanager 类型数据源聚合告警（默认 `state=firing`；`"suppressed"` 表示被静默/抑制，`"all"` 两者都要）。输出先披露实际查询的来源与不可用来源，涉及外部源时用 `am=` 标注并按指纹去重；可用 `alertmanager` 选择单一来源。上游的 `active` 状态（Alertmanager v2 的活动告警状态）统一报为 `state=firing`，正常告警不会被当成未知状态漏掉。可按文件夹、跨标签与注解的大小写不敏感子串、或大盘 URL/uid 过滤。活跃告警按 `limit` 参数封顶（默认 30、上限 100），丢弃的部分在末尾预算行披露。`definitions: true` 另发一次请求追加 provisioning 的规则定义（独立权限、独立故障隔离）。`ruleStates: true` 再追加每条规则的评估状态（`rule-state` 行：`inactive`、`pending`、`firing`、`recording`、`unknown`，来自 Prometheus 兼容规则接口）——`pending` 表示条件已满足但 `for` 时长未满，这是 Alertmanager 视角回答不了的；该段可用 `ruleState` 过滤。两个规则段共用 `rulesPage` 分页（每页 100 条），并披露总数与下一页参数。只读；告警文本是不可信数据。 |
 | `grafana_search` | 按标题和精确标签搜索，最多返回 50 条。 |
 | `grafana_status` | 检查 Grafana 连通性与 Service Account 凭证。 |
 | `grafana_sources` | 列出已配置的 Grafana 源站：每个源站的名称、只读 UID、URL、令牌是否已配，以及哪一台是默认源站。只读，绝不返回令牌值。在向其它工具传 `source` 之前，可用它发现合法的源站名称。 |
@@ -334,13 +347,15 @@ datasource 引用了该变量的面板（`{"type":"prometheus","uid":"$datasourc
 4. 批准或拒绝写回；显式完全权限会话免插件附加确认。
 5. 刷新 Grafana；再次写入前重新获取大盘。
 
-`grafana_push` 默认使用 `overwrite: false`。写回前会立即重新读取大盘并拒绝过期版本，同时自动保持当前目录。移动目录仍需 `allowFolderMove: true`；强制覆盖仍需 `forceOverwrite: true`，两者均遵循下述审批策略。
+`grafana_push` 默认使用 `overwrite: false`。写回前会立即重新读取大盘并拒绝过期版本，同时自动保持当前目录。移动目录仍需 `allowFolderMove: true`；强制覆盖仍需 `forceOverwrite: true`，两者均遵循下述审批策略。`grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert` 与 `grafana_restore_version` 也走相同的版本校验与审批门。
+
+局部改动优先使用 `grafana_upsert_panel`、`grafana_variable_upsert` 或 `grafana_patch`，不要为重传整份大盘。完整的超大盘模型可放入会话工作区文件，通过 `dashboardFile` 写入；文件经宿主文件系统读取，审批后内容发生变化会拒绝写入。保存前可用 `grafana_diff_dashboard` 查看变更路径，用 `grafana_verify_panel` 断言面板数据，用 `grafana_audit_time` 做时区与时间列的启发式检查。
 
 审批弹窗中展示的大盘身份（UID、标题、版本、所在文件夹）以及「快照于 X 分钟前获取」全部来自 `grafana_get` 保存的服务端可信快照，而不是模型提交的大盘 JSON，因此模型幻觉或被篡改的标题不会误导审批。没有可信快照时，弹窗会直接说明写回会被拒绝并要求先 `grafana_get`。审批弹出前插件还会实时核对 Grafana 端当前状态：版本或文件夹与快照不一致时，弹窗会给出醒目警示并列出两侧版本号；无法连接 Grafana 时，弹窗会注明「无法确认当前状态」。实时复核只用于丰富审批文案，写入前的最终校验始终在写回时重新执行。实时复核成功时，弹窗还会附上有界且经过清洗的内容 diff（新增/删除/修改的面板、模板变量与顶层字段），让审批人核对真实改动，而不只是模型自述的变更摘要。
 
 ### 写入审批与完全权限
 
-本插件明确将当前会话的实时文件权限映射到 `grafana_push`、`grafana_clone` 的**插件附加确认**：
+本插件明确将当前会话的实时文件权限映射到所有大盘写入工具（`grafana_push`、`grafana_clone`、`grafana_patch`、`grafana_upsert_panel`、`grafana_variable_upsert`、`grafana_restore_version`）的**插件附加确认**：
 
 | 当前会话状态 | 插件行为 |
 | --- | --- |
@@ -363,6 +378,8 @@ datasource 引用了该变量的面板（`{"type":"prometheus","uid":"$datasourc
 - 请求支持取消、超时、响应大小限制和 Dashboard 输入大小限制。
 - API 错误只暴露有限的状态和消息。
 - Grafana 返回内容始终作为不可信数据处理，而不是模型指令。
+- `dashboardFile` 通过宿主文件系统读取，并限制在会话工作区内；审批后文件内容变化会拒绝写入。
+- 告警读取会披露实际查询的 Alertmanager 来源及不可用来源，不会把未覆盖的外部来源误报为没有告警。
 
 Dashboard JSON 仍可能包含 SQL、内部域名、链接、标签和业务信息。获取大盘会把这些 JSON 作为工具上下文发送给当前模型提供商。在处理机密大盘前，请先确认模型提供商的数据政策。
 

@@ -13,6 +13,10 @@ import {
   formatAlertRuleRows,
   formatRuleStateRows,
   ruleQueryText,
+  alertmanagerPathOf,
+  alertmanagerSourcesOf,
+  mergeAlertmanagerAlerts,
+  selectAlertmanagers,
 } from '../lib/alerts.js'
 import { ALERT_ROWS_LIMIT, ALERT_STATES, MAX_ALERT_ROWS, MAX_ALERT_RULE_ROWS } from '../lib/constants.js'
 
@@ -100,6 +104,7 @@ async function assertNoWriteSnapshot(listeners) {
 const AM_PATH = '/api/alertmanager/grafana/api/v2/alerts'
 const RULES_PATH = '/api/v1/provisioning/alert-rules'
 const RULE_STATES_PATH = '/api/prometheus/grafana/api/v1/rules'
+const DATASOURCES_PATH = '/api/datasources'
 
 // 状态枚举以 Alertmanager v2 契约为准（Grafana 的 GettableAlerts 直接复用它）：
 // active / suppressed / unprocessed，没有 firing。fixture 必须用真实形状，否则
@@ -260,13 +265,14 @@ test('filterAlertRules and formatAlertRuleRows render the provisioning shape', (
 // ── grafana_alerts ─────────────────────────────────────────────────────────
 
 // 两个路由：活跃态必发，规则定义只在 definitions=true 时才发第二个请求。
-function stubAlertFetch(calls, { alerts = ALERTS, rules = RULES, alertsStatus = 200, rulesStatus = 200, ruleStates = RULE_STATES_PAYLOAD, ruleStatesStatus = 200 } = {}) {
+function stubAlertFetch(calls, { alerts = ALERTS, rules = RULES, alertsStatus = 200, rulesStatus = 200, ruleStates = RULE_STATES_PAYLOAD, ruleStatesStatus = 200, datasources = [] } = {}) {
   globalThis.fetch = async (url) => {
     const path = String(url).replace('https://grafana.example.com', '').split('?')[0]
     calls.push({ url: String(url), path })
     if (path === AM_PATH) return jsonResponse(alertsStatus === 200 ? alerts : { message: 'refused' }, alertsStatus)
     if (path === RULES_PATH) return jsonResponse(rulesStatus === 200 ? rules : { message: 'refused' }, rulesStatus)
     if (path === RULE_STATES_PATH) return jsonResponse(ruleStatesStatus === 200 ? ruleStates : { message: 'refused' }, ruleStatesStatus)
+    if (path === DATASOURCES_PATH) return jsonResponse(datasources)
     return jsonResponse({ message: 'unexpected route' }, 404)
   }
 }
@@ -301,8 +307,9 @@ test('grafana_alerts asks for silenced and inhibited alerts so it can tell them 
     // 默认只报 firing；不显式要 silenced/inhibited 的话 AM 不会把它们发回来，
     // state=suppressed 就永远是空的。
     const out = await tool.execute({}, execution())
-    assert.equal(calls.length, 1)
-    assert.equal(calls[0].url, `https://grafana.example.com${AM_PATH}?silenced=true&inhibited=true`)
+    // 先发现 Alertmanager 数据源，再查内置 AM；两者都是 GET。
+    assert.deepEqual(calls.map((call) => call.path), [DATASOURCES_PATH, AM_PATH])
+    assert.equal(calls[1].url, `https://grafana.example.com${AM_PATH}?silenced=true&inhibited=true`)
     const lines = out.split('\n')
     assert.equal(lines.length, 2)
     assert.equal(lines[0], 'alert "HighRPM" state=firing since=2026-09-08T10:12:00Z severity=warning folder="prod" dashboard=uid=fixture-dash-0001 summary="RPM above 900 for 5m"')
@@ -334,7 +341,7 @@ test('grafana_alerts fetches rule definitions only when asked, and reports that 
     const tool = toolByName(tools, 'grafana_alerts')
 
     const out = await tool.execute({ definitions: true }, execution())
-    assert.deepEqual(calls.map((call) => call.path), [AM_PATH, RULES_PATH])
+    assert.deepEqual(calls.map((call) => call.path), [DATASOURCES_PATH, AM_PATH, RULES_PATH])
     const lines = out.split('\n')
     // 活跃告警段在前，规则定义段在后，各自用自己的前缀，不需要分隔行。
     assert.equal(lines.length, 4)
@@ -497,10 +504,14 @@ test('grafana_alerts honors the source argument and records no write snapshot', 
     }, { GRAFANA_TOKEN_idprod: 'p', GRAFANA_TOKEN_ideu: 'e' })
     const tool = toolByName(tools, 'grafana_alerts')
 
+    calls.length = 0
     await tool.execute({ source: 'eu' }, execution())
-    assert.ok(calls[0].startsWith(`https://eu.example.com${AM_PATH}`), calls[0])
+    assert.ok(calls.some((url) => url.startsWith(`https://eu.example.com${AM_PATH}`)), calls.join(' '))
+    assert.ok(calls.every((url) => url.startsWith('https://eu.example.com')), calls.join(' '))
+    calls.length = 0
     await tool.execute({}, execution())
-    assert.ok(calls[1].startsWith(`https://prod.example.com${AM_PATH}`), calls[1])
+    assert.ok(calls.some((url) => url.startsWith(`https://prod.example.com${AM_PATH}`)), calls.join(' '))
+    assert.ok(calls.every((url) => url.startsWith('https://prod.example.com')), calls.join(' '))
     await assert.rejects(tool.execute({ source: 'nope' }, execution()), /Unknown Grafana source "nope"/)
     await assertNoWriteSnapshot(listeners)
   } finally {
@@ -586,7 +597,7 @@ test('grafana_alerts appends rule states only when asked, and isolates its failu
     const tool = toolByName(tools, 'grafana_alerts')
 
     const out = await tool.execute({ ruleStates: true }, execution())
-    assert.deepEqual(calls.map((call) => call.path), [AM_PATH, RULE_STATES_PATH])
+    assert.deepEqual(calls.map((call) => call.path), [DATASOURCES_PATH, AM_PATH, RULE_STATES_PATH])
     // 活跃告警段在前，规则状态段在后，行前缀把两个视角区分开。
     assert.match(out, /^alert "HighRPM" /m)
     assert.match(out, /^rule-state "DiskFull" state=pending folder="prod" group="group-1" alerts=0$/m)
@@ -613,6 +624,125 @@ test('grafana_alerts appends rule states only when asked, and isolates its failu
     const out = await toolByName(tools, 'grafana_alerts').execute({ ruleStates: true }, execution())
     assert.match(out, /^alert "HighRPM" /m)
     assert.match(out, /^\(rule states unavailable: Grafana API 500 GET \/api\/prometheus\/grafana\/api\/v1\/rules: refused\)$/m)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ── 外部 Alertmanager 数据源 ────────────────────────────────────────────────
+const EXTERNAL_AM_UID = 'external-am-1'
+const EXTERNAL_AM_PATH = '/api/alertmanager/external-am-1/api/v2/alerts'
+
+function externalAlert(name, fingerprint) {
+  return {
+    labels: { alertname: name, severity: 'critical', grafana_folder: 'prod' },
+    annotations: { summary: `${name} summary` },
+    status: { state: 'active', silencedBy: [], inhibitedBy: [] },
+    startsAt: '2026-11-16T10:00:00Z',
+    fingerprint,
+  }
+}
+
+test('alertmanager source discovery, routing and selection cover external data sources', () => {
+  const external = alertmanagerSourcesOf([
+    { type: 'prometheus', uid: 'prom-1', name: 'Prometheus' },
+    { type: 'alertmanager', uid: EXTERNAL_AM_UID, name: 'External AM' },
+    { type: 'alertmanager', uid: 'grafana', name: 'Reserved built-in uid' },
+    { type: 'alertmanager', name: 'missing uid' },
+  ])
+  assert.deepEqual(external, [{ name: 'External AM', uid: EXTERNAL_AM_UID, builtIn: false }])
+  assert.equal(alertmanagerPathOf('grafana'), AM_PATH)
+  assert.equal(alertmanagerPathOf(EXTERNAL_AM_UID), EXTERNAL_AM_PATH)
+  assert.deepEqual(selectAlertmanagers(external, 'all').map((am) => am.uid), ['grafana', EXTERNAL_AM_UID])
+  assert.deepEqual(selectAlertmanagers(external, 'grafana').map((am) => am.uid), ['grafana'])
+  assert.deepEqual(selectAlertmanagers(external, 'External AM').map((am) => am.uid), [EXTERNAL_AM_UID])
+  assert.throws(() => selectAlertmanagers(external, 'missing'), /known: "External AM"/)
+})
+
+test('mergeAlertmanagerAlerts deduplicates forwarded alerts but preserves distinct states', () => {
+  const shared = externalAlert('Shared', 'same-fingerprint')
+  const suppressed = { ...shared, status: { state: 'active', silencedBy: ['maintenance'], inhibitedBy: [] } }
+  const merged = mergeAlertmanagerAlerts([
+    { name: 'grafana', alerts: [shared] },
+    { name: 'External AM', alerts: [shared, suppressed, externalAlert('Only external', 'external-only')] },
+  ])
+  assert.equal(merged.length, 3)
+  assert.deepEqual(merged[0].__sources, ['grafana', 'External AM'])
+  assert.deepEqual(merged[1].__sources, ['External AM'])
+  assert.deepEqual(merged[2].__sources, ['External AM'])
+})
+
+test('grafana_alerts aggregates external Alertmanagers, labels sources and deduplicates forwards', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const shared = externalAlert('Shared', 'shared-1')
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    calls.push(path)
+    if (path === DATASOURCES_PATH) return jsonResponse([{ type: 'alertmanager', uid: EXTERNAL_AM_UID, name: 'External AM' }])
+    if (path === AM_PATH) return jsonResponse([shared])
+    if (path === EXTERNAL_AM_PATH) return jsonResponse([shared, externalAlert('ExternalOnly', 'external-1')])
+    return jsonResponse({ message: 'unexpected route' }, 404)
+  }
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_alerts').execute({}, execution())
+    assert.match(output, /^\(alertmanagers queried: "grafana", "External AM"\)$/m)
+    assert.match(output, /^alert "Shared" state=firing am="grafana, External AM"/m)
+    assert.match(output, /^alert "ExternalOnly" state=firing am="External AM"/m)
+    assert.equal((output.match(/^alert "Shared"/gm) ?? []).length, 1)
+    assert.deepEqual(calls, [DATASOURCES_PATH, AM_PATH, EXTERNAL_AM_PATH])
+
+    const externalOnly = await toolByName(tools, 'grafana_alerts').execute({ alertmanager: 'External AM' }, execution())
+    assert.match(externalOnly, /^\(alertmanagers queried: "External AM"\)$/m)
+    assert.match(externalOnly, /^alert "Shared" state=firing am="External AM"/m)
+    assert.doesNotMatch(externalOnly, /am="\?"/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_alerts isolates an unavailable external Alertmanager and supports selecting one', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    calls.push(path)
+    if (path === DATASOURCES_PATH) return jsonResponse([{ type: 'alertmanager', uid: EXTERNAL_AM_UID, name: 'External AM' }])
+    if (path === AM_PATH) return jsonResponse([externalAlert('BuiltIn', 'built-in-1')])
+    if (path === EXTERNAL_AM_PATH) return jsonResponse({ message: 'AM unavailable' }, 500)
+    return jsonResponse({ message: 'unexpected route' }, 404)
+  }
+  try {
+    const { tools } = createContext()
+    const tool = toolByName(tools, 'grafana_alerts')
+    const output = await tool.execute({}, execution())
+    assert.match(output, /^alert "BuiltIn"/m)
+    assert.match(output, /^\(alertmanager "External AM" unavailable: Grafana API 500 GET \/api\/alertmanager\/external-am-1\/api\/v2\/alerts/m)
+
+    calls.length = 0
+    await tool.execute({ alertmanager: 'grafana' }, execution())
+    assert.ok(calls.includes(AM_PATH))
+    assert.equal(calls.includes(EXTERNAL_AM_PATH), false)
+    await assert.rejects(tool.execute({ alertmanager: 'missing' }, execution()), /alertmanager must be/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('grafana_alerts discloses datasource discovery failure instead of implying full coverage', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === DATASOURCES_PATH) return jsonResponse({ message: 'datasources refused' }, 500)
+    if (path === AM_PATH) return jsonResponse([])
+    return jsonResponse({ message: 'unexpected route' }, 404)
+  }
+  try {
+    const { tools } = createContext()
+    const output = await toolByName(tools, 'grafana_alerts').execute({}, execution())
+    assert.match(output, /^\(alertmanager data sources unavailable: .*datasources refused; only the built-in Alertmanager was queried\)$/m)
+    assert.match(output, /^\(no alerts match the filters\)$/m)
   } finally {
     globalThis.fetch = originalFetch
   }

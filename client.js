@@ -139,9 +139,9 @@ window.__ModuleLoader__.load({
 				modeToggleLabel: "只读模式",
 				stateReadOnly: "只读",
 				stateReadWrite: "读写",
-				modeToggleHint: "停用 grafana_push 与 grafana_clone。适合生产监控与排障场景。",
+				modeToggleHint: "停用全部大盘写入工具（push、clone、patch、面板/变量编辑与版本回滚）。适合生产监控与排障场景。",
 				modeReadWriteDesc: "读写：AI 可查看并修改 Grafana 资源；写入仍需通过既有审批流程。",
-				modeReadOnlyDesc: "只读：AI 可查看大盘、指标、告警与数据源，但 grafana_push、grafana_clone 等写入工具已停用。",
+				modeReadOnlyDesc: "只读：AI 可查看大盘、指标、告警与数据源，但所有大盘写入工具（含 push、clone、patch、面板/变量编辑与版本回滚）已停用。",
 				modeEffectNote: "切换到只读立即生效；若插件以只读模式启动，切回读写后需重启 DSH 或重新加载插件，写入工具才会重新注册。",
 				savedReadOnly: "已保存。只读模式已生效。",
 				savedReadWrite: "已保存。若插件以只读模式启动，需重启 DSH 或重新加载插件，写入工具才会重新注册。"
@@ -192,9 +192,9 @@ window.__ModuleLoader__.load({
 				modeToggleLabel: "Read-only mode",
 				stateReadOnly: "Read-only",
 				stateReadWrite: "Read-write",
-				modeToggleHint: "Disable grafana_push and grafana_clone. Useful for production monitoring and troubleshooting.",
+				modeToggleHint: "Disable every dashboard write tool (push, clone, patch, panel/variable edits and version restore). Useful for production monitoring and troubleshooting.",
 				modeReadWriteDesc: "Read-write: the AI can inspect and modify Grafana resources; write operations still require the existing approval flow.",
-				modeReadOnlyDesc: "Read-only: the AI can inspect dashboards, metrics, alerts and data sources, but write tools such as grafana_push and grafana_clone are disabled.",
+				modeReadOnlyDesc: "Read-only: the AI can inspect dashboards, metrics, alerts and data sources, but every dashboard write tool (push, clone, patch, panel/variable edits and version restore) is disabled.",
 				modeEffectNote: "Switching to read-only takes effect immediately. If the plugin started in read-only mode, switching back to read-write requires restarting DSH or reloading the plugin before the write tools are registered again.",
 				savedReadOnly: "Saved. Read-only mode is active.",
 				savedReadWrite: "Saved. If the plugin started in read-only mode, restart DSH or reload the plugin to re-enable the write tools."
